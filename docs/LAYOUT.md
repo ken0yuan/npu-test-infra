@@ -25,11 +25,13 @@
 
 ## 插件子模块
 
-| 路径 | 仓库 | 初始锁定版本 |
+| 路径 | 仓库 | 当前锁定版本 |
 |---|---|---|
-| plugin/api-test-relations | git@github.com:ken0yuan/api-test-relations-plugin.git | 23ba61f（0.1.2，与原有 37 个文件内容一致，仅部分换行不同） |
+| plugin/api-test-relations | git@github.com:ken0yuan/api-test-relations-plugin.git | 6ae759d（0.1.3） |
 | plugin/trace_api_chain | git@github.com:ken0yuan/trace_api_chain.git | e9ac4dd |
 
-`.gitmodules` 保存 SSH 地址，主仓库 Git 索引保存具体 commit。API 插件原有目录已在项目外备份，主仓库不再重复保存其源码。API 远端已有 0.1.3，但本次仅转换管理方式，保留已验收版本；升级应另行验证。调用链子模块未自动安装或接入流水线。
+`.gitmodules` 保存 SSH 地址，主仓库 Git 索引保存具体 commit。API 插件原有目录已在项目外备份，主仓库不再重复保存其源码。API 插件按用户要求从 0.1.2 更新到 0.1.3，锁定远端发布提交 6ae759d。调用链子模块未自动安装或接入流水线。
 
 首次克隆使用 `git clone --recurse-submodules`；已有克隆在主仓库更新后执行 `git submodule update --init --recursive`。不使用 `--remote` 自动跨到未经验证的最新插件版本。
+
+0.1.3 已在 Linux ARM64 / Python 3.11 验证：49 项插件回归通过，2 项集成默认跳过；4 个真实 CPU 测试通过。529 条关系键和别名组与之前的 0.1.2 定点记录一致，未报告采集缺口。此结果不代表 NPU 或全量覆盖验收。
