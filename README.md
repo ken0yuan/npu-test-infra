@@ -35,6 +35,7 @@ git submodule status
 python3.11 -m venv venv/control
 venv/control/bin/python -m pip install -r docs/requirements-validation.txt
 python3.11 -m venv venv/test
+venv/test/bin/python -m pip install -r docs/requirements-test.txt
 # 在专用测试环境安装与目标源码匹配的 torch、torch_npu 及测试依赖。
 venv/control/bin/python run-test/prepare.py --device cpu   --test-python "$PWD/venv/test/bin/python" --obsutil /absolute/path/to/obsutil
 bash verify.sh
@@ -58,6 +59,74 @@ bash start.sh stop
 `start.sh` 管理 watchdog、cycle、pipeline、bug_monitor、brief 五常驻。服务日志在 `data/service/`，简报在 `data/logs/简报.log`。`run.sh` 是业务命令入口；`verify.sh` 运行工具回归和四场景隔离验收，输出在 `data/validation/`。
 
 结果库为 `data/runtime/pr_results.db`，基线位于 `data/runtime/baselines/`，队列位于 `data/runtime/queue/`。同 PR 重跑替换当前结果，保留历史日志；`no_result` 不推动基线；`done` 表示任务处理结束，不等于测试通过。
+
+## 真实问题台账
+
+`bug_monitor` 持续扫描任务、测试计划和真实 JUnit/收集/执行产物。计划生成前的选例异常也会立即留证。
+
+```bash
+bash run.sh ledger scan
+bash run.sh ledger status
+bash run.sh ledger resolve U-new-000001 --note '修复与回验说明' --evidence /absolute/data_root/verified.log
+```
+
+`data/runtime/issue-ledger/issues.db` 保存发生记录；原始证据按 SHA256 留快照，任务清理或 PR 重跑后仍可核对。
+四本 Markdown 账由数据库生成，默认在 `data/runtime/issue-ledger/views/`；可用本机配置
+`issue_ledger.docs_root` 指向 `docs/run_test/台账/`。新部署使用 `U-new-` / `S-new-`，不冒用遗失的历史编号。
+重复扫描不重复立账；已知 C 签名和显式配置的文件级 X 规则保留观察记录，不另立 U/S。
+跳过、超时、未取得结果均不算通过；已知签名也不自动证明环境故障或排除 PR 因果。
+正常预算导致的候选延期不会自动判为选例错误。自动监测不会安装包或改变测试结果与排除策略。
+
+测试依赖见 `docs/requirements-test.txt`，只安装到 `venv/test`，并同步到本机配置的
+`executor.test_requirements`，确保逐任务换包后仍安装它们。框架包只用 OBS 配套包；
+硬件专用包和不明缺失模块需单独核对，不按模块名猜包安装。
+
+## 飞书报告生成
+
+已按历史飞书测试报告还原 PR 链接、提交环境、六列统计表、基线前后对比、
+折叠测试详情与日志代码块。生成过程只读结果库与本次 PR 日志，不访问认证配置。
+
+```bash
+bash run.sh report render --pr 191432
+bash run.sh report scan
+```
+
+每份报告位于 `data/runtime/reports/PR_<编号>/<内容哈希>/`：
+`report.json` 为可核对数据，`report.html` 为可离线打开的预览，
+`feishu-plan.json` 为飞书原生内容块的有序发布计划。`current.json` 指向当前版本；
+内容不变不重写，重跑保留旧版本。发布计划中的表格单元格必须在创建表格返回 ID 后填充；
+`render/scan` 只生成本地文件；远端发布使用下列独立命令。
+
+本机配置加入 `"reports": {"enabled": true}` 后，常驻 `bug_monitor` 每轮自动生成报告；
+单个 PR 的报告失败会记在服务日志中，不改变测试结果或阻断其他 PR。
+
+统计表按“函数 × 设备”的测试项归类，与下方执行实例计数分开：
+Error > Failed > No Result > Skipped > Passed。部分实例跳过归入 Skipped，全部实例
+通过才归入 Passed；中断前观察计数单独展示，不冒充完整结果。
+只使用本次 `baseline-diff.json` 的历史快照；缺失、不可比或身份冲突均明确处理，
+不拿已更新的当前基线反推过去。日志缺失显示证据提示，长日志分块保留；HTML 转义，
+终端颜色码仅从展示文本中去除，SHA256 仍对应原文件。
+
+样例来源、与旧实现的边界及统计口径见 [报告还原说明](docs/report-generation.md)。
+
+### 发布到飞书
+
+将飞书专用配置保存在仓库外的受限文件（服务器示例 `/root/.config/npu-test-infra/feishu.env`，
+目录权限 0700、文件权限 0600），其中只需 `FEISHU_APP_ID`、`FEISHU_APP_SECRET`、
+`FEISHU_DOMAIN`、`FEISHU_TEST_FOLDER_TOKEN`。不要把认证内容提交 Git 或写入运行日志。
+在本机 `settings.json` 配置 `reports.feishu.env_file` 指向该文件。
+
+```bash
+bash run.sh report publish --pr 191432
+bash run.sh report publish-scan
+```
+
+验证手工发布成功后，将 `reports.enabled` 和 `reports.feishu.enabled` 设为 `true`，
+重载 `bug_monitor` 即启用自动发布。回执及断点保存在 `data/runtime/feishu-publish/`。
+上传目标只用 `FEISHU_TEST_FOLDER_TOKEN`，不写深度分析文件夹。
+先在“报告上传暂存”中构建并完整回读验证，再移入目标目录，将同名旧报告移入
+“历史测试报告”，保留旧文档及链接。内容不变不重复发布；超时后的未知写入结果必须
+经远端回读确认，无法确认时留下错误和暂存内容，不盲目再写。
 
 ## 插件
 

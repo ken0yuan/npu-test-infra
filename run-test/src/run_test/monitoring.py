@@ -76,7 +76,21 @@ def monitor_once(config, output):
             temp = path.with_suffix('.tmp')
             temp.write_text(json.dumps({'observed_at':snap['time'],**issue},ensure_ascii=False,indent=2),encoding='utf-8')
             temp.replace(path)
-    return {'time':snap['time'],'tasks_checked':len(snap['tasks']),'current_issues':len(issues),'archive':str(output)}
+    message = {'time':snap['time'],'tasks_checked':len(snap['tasks']),'current_issues':len(issues),'archive':str(output)}
+    if config.get('data_root'):
+        from .issue_ledger import scan
+        message['ledger'] = scan(config, snap)
+        if (config.get('reports') or {}).get('enabled', False):
+            from .result_docs import scan as scan_reports
+            try:
+                message['reports'] = scan_reports(config)
+                if ((config.get('reports') or {}).get('feishu') or {}).get('enabled', False):
+                    from .feishu_publish import scan as publish_reports
+                    message['feishu'] = publish_reports(config)
+            except Exception as error:
+                # A report failure must not change execution or ledger results.
+                message['reports'] = {'error': str(error)}
+    return message
 
 
 def brief_once(config):

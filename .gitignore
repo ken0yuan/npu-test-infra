@@ -49,6 +49,7 @@ id_ed25519.*
 
 # Local migration archives may contain databases, machine paths and old configs
 /docs/archive/
+/docs/run_test/台账/
 /.local-deps/
 *.egg-info/
 build/

@@ -25,7 +25,7 @@ def main():
         cfg=json.loads((root/"settings.example.json").read_text())
         cfg["data_root"]=str(root/"data/runtime")
         cfg["obs"]["downloader"]["bin"]=str(Path(args.obsutil).expanduser().resolve()) if args.obsutil else shutil.which("obsutil") or "obsutil"
-        cfg["executor"]["test_python_env"]=str(Path(args.test_python).expanduser().resolve()) if args.test_python else None
+        cfg["executor"]["test_python_env"]=os.path.abspath(os.path.expanduser(args.test_python)) if args.test_python else None
         cfg["executor"]["allowed_devices"]=[args.device]
         settings.write_text(json.dumps(cfg,ensure_ascii=False,indent=2)+"\n")
     env=dict(os.environ,PYTHONPATH=str(root/"run-test/src"))

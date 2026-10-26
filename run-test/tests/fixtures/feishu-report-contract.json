@@ -1,0 +1,569 @@
+{
+  "provenance": "Extracted from four user-authorized historical Feishu documents on 2026-10-26. Single-instance synthetic input reconstructed from displayed item outcomes; no raw logs or credentials included.",
+  "samples": [
+    {
+      "source_url": "https://mcnh5rzpwcgn.feishu.cn/docx/Vy7YdjCPNoQAPrxT0XPc9XsBnqh",
+      "source_title": "PR#194890",
+      "pr_number": 194890,
+      "metrics": {
+        "Total": 15,
+        "Passed": 5,
+        "Skipped": 10,
+        "No Result": 0,
+        "Failed": 0,
+        "Error": 0
+      },
+      "pr_heading_type": 5,
+      "detail_count": 15,
+      "tests": [
+        {
+          "test_function": "test/test_custom_ops.py::TestCustomOpAPI::test_library_get_kernel_with_conditional_dispatch",
+          "device": "cuda",
+          "counts": {
+            "pass": 1,
+            "fail": 0,
+            "error": 0,
+            "skip": 0
+          }
+        },
+        {
+          "test_function": "test/test_custom_ops.py::TestGenerateOpcheckTests::test_opcheck_preserves_pinned_memory_by_default",
+          "device": "cuda",
+          "counts": {
+            "pass": 1,
+            "fail": 0,
+            "error": 0,
+            "skip": 0
+          }
+        },
+        {
+          "test_function": "test/test_custom_ops.py::TestGenerateOpcheckTests::test_opcheck_preserves_pinned_memory_for_schema_check",
+          "device": "cuda",
+          "counts": {
+            "pass": 1,
+            "fail": 0,
+            "error": 0,
+            "skip": 0
+          }
+        },
+        {
+          "test_function": "test/test_cuda_graph_utils.py::TestAnnotationStore::test_view_is_live_and_read_only",
+          "device": "cuda",
+          "counts": {
+            "pass": 1,
+            "fail": 0,
+            "error": 0,
+            "skip": 0
+          }
+        },
+        {
+          "test_function": "test/test_cuda_graph_utils.py::TestAnnotationStore::test_writes_to_one_node_merge_first_wins",
+          "device": "cuda",
+          "counts": {
+            "pass": 1,
+            "fail": 0,
+            "error": 0,
+            "skip": 0
+          }
+        },
+        {
+          "test_function": "test/test_cuda_graph_utils.py::TestCuptiAnnotationBackend::test_auto_falls_back_when_multithreaded",
+          "device": "cuda",
+          "counts": {
+            "pass": 0,
+            "fail": 0,
+            "error": 0,
+            "skip": 1
+          }
+        },
+        {
+          "test_function": "test/test_cuda_graph_utils.py::TestCuptiAnnotationBackend::test_callback_disarmed_after_capture",
+          "device": "cuda",
+          "counts": {
+            "pass": 0,
+            "fail": 0,
+            "error": 0,
+            "skip": 1
+          }
+        },
+        {
+          "test_function": "test/test_cuda_graph_utils.py::TestCuptiAnnotationBackend::test_cupti_backend_requires_single_threaded_autograd",
+          "device": "cuda",
+          "counts": {
+            "pass": 0,
+            "fail": 0,
+            "error": 0,
+            "skip": 1
+          }
+        },
+        {
+          "test_function": "test/test_cuda_graph_utils.py::TestCuptiAnnotationBackend::test_failed_backward_does_not_leak_its_annotation",
+          "device": "cuda",
+          "counts": {
+            "pass": 0,
+            "fail": 0,
+            "error": 0,
+            "skip": 1
+          }
+        },
+        {
+          "test_function": "test/test_cuda_graph_utils.py::TestCuptiAnnotationBackend::test_invalid_backend_rejected",
+          "device": "cuda",
+          "counts": {
+            "pass": 0,
+            "fail": 0,
+            "error": 0,
+            "skip": 1
+          }
+        },
+        {
+          "test_function": "test/test_cuda_graph_utils.py::TestCuptiAnnotationBackend::test_nested_scopes_merge_inner_wins",
+          "device": "cuda",
+          "counts": {
+            "pass": 0,
+            "fail": 0,
+            "error": 0,
+            "skip": 1
+          }
+        },
+        {
+          "test_function": "test/test_cuda_graph_utils.py::TestCuptiAnnotationBackend::test_no_warning_without_body_work",
+          "device": "cuda",
+          "counts": {
+            "pass": 0,
+            "fail": 0,
+            "error": 0,
+            "skip": 1
+          }
+        },
+        {
+          "test_function": "test/test_cuda_graph_utils.py::TestCuptiAnnotationBackend::test_outer_scope_restored_after_inner_exits",
+          "device": "cuda",
+          "counts": {
+            "pass": 0,
+            "fail": 0,
+            "error": 0,
+            "skip": 1
+          }
+        },
+        {
+          "test_function": "test/test_cuda_graph_utils.py::TestCuptiAnnotationBackend::test_parity_with_edge_walk",
+          "device": "cuda",
+          "counts": {
+            "pass": 0,
+            "fail": 0,
+            "error": 0,
+            "skip": 1
+          }
+        },
+        {
+          "test_function": "test/test_cuda_graph_utils.py::TestCuptiAnnotationBackend::test_py_stacks_custom_backward",
+          "device": "cuda",
+          "counts": {
+            "pass": 0,
+            "fail": 0,
+            "error": 0,
+            "skip": 1
+          }
+        }
+      ]
+    },
+    {
+      "source_url": "https://mcnh5rzpwcgn.feishu.cn/docx/FySFdxicUoChgRx78ZxcANZenPc",
+      "source_title": "PR#191432",
+      "pr_number": 191432,
+      "metrics": {
+        "Total": 15,
+        "Passed": 11,
+        "Skipped": 4,
+        "No Result": 0,
+        "Failed": 0,
+        "Error": 0
+      },
+      "pr_heading_type": 5,
+      "detail_count": 15,
+      "tests": [
+        {
+          "test_function": "test/test_hub.py::TestHub::test_list_entrypoints",
+          "device": "cuda",
+          "counts": {
+            "pass": 1,
+            "fail": 0,
+            "error": 0,
+            "skip": 0
+          }
+        },
+        {
+          "test_function": "test/test_hub.py::TestHub::test_load_commit_from_forked_repo",
+          "device": "cuda",
+          "counts": {
+            "pass": 1,
+            "fail": 0,
+            "error": 0,
+            "skip": 0
+          }
+        },
+        {
+          "test_function": "test/test_hub.py::TestHub::test_load_state_dict_from_url",
+          "device": "cuda",
+          "counts": {
+            "pass": 1,
+            "fail": 0,
+            "error": 0,
+            "skip": 0
+          }
+        },
+        {
+          "test_function": "test/test_hub.py::TestHub::test_load_state_dict_from_url_check_hash_prefix",
+          "device": "cuda",
+          "counts": {
+            "pass": 1,
+            "fail": 0,
+            "error": 0,
+            "skip": 0
+          }
+        },
+        {
+          "test_function": "test/test_hub.py::TestHub::test_trust_repo_true",
+          "device": "cuda",
+          "counts": {
+            "pass": 1,
+            "fail": 0,
+            "error": 0,
+            "skip": 0
+          }
+        },
+        {
+          "test_function": "test/test_hub.py::TestHub::test_load_from_branch",
+          "device": "cuda",
+          "counts": {
+            "pass": 0,
+            "fail": 0,
+            "error": 0,
+            "skip": 1
+          }
+        },
+        {
+          "test_function": "test/test_hub.py::TestHub::test_load_from_github",
+          "device": "cuda",
+          "counts": {
+            "pass": 0,
+            "fail": 0,
+            "error": 0,
+            "skip": 1
+          }
+        },
+        {
+          "test_function": "test/test_hub.py::TestHub::test_load_zip_1_6_checkpoint",
+          "device": "cuda",
+          "counts": {
+            "pass": 1,
+            "fail": 0,
+            "error": 0,
+            "skip": 0
+          }
+        },
+        {
+          "test_function": "test/test_hub.py::TestHub::test_load_from_local_dir",
+          "device": "cuda",
+          "counts": {
+            "pass": 1,
+            "fail": 0,
+            "error": 0,
+            "skip": 0
+          }
+        },
+        {
+          "test_function": "test/test_hub.py::TestHub::test_trust_repo_legacy",
+          "device": "cuda",
+          "counts": {
+            "pass": 1,
+            "fail": 0,
+            "error": 0,
+            "skip": 0
+          }
+        },
+        {
+          "test_function": "test/test_hub.py::TestHub::test_trust_repo_check_yes",
+          "device": "cuda",
+          "counts": {
+            "pass": 1,
+            "fail": 0,
+            "error": 0,
+            "skip": 0
+          }
+        },
+        {
+          "test_function": "test/test_hub.py::TestHub::test_hub_parse_repo_info",
+          "device": "cuda",
+          "counts": {
+            "pass": 1,
+            "fail": 0,
+            "error": 0,
+            "skip": 0
+          }
+        },
+        {
+          "test_function": "test/test_hub.py::TestHub::test_load_legacy_zip_checkpoint",
+          "device": "cuda",
+          "counts": {
+            "pass": 0,
+            "fail": 0,
+            "error": 0,
+            "skip": 1
+          }
+        },
+        {
+          "test_function": "test/test_hub.py::TestHub::test_download_url_to_file",
+          "device": "cuda",
+          "counts": {
+            "pass": 1,
+            "fail": 0,
+            "error": 0,
+            "skip": 0
+          }
+        },
+        {
+          "test_function": "test/test_hub.py::TestHub::test_trust_repo_builtin_trusted_owners",
+          "device": "cuda",
+          "counts": {
+            "pass": 0,
+            "fail": 0,
+            "error": 0,
+            "skip": 1
+          }
+        }
+      ]
+    },
+    {
+      "source_url": "https://mcnh5rzpwcgn.feishu.cn/docx/YbBndk7upoygtDxjMXZcECM4nmh",
+      "source_title": "PR#197081",
+      "pr_number": 197081,
+      "metrics": {
+        "Total": 7,
+        "Passed": 0,
+        "Skipped": 0,
+        "No Result": 7,
+        "Failed": 0,
+        "Error": 0
+      },
+      "pr_heading_type": 5,
+      "detail_count": 7,
+      "tests": [
+        {
+          "test_function": "test/test_mps.py::TestMPS::test_dirichlet",
+          "device": "cpu",
+          "status": "no_result",
+          "reason": "historical no_result",
+          "counts": null
+        },
+        {
+          "test_function": "test/distributions/test_distributions.py::TestDistributions::test_poisson_forward_ad",
+          "device": "accelerator",
+          "status": "no_result",
+          "reason": "historical no_result",
+          "counts": null
+        },
+        {
+          "test_function": "test/distributions/test_distributions.py::TestDistributions::test_poisson_forward_ad",
+          "device": "cpu",
+          "status": "no_result",
+          "reason": "historical no_result",
+          "counts": null
+        },
+        {
+          "test_function": "test/distributions/test_distributions.py::TestDistributions::test_rand_excludes_upper_bound",
+          "device": "accelerator",
+          "status": "no_result",
+          "reason": "historical no_result",
+          "counts": null
+        },
+        {
+          "test_function": "test/distributions/test_distributions.py::TestDistributions::test_rand_excludes_upper_bound",
+          "device": "cpu",
+          "status": "no_result",
+          "reason": "historical no_result",
+          "counts": null
+        },
+        {
+          "test_function": "test/distributions/test_distributions.py::TestDistributions::test_uniform_excludes_upper_bound",
+          "device": "accelerator",
+          "status": "no_result",
+          "reason": "historical no_result",
+          "counts": null
+        },
+        {
+          "test_function": "test/distributions/test_distributions.py::TestDistributions::test_uniform_excludes_upper_bound",
+          "device": "cpu",
+          "status": "no_result",
+          "reason": "historical no_result",
+          "counts": null
+        }
+      ]
+    },
+    {
+      "source_url": "https://mcnh5rzpwcgn.feishu.cn/docx/RvRndWsVao9iGPxXPJVc5WfTnkd",
+      "source_title": "PR#201508",
+      "pr_number": 201508,
+      "metrics": {
+        "Total": 15,
+        "Passed": 11,
+        "Skipped": 3,
+        "No Result": 1,
+        "Failed": 0,
+        "Error": 0
+      },
+      "pr_heading_type": 5,
+      "detail_count": 15,
+      "tests": [
+        {
+          "test_function": "test/distributed/_tools/test_runtime_estimator.py::TestRuntimeEstimator::test_conv_model_runtime",
+          "device": "cuda",
+          "counts": {
+            "pass": 0,
+            "fail": 0,
+            "error": 0,
+            "skip": 1
+          }
+        },
+        {
+          "test_function": "test/distributed/checkpoint/test_fsdp_model_state.py::FsdpModelStateCheckpoint::test_fsdp_model_state_no_resharding",
+          "device": "cuda",
+          "counts": {
+            "pass": 1,
+            "fail": 0,
+            "error": 0,
+            "skip": 0
+          }
+        },
+        {
+          "test_function": "test/distributed/test_inductor_collectives.py::TestBucketingTrace::test_all_gather_bucket_trace_accepts_hinted_unbacked_chunk_numel",
+          "device": "cuda",
+          "counts": {
+            "pass": 1,
+            "fail": 0,
+            "error": 0,
+            "skip": 0
+          }
+        },
+        {
+          "test_function": "test/distributed/test_inductor_compile_collectives.py::TestInductorCompileCollectives::test_functionalize_inplace_allreduce",
+          "device": "cuda",
+          "counts": {
+            "pass": 1,
+            "fail": 0,
+            "error": 0,
+            "skip": 0
+          }
+        },
+        {
+          "test_function": "test/dynamo/test_model_output.py::TestHFPretrained::test_pretrained",
+          "device": "cuda",
+          "counts": {
+            "pass": 1,
+            "fail": 0,
+            "error": 0,
+            "skip": 0
+          }
+        },
+        {
+          "test_function": "test/dynamo/test_regional_inductor.py::RegionalInductorInvokeSubgraphTests::test_custom_decomposition",
+          "device": "cuda",
+          "counts": {
+            "pass": 1,
+            "fail": 0,
+            "error": 0,
+            "skip": 0
+          }
+        },
+        {
+          "test_function": "test/dynamo/test_regional_inductor_config.py::NestedRegionInductorConfigTests::test_invalid_inductor_config",
+          "device": "cuda",
+          "counts": {
+            "pass": 1,
+            "fail": 0,
+            "error": 0,
+            "skip": 0
+          }
+        },
+        {
+          "test_function": "test/dynamo/test_wrap_inductor_compiled_regions.py::TestWrapInductorCompiledRegions::test_fake_tensor_mode_works",
+          "device": "cuda",
+          "counts": {
+            "pass": 1,
+            "fail": 0,
+            "error": 0,
+            "skip": 0
+          }
+        },
+        {
+          "test_function": "test/functorch/test_codegen_runtime_wrapper.py::TestCodegenRuntimeWrapper::test_dynamic_dims",
+          "device": "cuda",
+          "counts": {
+            "pass": 1,
+            "fail": 0,
+            "error": 0,
+            "skip": 0
+          }
+        },
+        {
+          "test_function": "test/inductor/test_allow_tf32.py::TestAllowTf32ExtraKwargs::test_cache_key_records_registered_allow_tf32",
+          "device": "cpu",
+          "counts": {
+            "pass": 1,
+            "fail": 0,
+            "error": 0,
+            "skip": 0
+          }
+        },
+        {
+          "test_function": "test/inductor/test_analysis.py::TestAnalysis::test_augment_trace_against_flop_counter",
+          "device": "cpu",
+          "counts": {
+            "pass": 0,
+            "fail": 0,
+            "error": 0,
+            "skip": 1
+          }
+        },
+        {
+          "test_function": "test/inductor/test_aot_inductor_arrayref.py::TestCppWrapperCpuSelection::test_cpu_cpp_wrapper_follows_current_stack_allocation_config",
+          "device": "cpu",
+          "counts": {
+            "pass": 1,
+            "fail": 0,
+            "error": 0,
+            "skip": 0
+          }
+        },
+        {
+          "test_function": "test/inductor/test_aot_inductor_memory.py::AOTInductorMemoryTest::test_aot_compile_releases_the_weights",
+          "device": "accelerator",
+          "counts": {
+            "pass": 0,
+            "fail": 0,
+            "error": 0,
+            "skip": 1
+          }
+        },
+        {
+          "test_function": "test/inductor/test_aoti_cache_dir.py::TestAOTICacheDir::test_aoti_compile_package_with_relative_cache_dir",
+          "device": "cuda",
+          "counts": {
+            "pass": 1,
+            "fail": 0,
+            "error": 0,
+            "skip": 0
+          }
+        },
+        {
+          "test_function": "test/inductor/test_aoti_torchbind_constants.py::TestTorchbindAOTIDevice::test_custom_objs_empty_when_no_torchbind",
+          "device": "cpu",
+          "status": "no_result",
+          "reason": "historical no_result",
+          "counts": null
+        }
+      ]
+    }
+  ]
+}

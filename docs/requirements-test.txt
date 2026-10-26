@@ -1,0 +1,30 @@
+# Shared test dependencies only. torch / torch_npu / torchvision come from OBS.
+# ARM64 Ubuntu 22.04: newer z3 wheels may require a newer glibc.
+numpy==1.26.4
+z3-solver==4.15.4.0
+pytest==9.0.3
+hypothesis
+parameterized
+expecttest
+pytest-xdist
+pytest-timeout
+zstandard
+pandas
+pydot
+scipy
+sympy
+psutil
+PyYAML
+pillow
+requests
+python-dateutil
+networkx
+filelock
+fsspec
+jinja2
+packaging
+typing_extensions
+six
+setuptools>=68
+wheel
+ninja

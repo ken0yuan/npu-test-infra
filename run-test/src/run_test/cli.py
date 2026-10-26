@@ -540,6 +540,36 @@ def cmd_config_show(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_report(args):
+    from .result_docs import generate, scan
+    config = _load_config(args.config)
+    if args.report_cmd in ('publish', 'publish-scan'):
+        from .feishu_publish import publish, scan as publish_scan
+        result = publish(config, args.pr) if args.report_cmd == 'publish' else publish_scan(config)
+    else:
+        result = generate(config, args.pr) if args.report_cmd == 'render' else scan(config)
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 1 if result.get('errors') else 0
+
+
+def cmd_ledger(args):
+    from .issue_ledger import Ledger, scan
+    config = _load_config(args.config)
+    if args.ledger_cmd == 'scan':
+        result = scan(config)
+    else:
+        ledger = Ledger(config)
+        try:
+            if args.ledger_cmd == 'resolve':
+                ledger.resolve(args.identifier, args.note, args.evidence)
+                ledger.render()
+            result = ledger.summary()
+        finally:
+            ledger.close()
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0
+
+
 # ---------------------------------------------------------------------------
 # parser
 # ---------------------------------------------------------------------------
@@ -557,6 +587,24 @@ def build_parser() -> argparse.ArgumentParser:
     scan.add_argument("--output", help="JSON 清单保存路径")
     results = sub.add_parser("results", help="查询 PR 结果、失败计数及 no_result 数")
     results.add_argument("--pr", type=int, help="限定 PR 编号")
+
+    report = sub.add_parser('report', help='从真实落库结果生成飞书报告内容和离线预览')
+    rsub = report.add_subparsers(dest='report_cmd', required=True)
+    render = rsub.add_parser('render', help='生成指定 PR；不上传飞书')
+    render.add_argument('--pr', type=int, required=True)
+    rsub.add_parser('scan', help='增量生成全部当前 PR 报告；保留历史版本')
+    publish = rsub.add_parser('publish', help='发布指定 PR 到飞书测试目录，完整校验后归档旧版')
+    publish.add_argument('--pr', type=int, required=True)
+    rsub.add_parser('publish-scan', help='幂等发布全部当前 PR 报告到飞书')
+
+    ledger = sub.add_parser('ledger', help='真实问题台账：证据快照、U/S 归类、修复归档')
+    lsub = ledger.add_subparsers(dest='ledger_cmd', required=True)
+    lsub.add_parser('scan', help='扫描真实队列、选例和结果并幂等记账')
+    lsub.add_parser('status', help='查询台账统计')
+    repair = lsub.add_parser('resolve', help='附验证证据关闭问题，保留原始事件')
+    repair.add_argument('identifier')
+    repair.add_argument('--note', required=True)
+    repair.add_argument('--evidence', required=True, help='data_root 下真实验证日志路径')
 
     env = sub.add_parser("env", help="通用环境说明")
     env.add_argument("--write", action="store_true", help="采集并写入 common_environment.json")
@@ -689,6 +737,8 @@ def main(argv: list[str] | None = None) -> int:
         "executor": cmd_executor,
         "submit-result": cmd_submit_result,
         "config": cmd_config_show,
+        "ledger": cmd_ledger,
+        "report": cmd_report,
     }
     return table[args.cmd](args)
 

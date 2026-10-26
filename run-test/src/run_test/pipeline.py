@@ -56,8 +56,10 @@ def run_selection(
     设备判定（auto=AST 语义 v2，可一例多设备）→ 基线覆盖注记 → 提交清单。
     """
     import json
+    import os
     import sys
     import tarfile
+    import tempfile
 
     from . import task_queue as q
     from .baseline_store import BaselineRouter
@@ -151,7 +153,10 @@ def run_selection(
     out_dir = paths.data_root / "selection" / task.task_id
     out_dir.mkdir(parents=True, exist_ok=True)
     plan_path = out_dir / "test-plan.json"
-    plan_path.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=out_dir, delete=False) as stream:
+        temporary_plan = stream.name
+        stream.write(json.dumps(report, ensure_ascii=False, indent=2) + '\n')
+    os.replace(temporary_plan, plan_path)
     print(render_text(report))
     print(f"\n计划文件: {plan_path}")
 
@@ -198,6 +203,14 @@ def pipeline_once(config: dict, *, max_tasks_per_round: int = 50) -> dict[str, A
     # 独立 QueueStore 实例——连接不跨线程共用（db.connect 每方法新建连接）。
     import threading
 
+    def note_selection_failure(task, message):
+        report['select_errors'].append(message)
+        from .issue_ledger import selection_error
+        try:
+            selection_error(config, task, message)
+        except Exception as error:
+            report['select_errors'].append(f'{task.task_id}: 台账写入失败: {error}')
+
     def _select_worker() -> None:
         select_store = QueueStore(config)
         for task in select_store.list_tasks(STATE_PENDING_ANALYSIS):
@@ -206,9 +219,9 @@ def pipeline_once(config: dict, *, max_tasks_per_round: int = 50) -> dict[str, A
                 if rc == 0:
                     report["selected"].append(task.task_id)
                 else:
-                    report["select_errors"].append(f"{task.task_id}: select 退出码 {rc}")
+                    note_selection_failure(task, f"{task.task_id}: select 退出码 {rc}")
             except Exception as e:
-                report["select_errors"].append(f"{task.task_id}: {e}")
+                note_selection_failure(task, f"{task.task_id}: {e}")
 
     selector = threading.Thread(
         target=_select_worker, name="pipeline-select", daemon=True,
