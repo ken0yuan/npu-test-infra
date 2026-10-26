@@ -925,10 +925,12 @@ def test_merged_at_older_submission_skipped(config, router, monkeypatch):
                             AssertionError("时间戳可判时不查 Git")))
     first = make_submission(pr_number=2, pytorch_commit=COMMIT_B,
                             merged_at="2026-10-26T05:00:00Z",
+                            merged_at_provenance="upstream-main-commit-time",
                             items=[(TF_A, "cpu", Counts(5, 0, 0, 0))])
     submit_complete_result(config, first, router)
     earlier = make_submission(pr_number=1, pytorch_commit=COMMIT_A,
                               merged_at="2026-10-26T01:00:00Z",
+                              merged_at_provenance="upstream-main-commit-time",
                               items=[(TF_A, "cpu", Counts(1, 1, 1, 1))])
     report = submit_complete_result(config, earlier, router)
     rec = _baseline(router, TF_A, "cpu")

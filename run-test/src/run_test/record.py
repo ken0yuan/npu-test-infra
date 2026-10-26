@@ -593,9 +593,11 @@ def _write_databases(
                 if skip_keys and (fr.test_function, fr.device) in skip_keys:
                     continue
                 _, filename = baseline_logs[(fr.test_function, fr.device)]
-                # 合入元数据：本次提交自带优先；缺失沿用旧基线值（跨重试
-                # 保持已知 merged_at，不因 None 覆盖丢失、不串到无关 commit）。
+                # 合入元数据：本次提交自带优先；同 commit 重跑沿用旧基线值
+                # （跨重试保持已知 merged_at）。不同 commit 一律不带旧值——
+                # 旧时刻属于旧 commit，绝不串绑（用户方案第 3 条）。
                 _old = old_by_key.get((fr.test_function, fr.device))
+                _same_commit = _old is not None and _old.pytorch_commit == sub.pytorch_commit
                 upsert_baseline(
                     conn,
                     BaselineRecord(
@@ -608,10 +610,11 @@ def _write_databases(
                         coverage_status=fr.coverage_status,
                         instance_ids=fr.instance_ids,
                         environment_fingerprint=fr.environment_fingerprint,
-                        merged_at=sub.merged_at or (_old.merged_at if _old else None),
+                        merged_at=(sub.merged_at
+                                   or (_old.merged_at if _same_commit else None)),
                         merged_at_provenance=(
                             sub.merged_at_provenance
-                            or (_old.merged_at_provenance if _old else None)),
+                            or (_old.merged_at_provenance if _same_commit else None)),
                         source_pr_number=sub.pr_number,
                     ),
                 )
@@ -862,8 +865,11 @@ def submit_complete_result(
                  "submission_commit": sub.pytorch_commit,
                  "relation": relation, "reason": reason})
 
-        sub_t = _parse_utc(sub.merged_at)
-        base_t = _parse_utc(old.merged_at)
+        trusted = ('upstream-main-commit-time',)
+        sub_t = (_parse_utc(sub.merged_at)
+                 if sub.merged_at_provenance in trusted else None)
+        base_t = (_parse_utc(old.merged_at)
+                  if old.merged_at_provenance in trusted else None)
         if sub_t is not None and base_t is not None:
             # 持久化合入时刻比较：不依赖实时 Git 查询。
             if sub_t > base_t:
@@ -931,7 +937,12 @@ def submit_complete_result(
     return report
 
 
-def backfill_merged_at(config) -> dict:
+def _pr_report_exists(paths, pr_number: int) -> bool:
+    return (paths.pr_logs_root / f"PR_{pr_number}" / "report.json").is_file()
+
+
+def backfill_merged_at(config, refresh_reports: bool = False,
+                       use_lease: bool = True) -> dict:
     """存量行 merged_at 回填（用户 2026-10-26 方案第 3/5 条）。
 
     - 只回填 NULL（幂等；已有值保持——跨重试不丢失、不静默改写）；
@@ -943,13 +954,21 @@ def backfill_merged_at(config) -> dict:
     """
     from .baseline_store import baseline_db_path
     from .pr_store import set_merged_at
+    from .process_lock import executor_lease
     from .upstream import PyTorchMirror
 
+    # 维护写库必须持执行位租约（用户 2026-10-26 评审阻塞项 4）：
+    # 租约忙时如实返回 busy，不排队不阻塞、调用方稍后重试。
     paths = store_paths(config)
+    lease_cm = executor_lease(paths.queue_db.with_suffix(".executor.lock"))
+    lease = lease_cm.__enter__() if use_lease else True
+    if not lease:
+        return {"lease": "busy"}
+    stats = {"lease": "acquired", "pr_backfilled": 0, "pr_kept": 0,
+             "pr_unresolved": 0, "baseline_backfilled": 0, "baseline_kept": 0,
+             "baseline_unresolved": 0, "needs_refresh": [],
+             "reports_refreshed": [], "conflicts": []}
     mirror = PyTorchMirror(config=config)
-    stats = {"pr_backfilled": 0, "pr_kept": 0, "pr_unresolved": 0,
-             "baseline_backfilled": 0, "baseline_kept": 0, "baseline_unresolved": 0,
-             "conflicts": []}
     cache: dict[str, str | None] = {}
 
     def ts_for(sha: str):
@@ -976,8 +995,15 @@ def backfill_merged_at(config) -> dict:
             if ts is None:
                 stats["pr_unresolved"] += 1
                 continue
+            # 报告指纹防副作用（用户方案第 5 条）：已有报告的 PR 回填会改变
+            # 指纹——未指定受控刷新时跳过并登记 needs_refresh，绝不静默改。
+            if _pr_report_exists(paths, row["pr_number"]) and not refresh_reports:
+                stats["needs_refresh"].append(row["pr_number"])
+                continue
             set_merged_at(conn, row["pr_number"], ts)
             stats["pr_backfilled"] += 1
+            if refresh_reports and _pr_report_exists(paths, row["pr_number"]):
+                stats["reports_refreshed"].append(row["pr_number"])
         conn.commit()
     finally:
         conn.close()
@@ -1010,4 +1036,10 @@ def backfill_merged_at(config) -> dict:
             conn.commit()
         finally:
             conn.close()
+    if refresh_reports and stats["reports_refreshed"]:
+        from .result_docs import generate
+        for pr in stats["reports_refreshed"]:
+            generate(config, pr)  # 受控刷新：回填与报告再生成同一次维护内完成
+    if use_lease:
+        lease_cm.__exit__(None, None, None)
     return stats

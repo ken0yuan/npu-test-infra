@@ -187,7 +187,11 @@ def upsert_pr_result(conn: sqlite3.Connection, record: PrResultRecord) -> None:
             skip_count            = excluded.skip_count,
             no_result_count       = excluded.no_result_count,
             log_path              = excluded.log_path,
-            merged_at             = COALESCE(excluded.merged_at, pr_results.merged_at)
+            merged_at             = CASE
+                WHEN excluded.merged_at IS NOT NULL THEN excluded.merged_at
+                WHEN pr_results.pytorch_commit = excluded.pytorch_commit
+                    THEN pr_results.merged_at
+                ELSE NULL END
         """,
         (
             record.pr_number,

@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -566,7 +567,10 @@ def cmd_merged_at_backfill(args: argparse.Namespace) -> int:
         if Path(src).is_file():
             src_conn = _connect(src)
             try:
-                dst = backup_root / Path(src).name
+                # 每个来源唯一子目录：不同 managed 目录的 baseline.db 不互覆。
+                slot = hashlib.sha256(str(src).encode()).hexdigest()[:10]
+                dst = backup_root / slot / Path(src).name
+                dst.parent.mkdir(parents=True, exist_ok=True)
                 dst_conn = sqlite3.connect(dst)
                 try:
                     src_conn.backup(dst_conn)
@@ -574,7 +578,7 @@ def cmd_merged_at_backfill(args: argparse.Namespace) -> int:
                     dst_conn.close()
             finally:
                 src_conn.close()
-    report = backfill_merged_at(config)
+    report = backfill_merged_at(config, refresh_reports=args.refresh_reports)
     report["backup"] = str(backup_root)
     print(json.dumps(report, ensure_ascii=False, indent=2))
     return 0
@@ -773,7 +777,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("config", help="显示当前配置")
     mab = sub.add_parser("merged-at-backfill",
-                         help="存量 PR/基线行 merged_at 回填（只填 NULL，先备份，不触发报告刷新）")
+                         help="存量 PR/基线行 merged_at 回填（先租约+唯一备份；只填 NULL）")
+    mab.add_argument("--refresh-reports", action="store_true",
+                     help="对已有报告的 PR 受控回填并立即再生成报告（默认跳过并登记 needs_refresh）")
     mab.set_defaults(func=cmd_merged_at_backfill)
 
     return p
