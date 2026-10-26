@@ -57,6 +57,7 @@ def run_selection(
     """
     import json
     import os
+    import shutil
     import sys
     import tarfile
     import tempfile
@@ -91,9 +92,11 @@ def run_selection(
     body = sel_git(mirror.git_dir, "show", "-s", "--format=%B", sha).strip()
     pr_text = body or subject
 
-    # 测试树取自 OBS 源码包；同时提取该 commit 变更的源码文件。
+    # 测试树取自 OBS 源码包（任务级暂存——用户 2026-10-26：完成即删，
+    # 不留共享 source_cache 实体副本）；executor 复用同一份归档避免重复
+    # 下载。兼容：存量共享缓存存在则"收编"为任务本地副本后清点删除。
     sha10 = sha[:10]
-    cache = paths.data_root / "source_cache" / sha10
+    cache = paths.data_root / "selection" / task_id / "source-staging"
     tree = cache / "pytorch"
     changed_paths = []
     raw_changed = sel_git(mirror.git_dir, "diff", "--name-only", f"{sha}^", sha)
@@ -106,7 +109,14 @@ def run_selection(
             return 2
         pkg = cache / "pytorch-source.tar.gz"
         if not pkg.is_file():
-            downloader.download(task.obs_source_url, pkg)
+            legacy = paths.data_root / "source_cache" / sha10 / "pytorch-source.tar.gz"
+            if legacy.is_file():
+                # 收编存量共享缓存副本（避免重复下载）；共享目录稍后由
+                # 任务完成清理按"无在用引用"删除。
+                cache.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(legacy, pkg)
+            else:
+                downloader.download(task.obs_source_url, pkg)
         source_members = {f"pytorch/{path}" for path in changed_paths if not path.startswith("test/")}
         with tarfile.open(pkg, "r:gz") as tf:
             members = [m for m in tf.getmembers() if (
@@ -211,18 +221,62 @@ def pipeline_once(config: dict, *, max_tasks_per_round: int = 50) -> dict[str, A
         except Exception as error:
             report['select_errors'].append(f'{task.task_id}: 台账写入失败: {error}')
 
-    def _select_worker() -> None:
-        select_store = QueueStore(config)
-        for task in select_store.list_tasks(STATE_PENDING_ANALYSIS):
-            try:
-                rc = run_selection(config, select_store, task.task_id)
-                if rc == 0:
-                    report["selected"].append(task.task_id)
-                else:
-                    note_selection_failure(task, f"{task.task_id}: select 退出码 {rc}")
-            except Exception as e:
-                note_selection_failure(task, f"{task.task_id}: {e}")
+    sel_cfg = (config.get("selector") or {})
+    select_timeout = float(sel_cfg.get("task_timeout_seconds") or 900)
+    config_path = config.get("_config_path") or str(
+        paths.data_root.parent.parent / "settings.json") if False else config.get(
+        "_config_path") or "settings.json"
 
+    def _select_worker() -> None:
+        """持续消费：循环刷新 pending_analysis 候选（轮内新到任务也处理）；
+        每个任务的筛选在独立子进程运行（超时/卡死只杀该子进程组，不冻结
+        队列），超时上限 selector.task_timeout_seconds。"""
+        select_store = QueueStore(config)
+        attempted: set[str] = set()
+        import os as _os
+        import signal as _signal
+        import subprocess as _subprocess
+        import sys as _sys
+        while True:
+            pending = [t for t in select_store.list_tasks(STATE_PENDING_ANALYSIS)
+                       if t.task_id not in attempted]
+            if not pending:
+                if stop_event.is_set():
+                    break
+                time.sleep(1)
+                continue
+            for task in pending:
+                if stop_event.is_set():
+                    return
+                attempted.add(task.task_id)
+                try:
+                    proc = _subprocess.Popen(
+                        [_sys.executable, "-m", "run_test.pipeline", "select-one",
+                         "--task", task.task_id, "--config", config_path],
+                        cwd=str(_os.getcwd()), stdout=_subprocess.DEVNULL,
+                        stderr=_subprocess.PIPE, text=True,
+                        start_new_session=True)
+                    try:
+                        _, err = proc.communicate(timeout=select_timeout)
+                        rc = proc.returncode
+                    except _subprocess.TimeoutExpired:
+                        # 只杀该任务的筛选进程组（含孤儿子进程），任务留在
+                        # pending_analysis 下轮重试，证据入台账。
+                        _os.killpg(_os.getpgid(proc.pid), _signal.SIGKILL)
+                        proc.communicate()
+                        note_selection_failure(
+                            task, f"{task.task_id}: 筛选超时（>{select_timeout:.0f}s），"
+                                  "子进程组已终止；任务保留待重试")
+                        continue
+                    if rc == 0:
+                        report["selected"].append(task.task_id)
+                    else:
+                        note_selection_failure(
+                            task, f"{task.task_id}: select 退出码 {rc} {((err or '')[-300:])}")
+                except Exception as e:
+                    note_selection_failure(task, f"{task.task_id}: {e}")
+
+    stop_event = threading.Event()
     selector = threading.Thread(
         target=_select_worker, name="pipeline-select", daemon=True,
     )
@@ -238,8 +292,13 @@ def pipeline_once(config: dict, *, max_tasks_per_round: int = 50) -> dict[str, A
     while len(report["executed"]) < cap:
         outcome = executor.run_once()
         if outcome.outcome == "idle":
+            remaining = store.list_tasks(STATE_PENDING_ANALYSIS)
+            if remaining:
+                time.sleep(0.5)  # 还有待筛选任务：等 selector 产出清单
+                continue
             if selector.is_alive():
-                time.sleep(0.5)  # select 仍在产清单，稍候再取
+                stop_event.set()  # 队列已清空：通知 selector 收班
+                time.sleep(0.5)
                 continue
             break
         report["executed"].append({
@@ -247,5 +306,6 @@ def pipeline_once(config: dict, *, max_tasks_per_round: int = 50) -> dict[str, A
             "outcome": outcome.outcome,
             "detail": outcome.detail[:200],
         })
+    stop_event.set()
     selector.join()
     return report
