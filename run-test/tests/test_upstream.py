@@ -273,3 +273,78 @@ def test_detect_inversions_synthetic():
     assert detect_inversions([("a", 100), ("b", 90)]) == []
     inv = detect_inversions([("a", 100), ("b", 150), ("c", 120)])
     assert [i["sha"] for i in inv] == ["b"]
+
+
+# ---------------------------------------------------------------------------
+# 合入序快照（评审阻塞项 1/4：成员绑定 + 原子持久化 + 位置比较）
+# ---------------------------------------------------------------------------
+
+import os as _os
+import subprocess as _subprocess
+
+
+def _make_git_fixture(tmp_path):
+    """真实临时 Git 仓库：main 上三个 first-parent 提交（c1←c2←c3）。"""
+    work = tmp_path / "fixture"
+    work.mkdir()
+    env = {**_os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+           "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+    def _git(*args):
+        _subprocess.run(["git", "--git-dir", str(work), *args],
+                        check=True, capture_output=True, env=env)
+    _subprocess.run(["git", "init", "--bare", "-q", str(work)], check=True,
+                    capture_output=True, env=env)
+    # 用临时工作区制造三个提交再推入裸仓库
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    def _commit(msg):
+        (wt / "f.txt").write_text(msg, encoding="utf-8")
+        for cmd in (["-C", str(wt), "add", "f.txt"],
+                    ["-C", str(wt), "commit", "-q", "-m", msg]):
+            _subprocess.run(["git", *cmd], check=True, capture_output=True, env=env)
+    _subprocess.run(["git", "-C", str(wt), "init", "-q", "-b", "main"],
+                    check=True, capture_output=True, env=env)
+    _commit("c1"); c1 = _subprocess.run(["git", "-C", str(wt), "rev-parse", "HEAD"],
+                                        capture_output=True, text=True, env=env).stdout.strip()
+    _commit("c2"); c2 = _subprocess.run(["git", "-C", str(wt), "rev-parse", "HEAD"],
+                                        capture_output=True, text=True, env=env).stdout.strip()
+    _commit("c3"); c3 = _subprocess.run(["git", "-C", str(wt), "rev-parse", "HEAD"],
+                                        capture_output=True, text=True, env=env).stdout.strip()
+    _subprocess.run(["git", "-C", str(wt), "push", "-q", str(work), "main"],
+                    check=True, capture_output=True, env=env)
+    return work, (c1, c2, c3)
+
+
+class _FakeMirror:
+    def __init__(self, git_dir):
+        self.git_dir = str(git_dir)
+        self.repo_url = "file:///fixture"
+
+
+def test_validate_and_persist_order_snapshot(tmp_path, config):
+    """fetch 时一次校验 + 原子持久化：快照含完整 SHA 序列/来源/schema。"""
+    import json
+    work, (c1, c2, c3) = _make_git_fixture(tmp_path)
+    from run_test.upstream import validate_merge_order, persist_order_snapshot, load_order_snapshot
+    mirror = type("M", (), {"git_dir": str(work), "repo_url": "file:///fixture"})()
+    snapshot = validate_merge_order(mirror, limit=100)
+    assert snapshot["order"] == [c3, c2, c1]  # 新→旧
+    assert snapshot["schema"] == "upstream-order/1"
+    persist_order_snapshot(config, snapshot)
+    loaded = load_order_snapshot(config)
+    assert loaded["order"] == [c3, c2, c1] and loaded["source"] == "file:///fixture"
+    # 原子性：无临时残留
+    assert not list((tmp_path / "data").glob("upstream-order.json.tmp*"))
+
+
+def test_load_order_snapshot_corrupt_returns_none(config, tmp_path):
+    from run_test.config import store_paths
+    from run_test.upstream import load_order_snapshot
+    paths = store_paths(config)
+    target = paths.data_root / "upstream-order.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("{corrupt", encoding="utf-8")
+    assert load_order_snapshot(config) is None
+    target.write_text('{"schema": "wrong"}', encoding="utf-8")
+    assert load_order_snapshot(config) is None
+    assert not target.exists() or load_order_snapshot(config) is None

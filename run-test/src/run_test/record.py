@@ -847,7 +847,7 @@ def submit_complete_result(
     # 关系（ancestry 守卫保留，时间戳路径经端到端验证前不拆除）；两种途径
     # 都无法建立先后 → 保守保留现有基线（DB 行与日志都不动）并留痕。
     # 更晚合入 / 同 commit 重跑照常刷新；PR 结果库照常记录该次提交。
-    from .upstream import PyTorchMirror
+    from .upstream import PyTorchMirror, load_order_snapshot, order_position
 
     mirror = PyTorchMirror(config=config)
     merge_skipped: list[dict] = []

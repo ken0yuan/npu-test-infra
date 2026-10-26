@@ -24,6 +24,7 @@
 from __future__ import annotations
 
 import re
+import os
 import subprocess
 from dataclasses import dataclass, field
 import json
@@ -57,25 +58,82 @@ def detect_inversions(entries: list[tuple[str, int]]) -> list[dict]:
     return inversions
 
 
+ORDER_SNAPSHOT_SCHEMA = "upstream-order/1"
+
+
 def validate_merge_order(mirror, *, limit: int = 1000) -> dict:
-    """对 main first-parent 最近 limit 个提交做一次顺序校验（fetch 时
-    调用一次，结果持久化 data_root/upstream-order.json——结果提交侧不再
-    联网校验，异常时提交守卫回退 Git 祖先）。"""
+    """fetch 时一次校验并构建**合入序快照**（用户 2026-10-26 评审阻塞项
+    1/4：成员绑定——持久化完整 first-parent SHA 序列，提交守卫仅在双方
+    完整 commit 都在快照内时用位置比较排序，时间戳降级为元数据）。
+
+    返回快照 dict（schema/source/tip/checked/order/times/inversions），
+    由调用方经 persist_order_snapshot 原子落盘。
+    """
     fmt = "%H%x00%ct"
     out = _git(mirror.git_dir, ["log", "--first-parent", f"--max-count={limit}",
                                 f"--format={fmt}", "main"])
-    entries = []
+    shas, times = [], []
     for line in out.splitlines():
         if not line.strip():
             continue
         sha, ts = (line.split("\x00", 1) + [""])[:2]
         if ts.isdigit():
-            entries.append((sha, int(ts)))
-    inversions = detect_inversions(entries)
-    return {"tip": entries[0][0] if entries else None,
-            "checked": len(entries),
-            "max_commit_time": entries[0][1] if entries else None,
-            "inversions": inversions}
+            shas.append(sha)
+            times.append(int(ts))
+    entries = list(zip(shas, times))
+    return {"schema": ORDER_SNAPSHOT_SCHEMA,
+            "source": mirror.repo_url,
+            "tip": shas[0] if shas else None,
+            "checked_tip": shas[0] if shas else None,
+            "limit": limit,
+            "checked": len(shas),
+            "order": shas,          # 新→旧完整 first-parent 序列（成员绑定）
+            "times": times,         # 元数据（committer 时刻，不参与排序）
+            "inversions": detect_inversions(entries)}
+
+
+def persist_order_snapshot(config, snapshot: dict) -> Path:
+    """原子落盘顺序快照（评审阻塞项 1：临时文件 + os.replace）。"""
+    import tempfile
+    paths = store_paths(config)
+    target = paths.data_root / "upstream-order.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8',
+                                     dir=target.parent, delete=False) as stream:
+        temporary = Path(stream.name)
+        stream.write(json.dumps(snapshot, ensure_ascii=False, indent=2) + '\n')
+    os.replace(temporary, target)
+    return target
+
+
+def load_order_snapshot(config) -> dict | None:
+    """读取并校验顺序快照；缺失/损坏/schema 不符 → None（调用方回退
+    本地祖先，绝不只凭标签信任）。"""
+    paths = store_paths(config)
+    path = paths.data_root / "upstream-order.json"
+    if not path.is_file():
+        return None
+    try:
+        snap = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if (not isinstance(snap, dict)
+            or snap.get("schema") != ORDER_SNAPSHOT_SCHEMA
+            or not isinstance(snap.get("order"), list)
+            or not snap.get("tip")
+            or not snap.get("source")):
+        return None
+    if snap.get("inversions"):
+        return None  # 有倒序的快照不可作排序依据
+    return snap
+
+
+def order_position(snapshot: dict, sha: str) -> int | None:
+    """完整 commit 在快照内的位置（新→旧）；未覆盖返回 None。"""
+    try:
+        return snapshot["order"].index(sha)
+    except (KeyError, ValueError):
+        return None
 
 
 def _parse_log(out: str) -> list["UpstreamCommit"]:
@@ -341,6 +399,15 @@ def run_cycle(
     report.recorded = rec
     report.skipped_no_pr = no_pr
     queue.set_mirror_tip(mirror.repo_url, report.fetched_tip)
+
+    # fetch 时一次合入序校验 + 原子快照（评审阻塞项 1：此前只定义未调用）。
+    try:
+        snapshot = validate_merge_order(mirror)
+        persist_order_snapshot(config, snapshot)
+        if snapshot["inversions"]:
+            report.merge_order_inversions = snapshot["inversions"]
+    except Exception as e:  # 校验失败不阻塞轮；提交守卫回退本地祖先
+        report.errors.append(f"合入序快照失败: {e}")
 
     # 2. 对未入队 commit 定位桶中对象：先取桶快照（一次 ls），
     #    再在内存中匹配对象名，避免对每个 commit 逐个 stat。
