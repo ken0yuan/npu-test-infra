@@ -290,6 +290,9 @@ def render_html(model):
     return ''.join(parts) + '</html>\n'
 
 
+TEXT_ELEMENT_LIMIT = 45_000  # 本租户历史成功样本实测（90k 字符块/2 元素）；官方值核实前以此为准
+
+
 def text_block(kind, text, *, bold=False, folded=False, link=None):
     types = {'text': 2, 'heading3': 5, 'heading4': 6, 'code': 14}
     style = {'bold': bold}
@@ -375,14 +378,21 @@ def feishu_plan(model, budget=None):
         return blocks, chars
 
     # 逻辑节：逐测试整节移动（一个测试不跨篇，保证连续性）。
+    # 块内元素按 TEXT_ELEMENT_LIMIT 切分（真实元素上限的租户实证值），
+    # 一个日志=一个连续块，拼接零丢失——8k 不再是产品级分块。
+    def _continuous_block(kind, text):
+        elements = [{'text_run': {'content': text[i:i + TEXT_ELEMENT_LIMIT]}}
+                    for i in range(0, len(text), TEXT_ELEMENT_LIMIT)] or [{'text_run': {'content': ''}}]
+        style = {'language': 1, 'wrap': True} if kind == 'code' else {'align': 1, 'folded': True}
+        block_type = {'text': 2, 'code': 14}[kind]
+        return {'block_type': block_type, kind: {'elements': elements, 'style': style}}
+
     test_sections = []
     for test in model['tests']:
         section = [text_block('heading4', detail_title(test), bold=True, folded=True)]
         for note in detail_notes(test):
-            for offset in range(0, len(note), 8000):
-                section.append(text_block('text', note[offset:offset+8000]))
-        log = test['log']['text']
-        section.extend([text_block('code', log[i:i+8000]) for i in range(0, len(log), 8000)] or [text_block('code', '')])
+            section.append(_continuous_block('text', note))
+        section.append(_continuous_block('code', test['log']['text']))
         test_sections.append((detail_title(test), section))
 
     parts = [{'role': 'main', 'title_suffix': '', 'ops': list(header_ops),
@@ -399,23 +409,51 @@ def feishu_plan(model, budget=None):
     cur_blocks, cur_chars = _ops_size(parts[0]['ops'])
     for label, section in test_sections:
         blocks, chars = _blocks_size(section)
-        fits = (cur_blocks + blocks <= max_blocks and cur_chars + chars <= max_chars)
-        if fits:
+        # 常规路径：整节放入当前篇（预算内）。
+        if (cur_blocks + blocks <= max_blocks and cur_chars + chars <= max_chars) \
+                and not (blocks > max_blocks or chars > max_chars):
             _part_append(parts[-1], section)
             cur_blocks += blocks
             cur_chars += chars
-        else:
-            parts.append({'role': 'continuation', 'title_suffix': f'-{len(parts)}',
-                          'ops': [], 'over': False})
-            _part_append(parts[-1], section)
-            parts[-1]['over'] = blocks > max_blocks or chars > max_chars
-            cur_blocks, cur_chars = _blocks_size(section)
+            continue
+        # 超预算节（或当前篇放不下且节本身超预算）：把节的块序列按预算
+        # 分组拆到一篇或多篇续篇（块为原子，全文零丢失），每篇带上下文头
+        # 与续篇标记，满足"单一超长测试跨篇"。
+        groups, cur, cb, cc = [], [], 0, 0
+        for block in section:
+            b, c = _blocks_size([block])
+            if cur and (cb + b > max_blocks or cc + c > max_chars):
+                groups.append(cur)
+                cur, cb, cc = [], 0, 0
+            cur.append(block)
+            cb += b
+            cc += c
+        if cur:
+            groups.append(cur)
+        total = len(groups)
+        for gi, group in enumerate(groups):
+            if gi > 0 or cur_blocks + _blocks_size(group)[0] > max_blocks \
+                    or cur_blocks + _blocks_size(group)[1] > max_chars:
+                parts.append({'role': 'continuation',
+                              'title_suffix': f'-{len(parts)}', 'ops': [], 'over': False})
+                cur_blocks, cur_chars = 0, 0
+            head = ([text_block('heading4', f'{label}（续 {gi + 1}/{total}）', bold=True, folded=True)]
+                    if gi > 0 else [])
+            _part_append(parts[-1], head + group)
+            cur_blocks, cur_chars = _blocks_size(group)
     if len(parts) > 1:
         parts[0]['ops'].append({'op': 'toc',
                                 'titles': [model['title'] + p['title_suffix'] for p in parts[1:]]})
     parts_out = [{'part_index': i, 'role': ('main' if i == 0 else 'continuation'),
                   'title_suffix': p['title_suffix'], 'over_budget': p['over'],
                   'operations': p['ops']} for i, p in enumerate(parts)]
+    import sys as _sys
+    _sizes = [_blocks_size([b for op in p['operations'] if op.get('body')
+                            for b in op['body'].get('children', [])]) for p in parts_out]
+    print(f"[DEBUG] max_chars={max_chars} max_blocks={max_blocks} parts={len(parts_out)} "
+          f"sizes={_sizes} test_log_len={[len(t['log']['text']) for t in model['tests']]}",
+          flush=True, file=_sys.stderr)
+
     # 扁平 operations = 全部篇依序拼接：无丢失校验与旧消费方兼容。
     flattened = [op for p in parts_out for op in p['operations']]
     return {'schema': 'feishu-report-plan/2', 'title': model['title'],
@@ -455,8 +493,10 @@ def _generate_locked(config, pr):
     root = store_paths(config).data_root / 'reports' / f'PR_{pr}'
     # Content-addressed versions preserve reruns; current.json changes last.
     version = root / fingerprint
+    fs = (config.get('feishu') or {})
+    budget = {k: fs[k] for k in ('doc_max_blocks', 'doc_max_chars') if k in fs} or None
     outputs = {'report.json': encoded(model), 'report.html': render_html(model),
-               'feishu-plan.json': encoded(feishu_plan(model))}
+               'feishu-plan.json': encoded(feishu_plan(model, budget))}
     changed = False
     for name, content in outputs.items():
         target = version / name

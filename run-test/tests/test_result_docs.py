@@ -144,10 +144,13 @@ def test_long_logs_are_lossless_and_html_is_escaped():
     assert '\x1b' not in output
     plan = docs.feishu_plan(m)
     code = [b for b in appended(plan) if b['block_type'] == 14]
-    assert len(code) > 1
-    assert ''.join(text_of(b) for b in code) == cleaned
-    assert all(len(text_of(b)) <= 8000 for b in code)
-    assert all(len(op.get('body', {}).get('children', [])) <= 40 for op in plan['operations'])
+    # 连续块契约：一个日志=一个代码块，元素内切分拼接零丢失（用户
+    # 2026-10-26 澄清——8k 不再是产品级分块）。
+    assert len(code) == 1
+    assert ''.join(e['text_run']['content']
+                   for e in code[0]['code']['elements']) == cleaned
+    assert all(len(e['text_run']['content'])
+               <= docs.TEXT_ELEMENT_LIMIT for e in code[0]['code']['elements'])
     assert 'local_unpublished' == plan['status']
     assert 'block_id' not in json.dumps(plan)
 

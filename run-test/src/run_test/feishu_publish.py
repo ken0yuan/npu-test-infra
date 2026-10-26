@@ -285,51 +285,77 @@ class Publisher:
         else:
             self.state = {'pr_number': pr, 'fingerprint': fingerprint,
                           'folder': self.folder, 'status': 'staging'}
-            self.save()
+        # schema 钉住（评审阻塞项 5）：resume 时计划 schema 与暂存态不一致
+        # → 弃旧暂存重开（旧暂存文档留在暂存目录无害），绝不跨 schema 续传。
+        if self.state.get('plan_schema') != plan.get('schema'):
+            self.state = {'pr_number': pr, 'fingerprint': fingerprint,
+                          'folder': self.folder, 'status': 'staging',
+                          'plan_schema': plan.get('schema'),
+                          'resumed_from_migrated_staging': True}
+        self.state['plan_schema'] = plan.get('schema')
+        self.save()
         if self.state['status'] == 'published':
             return {**self.state['receipt'], 'changed': False}
         staging = self.unique_object('staging', self.folder, '报告上传暂存', 'folder')
         version = self.unique_object('version_folder', staging, f'PR_{pr}_{fingerprint}', 'folder')
         parts = plan['parts']
-        toc_by_part = {pi: [] for pi in range(len(parts))}
         docs = [self.unique_object(f'part{p["part_index"]}-doc', version,
                                    plan['title'] + p['title_suffix'], 'docx')
                 for p in parts]
         # 旧消费方/旧测试读取主篇 token 的兼容键（单篇回执同形）。
         self.state['document_id'] = docs[0]
         self.save()
+        TRANSPORT_BATCH = 40  # 单请求块数上限（传输批量，非产品分块）
+        expanded_lists = []
         for pi, part in enumerate(parts):
             doc = docs[pi]
-            toc_ops = []
-            for i, operation in enumerate(part['operations']):
+            # 展开本篇操作：toc 占位替换为链接块；table 保持原 op。
+            # 续篇带返回主篇/上一篇/下一篇导航（评审要求 backlink+prev/next）。
+            expanded = []
+            if pi > 0:
+                nav = []
+                if pi > 1:
+                    nav.append(result_docs.text_block('text', '上一篇',
+                                link=f'{self.domain}/docx/{docs[pi - 1]}'))
+                nav.append(result_docs.text_block('text', '返回主篇',
+                            link=f'{self.domain}/docx/{docs[0]}'))
+                if pi + 1 < len(parts):
+                    nav.append(result_docs.text_block('text', '下一篇',
+                                link=f'{self.domain}/docx/{docs[pi + 1]}'))
+                expanded.append({'op': 'append', 'parent': 'document',
+                                 'body': {'index': -1, 'children': nav}})
+            for operation in part['operations']:
                 if operation['op'] == 'toc':
                     links = [result_docs.text_block('text', plan['title'] + p['title_suffix'],
-                                        link=f'{self.domain}/docx/{docs[p["part_index"]]}')
+                                                    link=f'{self.domain}/docx/{docs[p["part_index"]]}')
                              for p in parts[1:]]
-                    toc_ops.append({'op': 'append', 'parent': 'document',
-                                    'body': {'index': -1,
-                                             'children': [result_docs.text_block('heading4', '本报告分篇（续篇链接）', bold=True)] + links}})
-                    self.append(f'part{pi}-toc', doc, doc, toc_ops[-1]['body']['children'])
-                    toc_by_part[pi].append(toc_ops[-1])
-                    continue
-                created = self.append(f'part{pi}-root-{i}', doc, doc, operation['body']['children'])
-                if operation['op'] == 'table':
-                    table = created[0]
-                    cells = table.get('table', {}).get('cells')
-                    if not cells:
-                        table = next(b for b in self.api.blocks(doc) if b['block_id'] == table['block_id'])
-                        cells = table['table']['cells']
-                    if len(cells) != len(operation['cell_children']):
-                        raise PublishError('建表返回单元格数量异常')
-                    for j, (cell, children) in enumerate(zip(cells, operation['cell_children'])):
-                        self.append(f'cell-{pi}-{i}-{j}', doc, cell, children)
-            if part.get('over_budget'):
-                # 单测试节超出软预算：保持连续如实标注（官方硬限未核实）。
-                self.state[f'part{pi}-over-budget'] = True
-                self.save()
-        # 逐篇回读校验：TOC 占位不计（其真实链接块由 toc_by_part 提供）。
-        verifications = [self.verify(doc, {'operations': [op for op in part['operations']
-                                                          if op.get('op') != 'toc'] + toc_by_part[pi]})
+                    expanded.append({'op': 'append', 'parent': 'document',
+                                     'body': {'index': -1,
+                                              'children': [result_docs.text_block('heading4', '本报告分篇（续篇链接）', bold=True)] + links}})
+                else:
+                    expanded.append(operation)
+            # 40 块传输分片：稳定步 ID（断点续传幂等）；表格块随片上传，
+            # 片响应后按返回 ID 回填单元格。
+            flat = [(op, b) for op in expanded
+                    for b in op.get('body', {}).get('children', [])]
+            for k in range(0, len(flat), TRANSPORT_BATCH):
+                chunk = flat[k:k + TRANSPORT_BATCH]
+                created = self.append(f'part{pi}-chunk{k // TRANSPORT_BATCH}', doc, doc,
+                                      [b for _, b in chunk])
+                created_ids = [b['block_id'] for b in created]
+                for (op, block), bid in zip(chunk, created_ids):
+                    if op['op'] == 'table':
+                        table = next((b for b in self.api.blocks(doc)
+                                      if b['block_id'] == bid), None)
+                        cells = (table or {}).get('table', {}).get('cells') or []
+                        if len(cells) != len(op['cell_children']):
+                            raise PublishError('建表返回单元格数量异常')
+                        for j, (cell, children) in enumerate(zip(cells, op['cell_children'])):
+                            for k2 in range(0, len(children), TRANSPORT_BATCH):
+                                self.append(f'cell-{pi}-{k // TRANSPORT_BATCH}-{j}-{k2}',
+                                            doc, cell, children[k2:k2 + TRANSPORT_BATCH])
+            expanded_lists.append(expanded)
+        verifications = [self.verify(doc, {'operations': expanded_lists[pi]})
                          for part, doc, pi in zip(parts, docs, range(len(parts)))]
         if not still_current():
             raise PublishError('本地结果已更新；已验证的旧版本留在暂存，未替换当前文档')

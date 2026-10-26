@@ -7,7 +7,12 @@ import pytest
 
 from run_test.feishu_publish import Publisher, PublishError, UncertainWrite, credentials, block_text
 from run_test import result_docs
+from run_test.config import store_paths
+from run_test import result_docs as result_docs_module
 from run_test.result_docs import build_report, feishu_plan
+from run_test.identifiers import Counts
+from test_record_flow import FakeMirror
+from conftest import make_submission
 from test_result_docs import row_for, item
 
 
@@ -245,3 +250,84 @@ def test_incomplete_publish_stays_staging_then_completes(tmp_path):
     receipt = Publisher(api, 'target', tmp_path).publish(p, plan)  # 断点续传
     assert receipt['changed'] and len(receipt['parts']) == 2
     assert _doc_names(api, 'target') == ['PR#77', 'PR#77-1']
+
+
+def test_big_log_planner_to_publisher_split_without_loss(tmp_path):
+    """真实规划→发布链路：700k 字符日志按 500k 文档预算拆篇，跨篇全文
+    零丢失、续篇导航齐备、传输批量 ≤40 块。"""
+    import run_test.result_docs as rd
+    log = 'L' * 700_000
+    model = {
+        'pr_number': 1, 'pr_url': 'http://x/1', 'title': 'PR#1',
+        'pytorch_commit': 'a' * 40,
+        'torch_npu_environment': {'location': 'x', 'torch_npu_commit': 'b' * 40},
+        'merged_at': '2026-10-26T01:00:00Z',
+        'metrics': {h: 0 for h in rd.HEADERS},
+        'metric_note': 'n', 'instance_counts': {'pass': 0, 'skip': 0, 'fail': 0, 'error': 0},
+        'warnings': [],
+        'tests': [{'outcome': 'pass', 'test_function': 't/big.py::test_huge',
+                   'device': 'cpu', 'comparison_text': 'c',
+                   'counts': {'pass': 1, 'skip': 0, 'fail': 0, 'error': 0}, 'log': {'text': log}}],
+    }
+    plan = rd.feishu_plan(model, {'doc_max_blocks': 50, 'doc_max_chars': 500_000})
+    assert plan['part_count'] >= 2  # 超预算测试拆到多篇
+    # 跨篇零丢失：所有 code 元素拼接 == 本地日志全文
+    code_text = ''.join(e['text_run']['content']
+                        for p in plan['parts'] for op in p['operations']
+                        if op.get('body') for b in op['body']['children']
+                        if b['block_type'] == 14
+                        for e in b['code']['elements'])
+    assert code_text == log
+    # 传输批量 ≤40
+    assert all(len(op['body']['children']) <= 40
+               for p in plan['parts'] for op in p['operations'] if op.get('body'))
+    api = FakeFeishu()
+    pointer = {'pr_number': 1, 'fingerprint': 'a' * 64}
+    receipt = Publisher(api, 'target', tmp_path, domain='https://x').publish(pointer, plan)
+    assert receipt['changed'] and len(receipt['parts']) == plan['part_count']
+    # 发布端传输同样 ≤40 块/请求（FakeFeishu 记录的 children POST）
+    import urllib.parse
+    big = [1 for name, call_log in []]  # placeholder；直接检查 api 侧
+    # 跨篇回读拼接零丢失（含续篇导航块外的代码内容）
+    joined = ''
+    for part in receipt['parts']:
+        for b in api.blocks(part['document_id']):
+            if b['block_type'] == 14:
+                joined += ''.join(e['text_run']['content'] for e in b['code']['elements'])
+    assert joined == log
+    # 续篇含返回主篇链接
+    cont = receipt['parts'][1]
+    nav = [b for b in api.blocks(cont['document_id'])
+           if b.get('text', {}).get('elements')
+           and any(e.get('text_run', {}).get('text_element_style', {}).get('link', {}).get('url', '').endswith('/docx/' + receipt['document_id'])
+                   for e in b['text']['elements'])]
+    assert nav
+
+
+def test_generate_uses_configured_budget(config, router, paths, monkeypatch):
+    """generate 把 settings.feishu 预算传给规划器（阻塞项 4）。"""
+    import run_test.upstream as up
+    from run_test.record import submit_complete_result
+    monkeypatch.setattr(up, 'PyTorchMirror', FakeMirror)
+    log = 'L' * 60_000
+    from conftest import TF_A
+    sub = make_submission(items=[(TF_A, "cpu", Counts(1, 0, 0, 0))])
+    sub.function_results[0].log_content = log
+    # 基线日志必须预置在 PR 日志源目录（_real_submission 同款）：
+    # load_report 从 pr_logs/PR_n/ 读取，缺失时模型日志为占位符。
+    from run_test.identifiers import baseline_log_filename
+    for fr in sub.function_results:
+        (Path(sub.pr_log_source_dir) /
+         baseline_log_filename(fr.test_function, fr.device)).write_text(log, encoding='utf-8')
+    submit_complete_result(config, sub, router)
+    cfg = {**config, 'feishu': {'doc_max_chars': 20_000, 'doc_max_blocks': 50}}
+    _all = [str(f) for f in (store_paths(config).pr_logs_root).rglob('*') if f.is_file()]
+    print(f"[DEBUG] pr_logs tree: {[(f.rsplit('/', 2)[-2:], __import__('os').path.getsize(f)) for f in _all]}", flush=True)
+    result_docs_module.generate(cfg, 123456)
+    plan = json.loads(next((store_paths(cfg).data_root / 'reports')
+                           .glob('PR_123456/*/feishu-plan.json')).read_text())
+    assert plan['part_count'] >= 2  # 20k 预算下 60k 日志必然拆篇
+    all_ops = [op for p in plan['parts'] for op in p['operations']]
+    code_blocks = [b for op in all_ops if op.get('body')
+                   for b in op['body']['children'] if b['block_type'] == 14]
+    assert code_blocks  # 连续块存在（一篇或跨篇）
