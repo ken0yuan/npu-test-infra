@@ -513,6 +513,7 @@ def _write_databases(
     paths, router: BaselineRouter, sub: Submission, pr_log_rel: str,
     baseline_logs: dict[tuple[str, str], tuple[str, str]],
     diffs: list[BaselineDiff] | None = None,
+    skip_keys: set | None = None,
 ) -> None:
     # PR 汇总只计取得结果的函数；no_result 不产生任何计数。
     totals = Counts.sum(
@@ -564,6 +565,8 @@ def _write_databases(
         try:
             conn.execute("BEGIN IMMEDIATE")
             for fr in frs:
+                if skip_keys and (fr.test_function, fr.device) in skip_keys:
+                    continue
                 _, filename = baseline_logs[(fr.test_function, fr.device)]
                 upsert_baseline(
                     conn,
@@ -595,13 +598,17 @@ DIFF_ARCHIVE_NAME = "baseline-diff.json"
 
 
 def _write_baseline_diff_archive(
-    paths, pr_log_rel: str, sub: Submission, diffs: list[BaselineDiff]
+    paths, pr_log_rel: str, sub: Submission, diffs: list[BaselineDiff],
+    merge_skipped: list[dict] | None = None,
 ) -> str:
     """把步骤 2 的旧基线对比固化为 pr_logs/PR_<n>/baseline-diff.json。
 
     这是该 PR 真实的"改动前基线 vs 本次结果"档案：基线前滚脚本优先用它
     生成前后对比文件（重建模式只作回退，before 可能已被后续 PR 刷新）。
+    合入序防护跳过的行如实记为 merge_order_skipped（after 为"未应用"的
+    本次结果），不得伪装成 overwritten。
     """
+    skipped = {(s['test_function'], s['device']): s for s in (merge_skipped or [])}
     comparisons = []
     for d in diffs:
         if d.old_record is None:
@@ -642,6 +649,29 @@ def _write_baseline_diff_archive(
             )
             continue
         fr_meta = next((fr for fr in sub.function_results if fr.test_function == d.test_function and fr.device == d.device), None)
+        skip = skipped.get((d.test_function, d.device))
+        if skip is not None:
+            # 合入序防护跳过：基线保持旧值；after 是"未应用"的本次结果。
+            comparisons.append(
+                {
+                    "test_function": d.test_function,
+                    "device": d.device,
+                    "managed_dir": d.managed_dir,
+                    "baseline_action": "merge_order_skipped",
+                    "before": before,
+                    "after": {
+                        "counts": d.new_counts.as_dict() if d.new_counts else None,
+                        "status": "merge_order_skipped",
+                        "applied": False,
+                        "reason": skip["reason"],
+                        "relation": skip["relation"],
+                        "baseline_commit": skip["baseline_commit"],
+                        "pytorch_commit": sub.pytorch_commit,
+                        "torch_npu_environment": sub.torch_npu_environment,
+                    },
+                }
+            )
+            continue
         action = ("created" if before is None else "overwritten") if d.comparable else "incomparable"
         after = {
             "counts": d.new_counts.as_dict(),
@@ -683,8 +713,10 @@ def _write_baseline_diff_archive(
 def _verify(
     paths, router: BaselineRouter, sub: Submission, pr_log_rel: str,
     diffs: list[BaselineDiff],
+    merge_order_skipped: set | None = None,
 ) -> dict[str, Any]:
-    """六步收尾核对。no_result 行核对"基线未被触碰"（与步骤 2 读值一致）。"""
+    """六步收尾核对。no_result 行核对"基线未被触碰"（与步骤 2 读值一致）；
+    合入序被跳过的行核对"基线保持旧值"（防护语义本身）。"""
     checks: dict[str, Any] = {}
     totals = Counts.sum(
         fr.counts for fr in sub.function_results if not fr.is_no_result
@@ -722,16 +754,21 @@ def _verify(
                 rec is not None and old is not None and rec == old
             )
         else:
-            ok = bool(
-                rec
-                and rec.counts == fr.counts
-                and rec.coverage_status == fr.coverage_status
-                and _normalized_instance_ids(rec.instance_ids) == _normalized_instance_ids(fr.instance_ids)
-                and rec.environment_fingerprint == fr.environment_fingerprint
-                and rec.pytorch_commit == sub.pytorch_commit
-                and rec.torch_npu_environment == sub.torch_npu_environment
-                and resolve_baseline_log(route.root, rec).is_file()
-            )
+            if merge_order_skipped and (fr.test_function, fr.device) in merge_order_skipped:
+                # 合入序跳过：核对"基线保持旧值"而非"匹配本次提交"。
+                old = old_by_key.get((fr.test_function, fr.device))
+                ok = rec is not None and old is not None and rec == old
+            else:
+                ok = bool(
+                    rec
+                    and rec.counts == fr.counts
+                    and rec.coverage_status == fr.coverage_status
+                    and _normalized_instance_ids(rec.instance_ids) == _normalized_instance_ids(fr.instance_ids)
+                    and rec.environment_fingerprint == fr.environment_fingerprint
+                    and rec.pytorch_commit == sub.pytorch_commit
+                    and rec.torch_npu_environment == sub.torch_npu_environment
+                    and resolve_baseline_log(route.root, rec).is_file()
+                )
         if not ok:
             baseline_ok = False
     checks["baselines_match_submission"] = baseline_ok
@@ -763,23 +800,58 @@ def submit_complete_result(
     # 2. 读取旧基线并对比。
     diffs = read_old_baselines(router, sub)
 
+    # 2.5 合入序防护决策（用户 2026-10-26 要求，须先于日志写入）：更早合入
+    # 的 PR 或关系未知 → 保留现有基线（DB 行与日志都不动）并留痕；
+    # 更晚合入 / 同 commit 重跑照常刷新；PR 结果库照常记录该次提交。
+    from .upstream import PyTorchMirror
+
+    mirror = PyTorchMirror(config=config)
+    merge_skipped: list[dict] = []
+    apply_keys: set[tuple[str, str]] = set()
+    for d in diffs:
+        if not d.comparable:
+            continue
+        old = d.old_record
+        if old is None or old.pytorch_commit == sub.pytorch_commit:
+            apply_keys.add((d.test_function, d.device))
+            continue
+        relation = mirror.merge_relation(sub.pytorch_commit, old.pytorch_commit)
+        if relation in ('a_later', 'equal'):
+            apply_keys.add((d.test_function, d.device))
+        else:
+            reason = 'baseline_newer' if relation == 'a_earlier' else 'relation_unknown'
+            print(f"[基线跳过] ({d.test_function}, {d.device}) 与基线 commit "
+                  f"{old.pytorch_commit[:10]} 关系 {relation}（{reason}），"
+                  f"保留现有基线，DB 与日志均不回退", flush=True)
+            merge_skipped.append(
+                {"test_function": d.test_function, "device": d.device,
+                 "baseline_commit": old.pytorch_commit,
+                 "submission_commit": sub.pytorch_commit,
+                 "relation": relation, "reason": reason})
+
     # 3. 准备日志（PR 日志 + 每函数/device 基线日志；失败不破坏旧日志）。
+    #    只为将刷新的行写基线日志——被防护跳过的行连日志都不覆盖。
     pr_log_rel = _prepare_pr_logs(paths, sub)
     try:
-        eligible_keys = {(d.test_function, d.device) for d in diffs if d.comparable}
-        baseline_logs = _prepare_baseline_logs(router, sub, eligible_keys)
+        baseline_logs = _prepare_baseline_logs(router, sub, apply_keys)
     except Exception:
         # 基线日志准备失败：PR 日志已复制，但不写任何数据库记录。
         raise
 
-    # 4 + 5. 更新 PR 记录、逐项刷新基线。
-    _write_databases(paths, router, sub, pr_log_rel, baseline_logs, diffs)
+    # 4 + 5. 更新 PR 记录、逐项刷新基线（跳过键已由 2.5 决策）。
+    skip_keys = {(d.test_function, d.device) for d in diffs
+                 if (d.test_function, d.device) not in apply_keys}
+    _write_databases(paths, router, sub, pr_log_rel, baseline_logs, diffs, skip_keys)
 
     # 4.5 物化基线前后对比档案（步骤 2 的 diffs；供基线前滚脚本按 PR 取用）。
-    diff_archive = _write_baseline_diff_archive(paths, pr_log_rel, sub, diffs)
+    #     合入序被跳过的行在档案中记为 merge_order_skipped（未应用）。
+    diff_archive = _write_baseline_diff_archive(paths, pr_log_rel, sub, diffs,
+                                                merge_skipped=merge_skipped)
 
     # 6. 核对完成情况（含 no_result 行的"基线未触碰"核对）。
-    checks = _verify(paths, router, sub, pr_log_rel, diffs)
+    checks = _verify(paths, router, sub, pr_log_rel, diffs,
+                     merge_order_skipped={(s['test_function'], s['device']) for s in merge_skipped})
+    checks["baseline_skipped_merge_order"] = merge_skipped
     report = SubmitReport(
         pr_number=sub.pr_number,
         pr_log_dir=pr_log_rel,

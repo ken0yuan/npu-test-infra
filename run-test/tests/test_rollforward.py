@@ -308,4 +308,41 @@ def test_submit_materializes_diff_archive(rf_config):
     data = json.loads((paths.data_root / report.diff_archive).read_text(encoding="utf-8"))
     assert data["comparisons"][0]["before"]["counts"]["pass"] == 9
     assert data["comparisons"][0]["after"]["counts"]["fail"] == 2
+    # 本测试无镜像目录：合入关系未知 → 防护保守保留基线（用户 2026-10-26
+    # 规则），档案如实记 merge_order_skipped 而非伪装 overwritten。
+    assert data["comparisons"][0]["baseline_action"] == "merge_order_skipped"
+    assert data["comparisons"][0]["after"]["applied"] is False
+
+
+def test_submit_diff_archive_overwritten_when_relation_known(rf_config, monkeypatch):
+    """关系可判定（新 commit 合入更晚）时，档案仍如实记 overwritten。"""
+    import run_test.upstream as up
+    from run_test.record import DIFF_ARCHIVE_NAME
+
+    class LaterMirror:
+        def __init__(self, config=None):
+            pass
+
+        def merge_relation(self, a, b):
+            return 'a_later' if a != b else 'equal'
+
+    monkeypatch.setattr(up, 'PyTorchMirror', LaterMirror)
+    config = rf_config
+    paths = store_paths(config)
+    _seed_baseline(config, paths, TF_A, "cuda", _counts(9))
+    log_dir = paths.data_root / "pr_logs" / "src_503"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    (log_dir / "f.log").write_text("log\n", encoding="utf-8")
+    sub = Submission(
+        pr_number=503, pytorch_commit=COMMIT_B, torch_npu_environment=ENV,
+        function_results=[FunctionResult(
+            TF_A, "cuda", _counts(1, 2), log_content="FAILED x\n",
+            coverage_status="full", instance_ids=("legacy",),
+            environment_fingerprint={"channel": "cuda", "boot": None},
+        )],
+        pr_log_source_dir=log_dir,
+    )
+    report = submit_complete_result(config, sub)
+    data = json.loads((paths.data_root / report.diff_archive).read_text(encoding="utf-8"))
     assert data["comparisons"][0]["baseline_action"] == "overwritten"
+    assert data["comparisons"][0]["after"]["counts"]["fail"] == 2

@@ -194,6 +194,31 @@ class PyTorchMirror:
         )
         return proc.stdout.strip() if proc.returncode == 0 else None
 
+    def merge_relation(self, a: str, b: str) -> str:
+        """a 相对 b 的合入关系：'equal' | 'a_earlier' | 'a_later' | 'unknown'。
+
+        main 线性历史上祖先关系即合入先后；git 调用失败或双向都不是
+        祖先（如 commit 不在镜像历史）返回 'unknown'，调用方按保守处理。
+        """
+        if a == b:
+            return 'equal'
+        if self._is_ancestor_raw(a, b) is True:
+            return 'a_earlier'
+        if self._is_ancestor_raw(b, a) is True:
+            return 'a_later'
+        return 'unknown'
+
+    def _is_ancestor_raw(self, older: str, newer: str):
+        """True/False 为祖先判定；None 表示 git 失败（关系未知）。"""
+        proc = subprocess.run(
+            ["git", "--git-dir", str(self.git_dir), "merge-base", "--is-ancestor",
+             older, newer],
+            capture_output=True, text=True, check=False,
+        )
+        if proc.returncode == 0:
+            return True
+        return False if proc.returncode == 1 else None
+
 
 # ---------------------------------------------------------------------------
 # 每轮循环：fetch → 记录新 commit → 定位桶中对象 → 入队

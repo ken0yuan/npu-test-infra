@@ -29,6 +29,8 @@ from run_test.record import (
     submit_complete_result,
 )
 
+from pathlib import Path
+
 from conftest import (
     COMMIT_A,
     COMMIT_B,
@@ -593,8 +595,11 @@ def test_new_signature_flagged_even_with_same_counts(config, router):
     assert "新增签名: C03-pg-no-npu-backend" in summary
 
 
-def test_counts_change_is_refresh_with_signature_note(config, router):
+def test_counts_change_is_refresh_with_signature_note(config, router, monkeypatch):
     """计数变化：基线刷新 + 签名标注（回归候选，不判噪声）。"""
+    import run_test.upstream as up
+    monkeypatch.setattr(up, 'PyTorchMirror', FakeMirror)
+    FakeMirror.relations = {(COMMIT_B, COMMIT_A): True}  # 提交晚于基线，照常刷新
     _seed_baseline_with_signature(config, router, Counts(0, 3, 0, 0))
     report = submit_complete_result(
         config, _triaged_submission(Counts(1, 2, 0, 0), ["C01-torchC-private-cuda-api"]), router,
@@ -685,3 +690,156 @@ def test_all_no_result_submission_persists_with_zero_counts(config, router, path
     # 全 no_result：一条基线都不建。
     assert _baseline(router, TF_A, "cpu") is None
     assert _baseline(router, TF_A, "accelerator") is None
+
+
+class FakeMirror:
+    """按预设祖先关系应答的镜像替身；未登记关系一律 unknown（保守保留现有基线）。"""
+    relations: dict = {}
+
+    def __init__(self, config=None):
+        pass
+
+    def is_ancestor(self, older, newer):
+        return bool(self.relations.get((older, newer)))
+
+    def merge_relation(self, a, b):
+        if a == b:
+            return 'equal'
+        if self.relations.get((a, b)):
+            return 'a_earlier'
+        if self.relations.get((b, a)):
+            return 'a_later'
+        return 'unknown'
+
+
+def test_merge_order_guard_skips_older_result(config, router, monkeypatch):
+    FakeMirror.relations = {}  # 防类属性跨用例泄漏
+    """合入序防护（用户 2026-10-26 要求）：基线已持有更晚合入 PR 的结果时，
+    更早 PR 的提交不得把基线回退到旧值，且跳过决策留痕于 report.checks。"""
+    import run_test.upstream as up
+    monkeypatch.setattr(up, 'PyTorchMirror', FakeMirror)
+    later = make_submission(pr_number=2, pytorch_commit=COMMIT_B,
+                            items=[(TF_A, "cpu", Counts(5, 0, 0, 0))])
+    submit_complete_result(config, later, router)
+    FakeMirror.relations = {(COMMIT_A, COMMIT_B): 'a_earlier'}  # A 合入早于 B
+    earlier = make_submission(pr_number=1, pytorch_commit=COMMIT_A,
+                              items=[(TF_A, "cpu", Counts(1, 1, 1, 1))])
+    report = submit_complete_result(config, earlier, router)
+    rec = _baseline(router, TF_A, "cpu")
+    assert rec.pytorch_commit == COMMIT_B  # 基线未被回退
+    assert report.checks["baseline_skipped_merge_order"] == [
+        {"test_function": TF_A, "device": "cpu",
+         "baseline_commit": COMMIT_B, "submission_commit": COMMIT_A,
+         "relation": "a_earlier", "reason": "baseline_newer"}]
+
+
+def test_merge_order_guard_unknown_ancestry_keeps_baseline(config, router, monkeypatch):
+    """未知祖先（关系不可判）必须保守：基线行与日志均不动，跳过原因
+    relation_unknown 留痕，不得静默覆盖较新的基线。"""
+    import run_test.upstream as up
+    monkeypatch.setattr(up, 'PyTorchMirror', FakeMirror)
+    first = make_submission(pr_number=1, pytorch_commit=COMMIT_B,
+                            items=[(TF_A, "cpu", Counts(3, 0, 0, 0))])
+    submit_complete_result(config, first, router)
+    FakeMirror.relations = {}  # 提交 commit 与基线 commit 关系不可判
+    unknown = make_submission(pr_number=9, pytorch_commit=COMMIT_A,
+                              items=[(TF_A, "cpu", Counts(9, 9, 9, 9))])
+    report = submit_complete_result(config, unknown, router)
+    rec = _baseline(router, TF_A, "cpu")
+    assert rec.pytorch_commit == COMMIT_B and rec.counts == Counts(3, 0, 0, 0)
+    assert report.checks["baseline_skipped_merge_order"] == [
+        {"test_function": TF_A, "device": "cpu",
+         "baseline_commit": COMMIT_B, "submission_commit": COMMIT_A,
+         "relation": "unknown", "reason": "relation_unknown"}]
+    # T4：对比档案把该行记为预期跳过，而不是"已覆盖"。
+    archive = json.loads((Path(config['data_root']) / report.diff_archive).read_text())
+    row = next(c for c in archive['comparisons']
+               if c['test_function'] == TF_A and c['device'] == 'cpu')
+    assert row['baseline_action'] == 'merge_order_skipped'
+    assert row['after']['reason'] == 'relation_unknown'
+
+
+def test_merge_order_guard_allows_newer_result(config, router, monkeypatch):
+    FakeMirror.relations = {}  # 防类属性跨用例泄漏
+    import run_test.upstream as up
+    monkeypatch.setattr(up, 'PyTorchMirror', FakeMirror)
+    first = make_submission(pr_number=1, pytorch_commit=COMMIT_A,
+                            items=[(TF_A, "cpu", Counts(1, 0, 0, 0))])
+    submit_complete_result(config, first, router)
+    FakeMirror.relations = {(COMMIT_A, COMMIT_B): 'a_later'}  # B 合入晚于 A
+    second = make_submission(pr_number=2, pytorch_commit=COMMIT_B,
+                             items=[(TF_A, "cpu", Counts(2, 0, 0, 0))])
+    report = submit_complete_result(config, second, router)
+    rec = _baseline(router, TF_A, "cpu")
+    assert rec.pytorch_commit == COMMIT_B  # 更晚合入的结果照常刷新
+    assert report.checks["baseline_skipped_merge_order"] == []
+
+
+def test_same_commit_rerun_overrides_regardless_of_guard(config, router, monkeypatch):
+    FakeMirror.relations = {}  # 防类属性跨用例泄漏
+    import run_test.upstream as up
+    monkeypatch.setattr(up, 'PyTorchMirror', FakeMirror)
+    first = make_submission(pr_number=1, pytorch_commit=COMMIT_A,
+                            items=[(TF_A, "cpu", Counts(1, 0, 0, 0))])
+    submit_complete_result(config, first, router)
+    FakeMirror.relations = {(COMMIT_A, COMMIT_A): True}
+    rerun = make_submission(pr_number=1, pytorch_commit=COMMIT_A,
+                            items=[(TF_A, "cpu", Counts(2, 2, 2, 2))])
+    submit_complete_result(config, rerun, router)
+    rec = _baseline(router, TF_A, "cpu")
+    assert rec.pytorch_commit == COMMIT_A and rec.counts == Counts(2, 2, 2, 2)
+
+
+def test_merge_order_guard_preserves_db_and_log_when_newer_first(config, router, paths, monkeypatch):
+    FakeMirror.relations = {}  # 防类属性跨用例泄漏
+    """用户要求的验证用例：先提交新结果、再提交旧结果——基线 DB 行与
+    日志文件都必须保持新结果版本，不被旧结果回退。"""
+    import run_test.upstream as up
+    monkeypatch.setattr(up, 'PyTorchMirror', FakeMirror)
+    newer = make_submission(pr_number=2, pytorch_commit=COMMIT_B,
+                            items=[(TF_A, "cpu", Counts(5, 0, 0, 0))])
+    submit_complete_result(config, newer, router)
+    rec_before = _baseline(router, TF_A, "cpu")
+    log_path = resolve_baseline_log(router.route(TF_A).root, rec_before)
+    log_before = log_path.read_text(encoding='utf-8')
+
+    FakeMirror.relations = {(COMMIT_A, COMMIT_B): 'a_earlier'}
+    older = make_submission(pr_number=1, pytorch_commit=COMMIT_A,
+                            items=[(TF_A, "cpu", Counts(1, 1, 1, 1))])
+    report = submit_complete_result(config, older, router)
+
+    rec_after = _baseline(router, TF_A, "cpu")
+    assert rec_after == rec_before  # DB 行保持新结果版本
+    assert log_path.read_text(encoding='utf-8') == log_before  # 日志同样未被覆盖
+    assert rec_after.pytorch_commit == COMMIT_B
+    skipped = report.checks["baseline_skipped_merge_order"]
+    assert skipped and skipped[0]["reason"] == "baseline_newer"
+    # 旧 PR 结果本身照常保存到 PR 结果库（仅基线受保护）。
+    conn = connect(paths.pr_db)
+    try:
+        old_saved = get_pr_result(conn, 1)
+    finally:
+        conn.close()
+    assert old_saved is not None and old_saved.pytorch_commit == COMMIT_A
+
+
+def test_merge_order_unknown_relation_preserves_baseline(config, router, paths, monkeypatch):
+    FakeMirror.relations = {}  # 防类属性跨用例泄漏
+    """关系未知（commit 不在镜像历史等）→ 保守保留现有基线并留痕。"""
+    import run_test.upstream as up
+    monkeypatch.setattr(up, 'PyTorchMirror', FakeMirror)
+    first = make_submission(pr_number=1, pytorch_commit=COMMIT_B,
+                            items=[(TF_A, "cpu", Counts(5, 0, 0, 0))])
+    submit_complete_result(config, first, router)
+    rec_before = _baseline(router, TF_A, "cpu")
+    log_path = resolve_baseline_log(router.route(TF_A).root, rec_before)
+    log_before = log_path.read_text(encoding='utf-8')
+
+    other = make_submission(pr_number=2, pytorch_commit=COMMIT_A,  # 未登记关系
+                            items=[(TF_A, "cpu", Counts(1, 1, 1, 1))])
+    report = submit_complete_result(config, other, router)
+
+    assert _baseline(router, TF_A, "cpu") == rec_before
+    assert log_path.read_text(encoding='utf-8') == log_before
+    skipped = report.checks["baseline_skipped_merge_order"]
+    assert skipped and skipped[0]["reason"] == "relation_unknown"
