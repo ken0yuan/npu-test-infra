@@ -193,12 +193,22 @@ def cmd_baseline(args: argparse.Namespace) -> int:
             f"（device=cuda，重复导入按本次值覆盖）"
         )
         return 0
+    if args.baseline_cmd in {"history", "snapshot", "rollback"}:
+        from .baseline_history import list_snapshots, snapshot_baselines, rollback_baselines
+        if args.baseline_cmd == "history":
+            report = list_snapshots(config)
+        elif args.baseline_cmd == "snapshot":
+            report = snapshot_baselines(config, args.reason, wait_seconds=args.wait_seconds)
+        else:
+            report = rollback_baselines(config, args.snapshot_id, wait_seconds=args.wait_seconds)
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        return 0
     if args.baseline_cmd == "rollforward":
         from .baseline_rollforward import DELETION_NOTICE, rollforward_baselines
 
-        pr_input = json.loads(Path(args.input).read_text(encoding="utf-8"))
+        pr_input = json.loads(Path(args.input).read_text(encoding="utf-8")) if args.input else None
         report = rollforward_baselines(
-            config, pr_input,
+            config, pr_input, wait_seconds=args.wait_seconds,
             router=BaselineRouter(config["baseline_dirs"], paths.baselines_root),
         )
         print(json.dumps(report, ensure_ascii=False, indent=2, default=str))
@@ -626,9 +636,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="基线前滚：按合入时间顺序回放一组 PR → 前后对比文件 + 刷新基线"
              "（供外部 AI 调用；输出文件分析后应立即删除）",
     )
-    b_rf.add_argument("--input", required=True,
+    rf_input = b_rf.add_mutually_exclusive_group(required=True)
+    rf_input.add_argument("--all", action="store_true", help="回放当前结果库全部 PR")
+    rf_input.add_argument("--input",
                       help="PR 清单 JSON：{\"prs\": [123, {\"pr_number\": 7, "
                            "\"merged_at\": \"…\"}]} 或裸数组")
+    b_rf.add_argument("--wait-seconds", type=float, default=0, help="等待执行位的最长秒数；不终止测试")
+    bsub.add_parser("history", help="列出持久基线快照（不会随临时对比报告删除）")
+    b_snap = bsub.add_parser("snapshot", help="备份全部基线 DB 与日志")
+    b_snap.add_argument("--reason", default="manual")
+    b_snap.add_argument("--wait-seconds", type=float, default=0)
+    b_back = bsub.add_parser("rollback", help="恢复指定快照；先保存当前状态以便撤销")
+    b_back.add_argument("snapshot_id")
+    b_back.add_argument("--wait-seconds", type=float, default=0)
     b_imp.add_argument("--src", required=True, help="test-source 根（含 test/ 的仓库 worktree）")
     b_imp.add_argument("--npu-commit", required=True,
                        help="torch_npu 完整 40/64 位 commit（快照 meta 只有版本短 sha）")

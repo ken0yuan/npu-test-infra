@@ -60,6 +60,14 @@ bash start.sh stop
 
 结果库为 `data/runtime/pr_results.db`，基线位于 `data/runtime/baselines/`，队列位于 `data/runtime/queue/`。同 PR 重跑替换当前结果，保留历史日志；`no_result` 不推动基线；`done` 表示任务处理结束，不等于测试通过。
 
+## 基线刷新与回滚
+
+`bash run.sh baseline rollforward --all --wait-seconds 600` 会读取当前已保存的 PR 结果，按合入时间从早到晚刷新；没有基线库时自动创建。整批在临时目录完成并校验，成功后原子切换数据库和日志。运行中的测试持有执行位时等待，不中断测试。
+
+刷新前后自动保存持久快照。用 `bash run.sh baseline history` 查看 id，使用 `bash run.sh baseline rollback SNAPSHOT_ID --wait-seconds 600` 恢复指定基线；回滚前也会保存当前状态，返回 `undo_snapshot` 便于撤销。快照在 `data/runtime/baseline-history/`，不会随临时对比报告一起清理。
+
+给 AI 的完整步骤、成功判据、数据准入规则和恢复范围见 [基线维护说明](docs/run_test/baseline-history.md)。每次维护都必须在 `docs/run_test/修复日志.md` 留下快照和验证记录。
+
 ## 真实问题台账
 
 `bug_monitor` 持续扫描任务、测试计划和真实 JUnit/收集/执行产物。计划生成前的选例异常也会立即留证。

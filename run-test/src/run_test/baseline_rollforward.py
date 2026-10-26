@@ -13,13 +13,13 @@
   改动前基线（before）与 PR 结果（after）。
 - before 优先取提交时固化的档案 ``pr_logs/PR_<n>/baseline-diff.json``
   （真实历史，source=archived）；档案缺失时回退重建：用 PR 库每函数计数
-  走一遍完整六步提交（source=reconstructed，其 before 可能已被后续 PR 刷
-  过，文件中显式标注）。
+  重建候选结果（source=reconstructed），只更新基线，不重写 PR 结果或日志。
+  replay_before 始终表示本次回放前基线，before 保留原始档案。
 - 基线查不到对应键（新测试 / 新 device）→ 该函数文件里只有 after，基线
   动作 = created（记录新基线而非覆盖）；查得到 → 覆盖。
 - 刷新顺序 = merged_at 顺序：archived 路径按序重放基线 upsert（保证组内
-  同键最终值取时间在后的 PR）；reconstructed 路径经 submit_complete_result
-  完整落库。
+  同键最终值取时间在后的 PR）；同刻以 PR 号升序。
+- 刷新前后持久保存数据库和日志快照；任一错误自动恢复刷新前基线。
 - 每份输出文件与 index.json 均带醒目提醒：**分析完毕立即删除整个输出目录**。
 """
 
@@ -46,9 +46,6 @@ from .identifiers import Counts
 from .pr_store import ensure_pr_db, get_pr_result, set_merged_at
 from .record import (
     DIFF_ARCHIVE_NAME,
-    FunctionResult,
-    Submission,
-    submit_complete_result,
     baseline_metadata_comparable,
 )
 
@@ -198,168 +195,84 @@ def _process_pr(config, paths, router, record, merged_at: str,
     comparisons: list[dict] = []
     errors: list[str] = []
 
+    source = "archived" if archive is not None else "reconstructed"
     if archive is not None:
-        source = "archived"
-        for cmp in archive["comparisons"]:
-            tf, device = cmp["test_function"], cmp["device"]
-            after = cmp["after"]
-            if after.get("counts") is None:
-                # no_result：提交时未取得结果、基线未动，回放同样不刷新，
-                # 原样透传到对比文件。
-                comparisons.append({**cmp})
-                continue
-            coverage_status = after.get("coverage_status", "unknown")
-            if coverage_status != "full":
-                comparisons.append({**cmp, "baseline_action": "incomparable"})
-                continue
+        candidates = archive["comparisons"]
+    else:
+        candidates = []
+        for item in record.tests:
+            if "counts" not in item and item.get("status") != "no_result":
+                raise RollforwardError(f"PR {pr_number} lacks per-function counts")
+            candidates.append({
+                "test_function": item["test_function"], "device": item["device"],
+                "before": None,
+                "after": {**item, "pytorch_commit": record.pytorch_commit,
+                          "torch_npu_environment": record.torch_npu_environment},
+            })
+
+    # Replay only baselines. Never re-submit a historical PR or replace its logs.
+    for cmp in candidates:
+        tf, device = cmp["test_function"], cmp["device"]
+        after = cmp["after"]
+        item = {**cmp, "baseline_action": "incomparable"}
+        if after.get("counts") is None:
+            item["baseline_action"] = "no_result"
+            comparisons.append(item)
+            continue
+        coverage_status = after.get("coverage_status", "unknown")
+        if coverage_status != "full":
+            comparisons.append(item)
+            continue
+        try:
+            route = router.route(tf)
+            filename = baseline_log_filename(tf, device)
+            conn = connect(baseline_db_path(route.root))
             try:
-                route = router.route(tf)
-                filename = baseline_log_filename(tf, device)
-                conn = connect(baseline_db_path(route.root))
-                try:
-                    old = get_baseline(conn, tf, device)
-                finally:
-                    conn.close()
-                if not baseline_metadata_comparable(
-                    old, counts=Counts.from_dict(after["counts"]),
-                    coverage_status=coverage_status,
+                old = get_baseline(conn, tf, device)
+            finally:
+                conn.close()
+            before = None if old is None else {
+                "counts": old.counts.as_dict(), "pytorch_commit": old.pytorch_commit,
+                "torch_npu_environment": old.torch_npu_environment,
+            }
+            item["replay_before"] = before
+            if source == "reconstructed":
+                item["before"] = before
+            item["managed_dir"] = route.managed_dir
+            if not baseline_metadata_comparable(
+                old, counts=Counts.from_dict(after["counts"]),
+                coverage_status=coverage_status,
+                instance_ids=tuple(after.get("instance_ids", [])),
+                environment_fingerprint=after.get("environment_fingerprint"),
+            ):
+                comparisons.append(item)
+                continue
+            source_log = pr_dir / filename
+            if not source_log.is_file():
+                raise RollforwardError(f"PR {pr_number} original log missing: {source_log}")
+            target_log = route.root / "logs" / filename
+            target_log.parent.mkdir(parents=True, exist_ok=True)
+            old_log = target_log.read_bytes() if target_log.is_file() else None
+            shutil.copyfile(source_log, target_log)
+            try:
+                _write_baseline_upsert(
+                    router, tf, device, Counts.from_dict(after["counts"]),
+                    after["pytorch_commit"], after["torch_npu_environment"],
+                    log_rel=f"logs/{filename}", coverage_status=coverage_status,
                     instance_ids=tuple(after.get("instance_ids", [])),
                     environment_fingerprint=after.get("environment_fingerprint"),
-                ):
-                    comparisons.append({**cmp, "baseline_action": "incomparable", "managed_dir": cmp.get("managed_dir")})
-                    continue
-                source_log = pr_dir / filename
-                if not source_log.is_file():
-                    raise RollforwardError(f"PR {pr_number} 原始日志不在位: {source_log}")
-                target_log = route.root / "logs" / filename
-                target_log.parent.mkdir(parents=True, exist_ok=True)
-                old_log = target_log.read_bytes() if target_log.is_file() else None
-                shutil.copyfile(source_log, target_log)
-                try:
-                    managed = _write_baseline_upsert(
-                        router, tf, device,
-                        Counts.from_dict(after["counts"]),
-                        after["pytorch_commit"], after["torch_npu_environment"],
-                        log_rel=f"logs/{filename}",
-                        coverage_status=coverage_status,
-                        instance_ids=tuple(after.get("instance_ids", [])),
-                        environment_fingerprint=after.get("environment_fingerprint"),
-                    )
-                except Exception:
-                    if old_log is None:
-                        target_log.unlink(missing_ok=True)
-                    else:
-                        target_log.write_bytes(old_log)
-                    raise
-            except (NoBaselineDirectoryError, RollforwardError) as e:
-                errors.append(f"({tf}, {device}) 基线未刷新: {e}")
-                managed = cmp.get("managed_dir")
-            comparisons.append({**cmp, "managed_dir": managed})
-    else:
-        # 重建模式：PR 库每函数计数 → 完整六步提交（校验、读旧基线、
-        # 日志就位、写 PR 库、刷基线、核对），before 为提交时真实读值。
-        # no_result 项（无 counts，带 status）按无结果回放：不刷基线。
-        source = "reconstructed"
-        if any(
-            "counts" not in item and item.get("status") != "no_result"
-            for item in record.tests
-        ):
-            raise RollforwardError(
-                f"PR {pr_number} 的 PR 库记录缺每函数计数（旧格式），无法重建对比"
-            )
-        pointer = (
-            f"基线由 rollforward 从 PR {pr_number} 结果重建刷新；\n"
-            f"本次 PR 结果原始日志见 {record.log_path}/。\n"
-            f"pytorch_commit={record.pytorch_commit}\n"
-        )
-        frs = []
-        for item in record.tests:
-            if item.get("status") == "no_result":
-                frs.append(
-                    FunctionResult(
-                        test_function=item["test_function"],
-                        device=item["device"],
-                        counts=None,
-                        status="no_result",
-                        reason=item.get("reason") or "PR 库记录为 no_result",
-                        log_content=pointer,
-                        execution_status=item.get("execution_status", "runner_error"),
-                        observed_counts=Counts.from_dict(item["observed_counts"]) if item.get("observed_counts") else None,
-                        artifact_ref=item.get("artifact_ref"),
-                        event_reports=item.get("event_reports"),
-                    )
                 )
-            else:
-                source_log = pr_dir / baseline_log_filename(item["test_function"], item["device"])
-                if not source_log.is_file():
-                    raise RollforwardError(f"PR {pr_number} 原始日志不在位: {source_log}，拒绝重建基线")
-                frs.append(
-                    FunctionResult(
-                        test_function=item["test_function"],
-                        device=item["device"],
-                        counts=Counts.from_dict(item["counts"]),
-                        log_source_path=source_log,
-                        triage=item.get("triage"),
-                        coverage_status=item.get("coverage_status", "unknown"),
-                        instance_ids=tuple(item.get("instance_ids", [])),
-                        environment_fingerprint=item.get("environment_fingerprint"),
-                    )
-                )
-        sub = Submission(
-            pr_number=pr_number,
-            pytorch_commit=record.pytorch_commit,
-            torch_npu_environment=record.torch_npu_environment,
-            function_results=frs,
-            pr_log_source_dir=pr_dir if pr_dir.is_dir() else None,
-        )
-        report = submit_complete_result(config, sub, router=router)
-        for d in report.diffs:
-            if d.old_record is None:
-                before = None
-            else:
-                before = {
-                    "counts": d.old_record.counts.as_dict(),
-                    "pytorch_commit": d.old_record.pytorch_commit,
-                    "torch_npu_environment": d.old_record.torch_npu_environment,
-                }
-            if d.new_counts is None:
-                comparisons.append(
-                    {
-                        "test_function": d.test_function,
-                        "device": d.device,
-                        "managed_dir": d.managed_dir,
-                        "baseline_action": "no_result",
-                        "before": before,
-                        "after": {
-                            "counts": None,
-                            "status": "no_result",
-                            "reason": d.reason,
-                            "pytorch_commit": record.pytorch_commit,
-                            "torch_npu_environment": record.torch_npu_environment,
-                        },
-                    }
-                )
-                continue
-            action = "created" if before is None else "overwritten"
-            if before is not None and d.old_triage:
-                before["triage"] = list(d.old_triage)
-            after = {
-                "counts": d.new_counts.as_dict(),
-                "pytorch_commit": record.pytorch_commit,
-                "torch_npu_environment": record.torch_npu_environment,
-            }
-            if d.new_triage:
-                after["triage"] = list(d.new_triage)
-            comparisons.append(
-                {
-                    "test_function": d.test_function,
-                    "device": d.device,
-                    "managed_dir": d.managed_dir,
-                    "baseline_action": action,
-                    "before": before,
-                    "after": after,
-                }
-            )
+            except Exception:
+                if old_log is None:
+                    target_log.unlink(missing_ok=True)
+                else:
+                    target_log.write_bytes(old_log)
+                raise
+            item["baseline_action"] = "created" if old is None else "overwritten"
+        except Exception as error:
+            errors.append(f"({tf}, {device}) baseline not refreshed: {error}")
+            item["baseline_action"] = "error"
+        comparisons.append(item)
 
     file_payload = {
         "notice": DELETION_NOTICE,
@@ -392,7 +305,7 @@ def _process_pr(config, paths, router, record, merged_at: str,
     }
 
 
-def rollforward_baselines(config: dict, pr_input, *, router: BaselineRouter | None = None) -> dict:
+def _rollforward_baselines(config: dict, pr_input, *, router: BaselineRouter | None = None) -> dict:
     """入口：按合入时间顺序回放一组 PR → 前后对比文件 + 基线刷新。"""
     paths = store_paths(config)
     if router is None:
@@ -448,7 +361,7 @@ def rollforward_baselines(config: dict, pr_input, *, router: BaselineRouter | No
         finally:
             pr_conn.close()
 
-    # 有结果的 PR 才进入回放；按 merged_at 升序（同刻保持输入顺序）。
+    # 有结果的 PR 才进入回放；按 merged_at 升序（同刻按 PR 号升序）。
     pr_conn = connect(paths.pr_db)
     try:
         records: list[tuple[int, str, object]] = []
@@ -462,7 +375,7 @@ def rollforward_baselines(config: dict, pr_input, *, router: BaselineRouter | No
             records.append((pr_number, merged_at, record))
     finally:
         pr_conn.close()
-    records.sort(key=lambda row: _parse_ts(row[1]))
+    records.sort(key=lambda row: (_parse_ts(row[1]), row[0]))
 
     run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
     out_dir = paths.data_root / ROLLFORWARD_DIR_NAME / run_id
@@ -494,3 +407,65 @@ def rollforward_baselines(config: dict, pr_input, *, router: BaselineRouter | No
         "prs": files,
         "errors": errors,
     }
+
+
+def rollforward_baselines(config: dict, pr_input=None, *, router=None, wait_seconds=0) -> dict:
+    """Refresh in merge order with a persistent undo point and executor exclusion.
+
+    None selects all retained PR results under the lock. This is incremental:
+    unrelated keys remain intact. Rollback scope is baseline DBs and logs only.
+    """
+    from tempfile import TemporaryDirectory
+    from .baseline_history import maintenance, _snapshot, _restore, _history_root, _publish, _validate_databases
+
+    with maintenance(config, wait_seconds):
+        paths = store_paths(config)
+        if pr_input is None:
+            ensure_pr_db(paths.data_root)
+            conn = connect(paths.pr_db)
+            try:
+                pr_input = [row[0] for row in conn.execute("SELECT pr_number FROM pr_results")]
+            finally:
+                conn.close()
+        _parse_pr_input(pr_input)
+        # A custom router must describe this same tree for the snapshot to cover it.
+        if router is not None and (
+            router.baselines_root.resolve() != store_paths(config).baselines_root.resolve()
+            or sorted(router.dirs) != sorted(config.get("baseline_dirs", []))
+        ):
+            raise RollforwardError("router must match configured snapshot scope")
+        before = _snapshot(config, "before-rollforward", {"input": pr_input})
+        published = False
+        try:
+            with TemporaryDirectory(prefix=".baseline-refresh-", dir=paths.data_root) as temp:
+                stage = Path(temp)
+                shutil.copytree(_history_root(config) / before["id"] / "baselines", stage, dirs_exist_ok=True)
+                staged_router = BaselineRouter(config.get("baseline_dirs", []), stage)
+                report = _rollforward_baselines(config, pr_input, router=staged_router)
+                for item in report["prs"]:
+                    report["errors"].extend({"pr_number": item["pr_number"], "error": e} for e in item["errors"])
+                if not report["errors"]:
+                    _validate_databases(stage)
+                    _publish(stage, paths.baselines_root)
+                    published = True
+            report["applied"] = published
+            if published:
+                after = _snapshot(config, "after-rollforward", {
+                    "before_snapshot": before["id"],
+                    "pr_order": [p["pr_number"] for p in report["prs"]],
+                })
+                report["after_snapshot"] = after["id"]
+            report["before_snapshot"] = before["id"]
+            receipt = _history_root(config) / before["id"] / "refresh.json"
+            receipt.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            index_path = Path(report["index_file"])
+            index = json.loads(index_path.read_text(encoding="utf-8"))
+            index.update({k: report[k] for k in ("applied", "before_snapshot", "errors")})
+            if "after_snapshot" in report:
+                index["after_snapshot"] = report["after_snapshot"]
+            index_path.write_text(json.dumps(index, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            return report
+        except BaseException:
+            if published:
+                _restore(config, before["id"])
+            raise
