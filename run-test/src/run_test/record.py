@@ -704,6 +704,11 @@ def _write_baseline_diff_archive(
                         "baseline_commit": skip["baseline_commit"],
                         "pytorch_commit": sub.pytorch_commit,
                         "torch_npu_environment": sub.torch_npu_environment,
+                        # 执行元数据与 PR 行 tests 项同形：load_report 校验
+                        # 档案 after 与 PR 结果一致，缺了会误判"快照不符"。
+                        "coverage_status": fr_meta.coverage_status if fr_meta else "unknown",
+                        "instance_ids": list(fr_meta.instance_ids) if fr_meta else [],
+                        "environment_fingerprint": fr_meta.environment_fingerprint if fr_meta else None,
                     },
                 }
             )
@@ -938,7 +943,32 @@ def submit_complete_result(
 
 
 def _pr_report_exists(paths, pr_number: int) -> bool:
-    return (paths.pr_logs_root / f"PR_{pr_number}" / "report.json").is_file()
+    """结果文档是否已生成：reports/PR_<n>/current.json 指针存在
+    （generate 的真实输出位置；评审阻塞项 5 的路径修正）。"""
+    return (paths.data_root / "reports" / f"PR_{pr_number}" / "current.json").is_file()
+
+
+def _backup_database(src, backup_root) -> dict:
+    """sqlite 在线备份到唯一子目录，附 SHA256 来源清单（评审阻塞项 4）。"""
+    import hashlib as _hashlib
+    import sqlite3 as _sqlite3
+    from pathlib import Path as _Path
+    src = _Path(src)
+    slot = _hashlib.sha256(str(src).encode()).hexdigest()[:10]
+    dst = backup_root / slot / src.name
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    source_conn = connect(src)
+    try:
+        dst_conn = _sqlite3.connect(dst)
+        try:
+            source_conn.backup(dst_conn)
+        finally:
+            dst_conn.close()
+    finally:
+        source_conn.close()
+    digest = _hashlib.sha256(dst.read_bytes()).hexdigest()
+    return {"source": str(src), "backup": str(dst), "sha256": digest,
+            "bytes": dst.stat().st_size}
 
 
 def backfill_merged_at(config, refresh_reports: bool = False,
@@ -959,12 +989,29 @@ def backfill_merged_at(config, refresh_reports: bool = False,
 
     # 维护写库必须持执行位租约（用户 2026-10-26 评审阻塞项 4）：
     # 租约忙时如实返回 busy，不排队不阻塞、调用方稍后重试。
+    # 备份在同一租约内完成（评审 315432：备份+变更持同一租约，唯一
+    # run ID + 来源清单；老 schema 由 sqlite 在线备份原样保留）。
     paths = store_paths(config)
     lease_cm = executor_lease(paths.queue_db.with_suffix(".executor.lock"))
     lease = lease_cm.__enter__() if use_lease else True
     if not lease:
         return {"lease": "busy"}
-    stats = {"lease": "acquired", "pr_backfilled": 0, "pr_kept": 0,
+    import secrets as _secrets
+
+    run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + _secrets.token_hex(4)
+    backup_root = paths.data_root / "merged-at-backups" / run_id
+    backup_root.mkdir(parents=True, exist_ok=True)
+    manifest = {"run_id": run_id, "sources": []}
+    from .baseline_store import BaselineRouter as _Router
+    _router = _Router(config.get("baseline_dirs", []), paths.baselines_root)
+    for src in [paths.queue_db, paths.pr_db] + [
+            baseline_db_path(_router.managed_root(d)) for d in _router.dirs]:
+        if Path(src).is_file():
+            manifest["sources"].append(_backup_database(src, backup_root))
+    (backup_root / "manifest.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    stats = {"lease": "acquired", "run_id": run_id, "backup": str(backup_root),
+             "pr_backfilled": 0, "pr_kept": 0,
              "pr_unresolved": 0, "baseline_backfilled": 0, "baseline_kept": 0,
              "baseline_unresolved": 0, "needs_refresh": [],
              "reports_refreshed": [], "conflicts": []}

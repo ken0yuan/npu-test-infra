@@ -7,9 +7,29 @@ import sqlite3
 import pytest
 
 from run_test import result_docs as docs
+from run_test.config import store_paths
 from run_test.identifiers import Counts, baseline_log_filename
 from run_test.record import submit_complete_result
 from conftest import COMMIT_A, COMMIT_B, COMMIT_NPU, make_submission
+
+class _FakeMirror:
+    """线性 A→B 推进替身；commit_times 供 backfill 解析测试注入。"""
+    commit_times: dict = {}
+
+    def __init__(self, config=None):
+        pass
+
+    def merge_relation(self, a, b):
+        if a == b:
+            return 'equal'
+        order = [COMMIT_A, COMMIT_B]
+        if a in order and b in order:
+            return 'a_earlier' if order.index(a) < order.index(b) else 'a_later'
+        return 'unknown'
+
+    def commit_timestamp(self, sha):
+        return self.commit_times.get(sha)
+
 
 @pytest.fixture(autouse=True)
 def _deterministic_merge_order(monkeypatch):
@@ -17,19 +37,7 @@ def _deterministic_merge_order(monkeypatch):
     本身由 test_record_flow 覆盖。真实镜像对假 commit 会返回 unknown 而
     保守跳过刷新，导致报告与基线指纹不一致——这里替换为确定性替身。"""
     import run_test.upstream as up
-
-    class _FakeMirror:
-        def __init__(self, config=None):
-            pass
-
-        def merge_relation(self, a, b):
-            if a == b:
-                return 'equal'
-            order = [COMMIT_A, COMMIT_B]
-            if a in order and b in order:
-                return 'a_earlier' if order.index(a) < order.index(b) else 'a_later'
-            return 'unknown'
-
+    _FakeMirror.commit_times = {}
     monkeypatch.setattr(up, 'PyTorchMirror', _FakeMirror)
 
 
@@ -245,3 +253,54 @@ def test_cli_exposes_local_render():
     from run_test.cli import build_parser
     args = build_parser().parse_args(['report', 'render', '--pr', '191432'])
     assert args.pr == 191432 and args.report_cmd == 'render'
+
+
+def test_backfill_skips_reported_pr_without_fingerprint_drift(config, router, paths, monkeypatch):
+    """已有报告的 PR：默认回填跳过（needs_refresh），DB 不动、指纹不变、
+    不产生重传；--refresh-reports 受控回填并再生成（阻塞项 5）。"""
+    import run_test.upstream as up
+    from run_test.record import backfill_merged_at
+    _real_submission(config, router, paths)
+    first = docs.generate(config, 123456)
+    _FakeMirror.commit_times = {COMMIT_A: "2026-10-26T01:00:00+00:00"}
+    stats = backfill_merged_at(config)
+    assert stats["needs_refresh"] == [123456] and stats["pr_backfilled"] == 0
+    second = docs.generate(config, 123456)
+    assert second["fingerprint"] == first["fingerprint"]  # 零指纹漂移
+    stats = backfill_merged_at(config, refresh_reports=True)
+    assert stats["pr_backfilled"] == 1 and stats["reports_refreshed"] == [123456]
+    third = docs.generate(config, 123456)
+    assert third["fingerprint"] != first["fingerprint"]  # 受控刷新生效
+
+
+def test_newer_then_older_submission_stays_renderable(config, router, paths):
+    """较新 PR 先落基线，较旧 PR 提交被防护跳过：基线行与日志不动，
+    旧 PR 的报告仍可渲染发布（档案元数据完整，不误判快照不符）。"""
+    _real_submission(config, router, paths, pr_number=555, pytorch_commit=COMMIT_B,
+                     merged_at="2026-10-26T05:00:00Z",
+                     merged_at_provenance="upstream-main-commit-time")
+    baseline_before = _baseline_bytes(config)
+    _real_submission(config, router, paths, pr_number=556, pytorch_commit=COMMIT_A,
+                     merged_at="2026-10-26T01:00:00Z",
+                     merged_at_provenance="upstream-main-commit-time")
+    assert _baseline_bytes(config) == baseline_before  # 行与日志字节级不变
+    result = docs.generate(config, 556)  # 旧 PR 仍可渲染（此前抛 ReportError）
+    assert result["fingerprint"]
+    archive = json.loads((store_paths(config).pr_logs_root / "PR_556" /
+                          "baseline-diff.json").read_text(encoding="utf-8"))
+    skipped = [c for c in archive["comparisons"] if c["baseline_action"] == "merge_order_skipped"]
+    assert skipped and skipped[0]["after"]["instance_ids"]  # 元数据完整
+
+
+def _baseline_bytes(config):
+    from run_test.baseline_store import baseline_db_path, BaselineRouter
+    from run_test.db import connect
+    router = BaselineRouter(config.get("baseline_dirs", []), store_paths(config).baselines_root)
+    rows = []
+    for d in router.dirs:
+        conn = connect(baseline_db_path(router.managed_root(d)))
+        try:
+            rows.extend(conn.execute("SELECT * FROM baseline ORDER BY test_function").fetchall())
+        finally:
+            conn.close()
+    return rows

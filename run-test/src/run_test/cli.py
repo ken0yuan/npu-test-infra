@@ -556,30 +556,7 @@ def cmd_merged_at_backfill(args: argparse.Namespace) -> int:
     from .record import backfill_merged_at
 
     config = _load_config(args.config)
-    paths = store_paths(config)
-    stamp = _dt.now(_tz.utc).strftime("%Y%m%dT%H%M%SZ")
-    backup_root = paths.data_root / "merged-at-backups" / stamp
-    backup_root.mkdir(parents=True, exist_ok=True)
-    router = BaselineRouter(config.get("baseline_dirs", []), paths.baselines_root)
-    targets = [paths.queue_db, paths.pr_db]
-    targets += [baseline_db_path(router.managed_root(d)) for d in router.dirs]
-    for src in targets:
-        if Path(src).is_file():
-            src_conn = _connect(src)
-            try:
-                # 每个来源唯一子目录：不同 managed 目录的 baseline.db 不互覆。
-                slot = hashlib.sha256(str(src).encode()).hexdigest()[:10]
-                dst = backup_root / slot / Path(src).name
-                dst.parent.mkdir(parents=True, exist_ok=True)
-                dst_conn = sqlite3.connect(dst)
-                try:
-                    src_conn.backup(dst_conn)
-                finally:
-                    dst_conn.close()
-            finally:
-                src_conn.close()
     report = backfill_merged_at(config, refresh_reports=args.refresh_reports)
-    report["backup"] = str(backup_root)
     print(json.dumps(report, ensure_ascii=False, indent=2))
     return 0
 
