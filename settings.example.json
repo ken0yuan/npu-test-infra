@@ -1,0 +1,28 @@
+{
+  "data_root": null,
+  "baseline_dirs": [
+    "test"
+  ],
+  "executor": {
+    "test_python_env": null,
+    "allowed_devices": [
+      "cpu"
+    ],
+    "function_timeout_seconds": 600
+  },
+  "upstream": {
+    "cycle_interval_seconds": 3600,
+    "first_run_backfill_hours": 2
+  },
+  "skill": {
+    "ref": "bf9b16e"
+  },
+  "obs": {
+    "bucket": "pytorch-ci-cache",
+    "downloader": {
+      "type": "obsutil",
+      "bin": "obsutil"
+    },
+    "wheel_name_contains": []
+  }
+}

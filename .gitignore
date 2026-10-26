@@ -1,0 +1,57 @@
+# Generated Python and test caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Runtime databases, logs, packages, source caches and validation artifacts
+/data/
+
+# Local Python environments
+/venv/
+/.venv/
+
+# Machine-specific configuration; commit settings.example.json instead
+/settings.json
+/settings.local.json
+/settings.local.*.json
+
+# Local environment variables; sanitized templates may be committed
+.env
+.env.*
+!.env.example
+!.env.sample
+!.env.template
+
+# Credentials and private keys
+.obsutilconfig
+.aws/
+.ssh/
+secrets/
+.secrets/
+credentials.json
+credentials.*.json
+service-account*.json
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa
+id_rsa.*
+id_dsa
+id_dsa.*
+id_ecdsa
+id_ecdsa.*
+id_ed25519
+id_ed25519.*
+
+# macOS metadata
+.DS_Store
+
+# Local migration archives may contain databases, machine paths and old configs
+/docs/archive/
+/.local-deps/
+*.egg-info/
+build/
+dist/
+.coverage
+htmlcov/

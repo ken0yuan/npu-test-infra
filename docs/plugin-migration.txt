@@ -1,0 +1,83 @@
+API ↔ 测试关系插件 0.1.2：Linux ARM64 迁移教程
+
+适用：Apple Silicon 上运行的 Linux ARM64 虚拟机，以及普通 Linux ARM64/x86_64 服务器。
+不适用：直接在 macOS 或 Windows 运行。本版要求 CPython 3.11。
+已验证：x86_64 Linux/WSL、CPython 3.11、真实 PyTorch/CUDA；尚无 ARM64 实机验证。
+
+一、准备你自己的测试环境
+
+使用已经安装好 PyTorch 和目标测试依赖的 Python 3.11 环境。
+下面所有命令中的 python 必须指向这个环境。插件不需要源码编译的 PyTorch、-g1 或 GDB，普通 PyTorch wheel 可以使用。
+
+  python -c "import sys,platform,torch; print(sys.version); print(platform.system(),platform.machine()); print(torch.__version__); print(torch.__file__)"
+
+确认系统是 Linux，Python 是 3.11；ARM 虚拟机通常显示 aarch64。
+当前插件在本机编译小型身份适配器，因此还需要 cc 和该 Python 3.11 的开发头文件。
+Ubuntu/Debian 若确实缺少，可安装 build-essential 和匹配解释器的 python3.11-dev。
+Conda 或自行构建的 Python 通常自带头文件；不要用 Python 3.10/3.12 的头文件替代。
+此处不需要安装 CUDA 或 Triton。只有目标测试自己需要它们时才安装。
+
+二、安装插件
+
+解压迁移包，进入解压后的目录：
+
+  sha256sum -c SHA256SUMS.txt
+  python -m pip install ./api_test_relations-0.1.2-py3-none-any.whl
+  python -m api_test_relations doctor
+
+doctor 会使用目标机器的编译器构建并加载身份适配器，不导入 PyTorch。
+成功时输出 native_adapter: built_and_imported。
+wheel 中没有预编译的 x86 动态库，不会把 WSL 的二进制拿到 ARM 上运行。
+
+三、先跑随包 CPU 小样本
+
+  unzip api-test-relations-plugin-0.1.2-source.zip
+  cd api-test-relations-plugin
+  export RUN="$PWD/migration-runs/cpu-001"
+  PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest -p api_test_relations.pytest_plugin examples/migration/test_cpu_mapping.py -q --api-relations-repo "$PWD" --api-relations-out "$RUN" --api-relations-label linux-arm64-cpu
+
+等待 pytest 返回，并确认它的子进程退出后，重建最终汇总：
+
+  python -m api_test_relations settle --out "$RUN" --destination "${RUN}-final"
+  python examples/migration/check_mapping.py "${RUN}-final"
+  python -m api_test_relations query --out "${RUN}-final" --api torch.Tensor.fill_
+  python -m api_test_relations audit --out "${RUN}-final"
+
+小样本包含 5 个实例：两个参数化 fill_、cProfile、线程、Python 子进程。
+检查脚本验证 6 条明确的 API↔测试关系和子进程完成回执；missing、unexpected_owners、gaps 应为空。
+这里的 pytorch/examples/... 是以所选 repo 根目录生成的统一路径前缀，不表示这些样例来自 PyTorch 仓库。
+每次重试换一个新目录，例如 cpu-002；不要覆盖证据。
+
+四、接入你真正要跑的测试
+
+进入包含目标测试的仓库根目录，保留原来能够运行测试的命令、环境和筛选条件，追加插件参数：
+
+  cd /path/to/pytorch
+  python -m pytest -p api_test_relations.pytest_plugin test/YOUR_TEST.py --api-relations-repo "$PWD" --api-relations-out /data/api-relations/run-001 --api-relations-label linux-arm64-cpu
+  python -m api_test_relations settle --out /data/api-relations/run-001 --destination /data/api-relations/run-001-final
+  python -m api_test_relations query --out /data/api-relations/run-001-final --api torch.Tensor.fill_ --json /data/api-relations/fill-relations.json
+
+YOUR_TEST.py 必须替换为你已有的测试，不能原样运行。
+如果原命令禁用了 pytest 自动加载，显式的 -p 参数仍会加载此插件。
+如果已自动加载了此插件，pytest 使用相同入口名称，不需另外启动采集器。
+在昇腾服务器上，按已有环境需要追加 --api-relations-import torch_npu，并用自己的 NPU 测试和设备设置。
+label 仅用于记录环境，不会把 CPU 测试转换成 NPU 测试。
+
+五、输出和边界
+
+relations.sqlite：API↔完整参数化测试名的关系、阶段、别名和首个调用点。
+shards/：每个进程的原始观测、父测试归属、启动和完成回执。
+manifest.json、test-sources.json：环境、台账和源码身份。
+settlement.json：最终汇总的来源及校验值。原始目录保持不变。
+
+默认台账为 10,362 条，torch.compile API 本身排除。解析的是运行时 callable 身份，不依赖固定源码行号或地址。
+单独的 torch_npu.* 名称尚未接入；torch 命名空间中被扩展替换的 callable 可按实际对象解析。
+不提供调度器、自动依赖安装或 pytest-xdist；多个独立 pytest 进程须使用各自的新输出目录。
+API 未观测到不等于没有测试调用，capture_finished 也不表示零遗漏；同时检查 gaps。
+同一 callable 的多个别名会作为别名组记录，不能据此断言用户采用了每个别名拼写。
+
+本地对照：两个 profiler 样本保留全部 193 条历史关系并新增 79 条；两个动态形状样本在退出后汇总得到 381 条，与历史键和别名组一致。
+退出后汇总曾补回 11 条已写入原始分片但尚未进入摘要的关系，这也是 settle 步骤的原因。
+一个编译缓存样本两次在 360 秒限时内未完成，不能宣称其采集已经通过验证；全量吞吐、ARM64/NPU 尚未实测。
+
+遇到 doctor、采集或检查失败，请保留完整运行目录和命令输出。不要把空关系、子进程缺少回执或依赖导致提前退出当作完整覆盖。

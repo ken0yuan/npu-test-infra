@@ -1,0 +1,61 @@
+{
+  "package_version": "0.1.2",
+  "date": "2026-10-25",
+  "target": "ARM64 Linux with existing working PyTorch/torch_npu environment",
+  "actual_validation": "x86_64 WSL Ubuntu-22.04, CPython 3.11, real source-built PyTorch 1ee9fbab and CUDA plus isolated synthetic regressions",
+  "regressions": {
+    "passed": 39,
+    "skipped": 2,
+    "skipped_checks_run_separately": {
+      "passed": 2,
+      "scope": "real CUDA identity/thread calls and full ledger binding"
+    }
+  },
+  "tested": [
+    "exact function and descriptor identities",
+    "parameterized test ownership",
+    "callable aliases",
+    "extension rebinding using synthetic torch_npu",
+    "thread ownership",
+    "Python child process receipts",
+    "spawn process pool task ownership",
+    "phase/SQLite merge and query",
+    "source paths and hashes",
+    "no collection when plugin disabled",
+    "refuse overwriting evidence",
+    "concurrent registry refresh and namespace growth",
+    "transactional refresh rollback",
+    "binding mutation during scan",
+    "cProfile and _lsprof before/during/after collection with preserved native stats",
+    "same-line native profiling transitions",
+    "existing trace clients and opcode flags",
+    "native profiling in threads and exceptions",
+    "hot-journal committed evidence recovery and merge",
+    "recovery rejects live PID and unrelated corruption",
+    "Post-exit rebuild includes late relations and receipts without modifying original evidence",
+    "Raw gaps preserved, live producer and overwrite refused, empty shard reported"
+  ],
+  "skipped": [],
+  "arm64_executed": false,
+  "ascend_npu_executed": false,
+  "native_adapter": "C source only; compile with target CPython 3.11 headers and native compiler",
+  "known_limitations": "docs/limitations.md",
+  "proves_zero_omissions": false,
+  "production_baseline_resumed": false,
+  "wheel_validation": {
+    "host_native_adapter": "built_and_imported",
+    "standalone_pytest_mapping": "verified",
+    "packaged_native_binary": false,
+    "source_tree_imported": false
+  },
+  "real_comparison": {
+    "evidence_directory": "../api-relations-plugin-comparison-20261025",
+    "canary_old_keys_retained": 23,
+    "canary_new_keys": 29,
+    "profiler_historical_keys_retained": 193,
+    "profiler_new_keys": 272,
+    "warning_historical_keys_retained_after_settle": 381,
+    "late_keys_recovered_from_raw": 11,
+    "limitations": "Other reruns and outstanding coverage gaps are recorded separately in comparison.json. Not full-suite acceptance."
+  }
+}

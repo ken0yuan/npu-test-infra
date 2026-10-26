@@ -1,0 +1,70 @@
+{
+  "collector_origin": "relations-v4r2",
+  "files": [
+    {
+      "source": "outputs/npu-test-infra-x86/releases/relations-v4r2/src/trace_api_chain/tools/rtcapture/relation_child_entry.py",
+      "target": "src/api_test_relations/runtime/relation_child_entry.py",
+      "source_sha256": "a0ca4cb502897f88592192e97fe8534775363ad9ac88ef30abcfd60866b6aa9a"
+    },
+    {
+      "source": "outputs/npu-test-infra-x86/releases/relations-v4r2/src/trace_api_chain/tools/rtcapture/relation_collector.py",
+      "target": "src/api_test_relations/runtime/relation_collector.py",
+      "source_sha256": "7387bff80a45e9d8cf70424351fff80900c43bd1129f8989216181b5b547eb83"
+    },
+    {
+      "source": "outputs/npu-test-infra-x86/releases/relations-v4r2/src/trace_api_chain/tools/rtcapture/relation_context.py",
+      "target": "src/api_test_relations/runtime/relation_context.py",
+      "source_sha256": "82d5e608a415556f487385017548225ef8d11d146c9c3cb4be4465d1149483a4"
+    },
+    {
+      "source": "outputs/npu-test-infra-x86/releases/relations-v4r2/src/trace_api_chain/tools/rtcapture/relation_launch.py",
+      "target": "src/api_test_relations/runtime/relation_launch.py",
+      "source_sha256": "1180d27491865a7679a8cb6b49ae435546e23792ee81bb0065d0377b0b77b5f8"
+    },
+    {
+      "source": "outputs/npu-test-infra-x86/releases/relations-v4r2/src/trace_api_chain/tools/rtcapture/relation_plugin.py",
+      "target": "src/api_test_relations/runtime/relation_plugin.py",
+      "source_sha256": "c7fb69224feca13430ba3a05e5f860dd16783e1741572b38f8cca02238d745ef"
+    },
+    {
+      "source": "outputs/npu-test-infra-x86/releases/relations-v4r2/src/trace_api_chain/tools/rtcapture/relation_process.py",
+      "target": "src/api_test_relations/runtime/relation_process.py",
+      "source_sha256": "5309ea75a6c3e433f176649a78d6b28829a7a39a8561c08f3da7e04ec539d57c"
+    },
+    {
+      "source": "outputs/npu-test-infra-x86/releases/relations-v4r2/src/trace_api_chain/tools/rtcapture/relation_identity.c",
+      "target": "src/api_test_relations/runtime/relation_identity.c",
+      "source_sha256": "ae1d5686dbad0ad8ec5da13bf3638f47e18bd52e58004ee2a54ff2feef4b24b5"
+    },
+    {
+      "source": "outputs/npu-test-infra-x86/releases/relations-v4r2/src/trace_api_chain/tools/rtcapture/bootstrap/sitecustomize.py",
+      "target": "src/api_test_relations/runtime/bootstrap/sitecustomize.py",
+      "source_sha256": "d4942b02f6938ba74383ad18cae06e9f7fa30944496d4ef3238867f97de7e453"
+    }
+  ],
+  "catalog_count": 10362,
+  "catalog_sha256": "c086abe9b812c2c315f1c208dd25b7c83f9d5b0fe825710f25f5fb78d2a0cd48",
+  "adaptations": [
+    "Explicit opt-in pytest entry point",
+    "Per-run native build for host architecture",
+    "Backend-neutral capture; test runner owns device policy",
+    "Transactional locked registry refresh with dirty-version preservation",
+    "Native opcode guard and profiling/tracing client forwarding",
+    "Hot-journal recovery extracted from parallel-scheduler-v2 with guaranteed reader closure",
+    "Post-exit immutable-source settlement; rebuild derived states from final raw shards and receipts; explicit empty-shard gap"
+  ],
+  "not_included": [
+    "scheduler",
+    "dependency installer",
+    "old run databases",
+    "compiled extensions",
+    "PyTorch",
+    "torch_npu",
+    "GDB/callchain",
+    "historical baselines",
+    "credentials"
+  ],
+  "storage_origin": "relations-v4r2/api_relations.py:connect,merge,active_children,drain_children,query",
+  "package_version": "0.1.2",
+  "recovery_origin": "outputs/npu-test-infra-x86/releases/parallel-scheduler-v2/scheduler.py:recover_closed_shards,merge_recovering"
+}

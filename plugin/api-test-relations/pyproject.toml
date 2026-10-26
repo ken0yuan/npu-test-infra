@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=65", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "api-test-relations"
+version = "0.1.2"
+description = "Evidence-preserving PyTorch API to pytest test relation collection"
+readme = "README.md"
+requires-python = ">=3.11,<3.12"
+dependencies = ["pytest>=7,<10"]
+
+[project.scripts]
+api-test-relations = "api_test_relations.cli:main"
+
+[project.entry-points.pytest11]
+api_test_relations = "api_test_relations.pytest_plugin"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+api_test_relations = ["catalogs/*.json", "runtime/*.c", "runtime/*.h"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["integration: explicit opt-in real PyTorch/CUDA checks"]
