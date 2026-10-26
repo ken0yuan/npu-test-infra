@@ -149,6 +149,8 @@ class Executor:
         # 清理阶段未完成的任务优先续清理；清理完成前不开始下一任务。
         for task in self.queue.list_tasks(q.STATE_CLEANING):
             self._resume_cleaning(task)
+            if self.queue.get_task(task.task_id).state == q.STATE_CLEANING:
+                return RunOutcome(None, 'idle', 'Cleanup pending; executor retained')
 
         task = self.queue.claim_next()
         if task is None:
@@ -177,14 +179,14 @@ class Executor:
             return RunOutcome(task.task_id, "blocked", reason)
         # 阶段 1：准备（下载 + 完整性核验）。资源不齐 → blocked 等待，
         # 不卸载当前环境、不开始测试（文档第 6 节步骤 1–4）。
-        ok, detail = self._prepare(task)
+        ok, detail = self._timed(task, 'prepare', self._prepare, task)
         if not ok:
             return RunOutcome(task.task_id, "blocked", detail)
 
         # 阶段 2：卸载旧包、安装本任务 wheel（步骤 5–6）。
         # "blocked" = 待实施配置缺失（等待，不动环境）；"failed" = 安装/
         # 核验失败，属执行中断：保存诊断、清理临时资源、标 failed。
-        status, detail = self._install(task)
+        status, detail = self._timed(task, 'install', self._install, task)
         if status == "blocked":
             return RunOutcome(task.task_id, "blocked", detail)
         if status == "failed":
@@ -205,20 +207,20 @@ class Executor:
             return RunOutcome(task.task_id, "blocked", reason)
         # 环境预检：环境级故障（CANN/driver/boot/测试依赖）在此分界为
         # blocked(env)，不进 testing——不与代码嫌疑的 failed 混淆。
-        ok, reason = self._preflight(task, source_root)
+        ok, reason = self._timed(task, 'preflight', self._preflight, task, source_root)
         if not ok:
             self.queue.mark_blocked(task.task_id, reason)
             return RunOutcome(task.task_id, "blocked", reason)
         # 等卡门禁（用户 2026-10-26 要求）：下载安装照常完成，仅在执行
         # 测试前确认空闲 NPU 卡，不够就等待。本轮仅串行等待、不钉卡
         # （按测试真实需求申请与设备租约是遗留项，见修复日志）。
-        ok, reason, free_cards = self._wait_for_free_npu(task)
+        ok, reason, free_cards = self._timed(task, 'device_wait', self._wait_for_free_npu, task)
         if not ok:
             self.queue.mark_blocked(task.task_id, reason or "等待空闲 NPU 卡未成功")
             return RunOutcome(task.task_id, "blocked", reason)
         print(f"[等卡] 通过：空闲 NPU {len(free_cards)} 张，开始执行", flush=True)
         self.queue.transition(task.task_id, q.STATE_TESTING, "开始按清单执行")
-        submission = self._run(task, source_root)
+        submission = self._timed(task, 'testing', self._run, task, source_root)
         if submission is None:
             # _run 自行处理了中断状态：blocked（全部 no_result，环境嫌疑）
             # 或 failed（诊断与 error_reason 见任务记录）。
@@ -230,19 +232,44 @@ class Executor:
         # 阶段 4：写库（重试；耗尽后保留证据、不清理）。
         self.queue.transition(task.task_id, q.STATE_WRITING, "开始写库")
         try:
-            self._persist_with_retry(task, submission)
+            self._timed(task, 'persist', self._persist_with_retry, task, submission)
         except ExecutorError as e:
             return RunOutcome(task.task_id, "failed", str(e))
 
         # 阶段 5：立即清理（成功写库后不等待、不设保留期）。
         self.queue.transition(task.task_id, q.STATE_CLEANING, "写库完成，立即清理")
-        self._cleanup_task_artifacts(task)
+        try:
+            self._timed(task, 'cleanup', self._cleanup_task_artifacts, task)
+        except Exception as error:
+            self._save_diagnostics(task, str(error), 'cleanup')
+            return RunOutcome(task.task_id, 'cleaning', str(error))
         self.queue.transition(task.task_id, q.STATE_DONE, "本任务完成")
         return RunOutcome(task.task_id, "done", str(submission.pr_number))
 
     # ------------------------------------------------------------------
     # 阶段实现
     # ------------------------------------------------------------------
+
+    def _timed(self, task, stage, operation, *args):
+        import time
+        from .task_staging import task_root, atomic_json
+        path = task_root(self.config, task) / 'executor-progress.json'
+        try:
+            state = json.loads(path.read_text(encoding='utf-8'))
+        except (OSError, ValueError):
+            state = {}
+        started = time.monotonic()
+        state.update(task_id=task.task_id, stage=stage, updated_at=time.time())
+        atomic_json(path, state)
+        print(f'[executor] {task.task_id} stage={stage}', flush=True)
+        try:
+            return operation(*args)
+        finally:
+            elapsed = time.monotonic() - started
+            state.setdefault('stage_seconds', {})[stage] = elapsed
+            state['updated_at'] = time.time()
+            atomic_json(path, state)
+            print(f'[executor] {task.task_id} stage={stage} seconds={elapsed:.3f}', flush=True)
 
     def _prepare(self, task: q.Task) -> tuple[bool, str]:
         """下载与核验。返回 (ok, detail)；不 ok 时任务已标记 blocked。"""
@@ -262,18 +289,9 @@ class Executor:
         source_pkg = packages / "pytorch-source.tar.gz"
         # 拆分包格式（2026-10-22 起）：torch_npu 独立对象，与主体包同下。
         npu_pkg = packages / "wheels-npu.tar.gz"
-        # 任务级源码复用（用户 2026-10-26）：筛选阶段已下载并解压校验的
-        # 源码归档直接复用，wheel 三件套照常下载——消除同任务二次下载。
-        staged_source = (self.paths.data_root / "selection" / task.task_id /
-                         "source-staging" / "pytorch-source.tar.gz")
-        reuse_source = staged_source.is_file() and staged_source.stat().st_size > 0
-        downloads = [(task.obs_wheels_url, wheels_pkg)]
-        if not reuse_source:
-            downloads.append((task.obs_source_url, source_pkg))
+        downloads = [(task.obs_wheels_url, wheels_pkg), (task.obs_source_url, source_pkg)]
         if task.obs_wheels_npu_url:
             downloads.append((task.obs_wheels_npu_url, npu_pkg))
-        if reuse_source:
-            print(f"[源码复用] 使用筛选阶段暂存归档: {staged_source}", flush=True)
         # 下载重试：次数/间隔来自 store.json（queue.download_retries /
         # download_retry_interval_seconds）；未配置（null）= 不重试，保持
         # "不猜默认值"约定。逐文件重试——源码包大，不因 wheels 失败重下它。
@@ -296,11 +314,14 @@ class Executor:
                         time.sleep(interval)
 
         try:
+            from .task_staging import verified_package
             for url, pkg in downloads:
-                _download_with_retry(url, pkg)
-            if reuse_source:
-                import shutil as _shutil
-                _shutil.copy2(staged_source, source_pkg)
+                staged = verified_package(self.config, task, pkg.name)
+                if staged:
+                    shutil.copy2(staged, pkg)
+                    print(f'[reuse] {task.task_id} {pkg.name}', flush=True)
+                else:
+                    _download_with_retry(url, pkg)
         except ObsDownloadError as e:
             self.queue.bump_retry(task.task_id)
             reason = f"OBS 下载失败（共尝试 {max_attempts} 次）: {e}"
@@ -835,25 +856,21 @@ class Executor:
     # ------------------------------------------------------------------
 
     def _cleanup_task_artifacts(self, task: q.Task) -> None:
-        """任务完成清理（用户 2026-10-26 生命周期要求）：工作目录（wheel
-        归档、解压源码树、torch_npu 包）+ 筛选源码暂存 + 计划目录一并删除；
-        失败上抛由 cleaning 重试机制处理，不假报 done。共享 source_cache
-        遗留副本在无在用引用时尽力删除（失败仅记录，非本任务独占产物）。
-        """
+        from .task_staging import remove_staging
         self._safe_cleanup(task.work_dir)
-        import shutil as _shutil
-        staging = self.paths.data_root / "selection" / task.task_id
-        if staging.exists():
-            _shutil.rmtree(staging)
-        sha10 = (task.pytorch_commit or "")[:10]
-        cache = self.paths.data_root / "source_cache" / sha10
-        if cache.exists():
-            active = [t for t in self.queue.list_tasks()
-                      if t.state not in q.TERMINAL_STATES
-                      and (t.pytorch_commit or "").startswith(sha10)
-                      and t.task_id != task.task_id]
-            if not active:
-                _shutil.rmtree(cache, ignore_errors=True)
+        remove_staging(self.config, task)
+        # Retire legacy source cache only when no other live task references it.
+        sha = task.pytorch_commit or ''
+        if re.fullmatch(r'[0-9a-f]{40,64}', sha):
+            base = (self.paths.data_root / 'source_cache').resolve()
+            cache = base / sha[:10]
+            active = [t for t in self.queue.list_tasks() if t.task_id != task.task_id
+                      and t.state not in q.TERMINAL_STATES
+                      and (t.pytorch_commit or '').startswith(sha[:10])]
+            if cache.exists() and not active:
+                if cache.is_symlink() or cache.resolve().parent != base:
+                    raise ExecutorError('Unsafe legacy source cache path')
+                shutil.rmtree(cache)
 
     def _safe_cleanup(self, work_dir: str | Path) -> None:
         """删除本任务临时目录；绝对路径必须位于 task_work 根内。
@@ -888,7 +905,7 @@ class Executor:
         try:
             self.queue.transition(task.task_id, q.STATE_CLEANING, f"中断: {reason}")
             if task.work_dir:
-                self._safe_cleanup(task.work_dir)
+                self._cleanup_task_artifacts(task)
             self.queue.transition(task.task_id, q.STATE_FAILED, reason)
         except q.QueueError:
             # 状态已处于终态（可能此前已处理），诊断已保存即可。

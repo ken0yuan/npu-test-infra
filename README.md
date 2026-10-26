@@ -165,3 +165,5 @@ venv/test/bin/python -m api_test_relations doctor
 主仓库只提交入口脚本、`settings.example.json`、`run-test/`、`.gitmodules`、`plugin/` 的子模块引用和当前文档；插件源码在各自仓库中维护。`.gitignore` 排除本机配置、凭据、虚拟环境、运行数据和历史归档。提交前用 `git status --short` 核对文件；不要使用 `git add -f` 绕过这些规则。
 
 飞书多文档阶段修复、配置与验收证据见 [2026-10-26 报告验收记录](docs/run_test/report-acceptance-20261026.md)；整体流水线尚待最终验收。
+
+流水线筛选、预取与清理阶段验收见 [2026-10-26 流水线验收记录](docs/run_test/pipeline-acceptance-20261026.md)；整体流水线尚待最终验收。

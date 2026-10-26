@@ -411,7 +411,9 @@ def cmd_pipeline(args: argparse.Namespace) -> int:
         except Exception as e:  # 单轮失败不终止常驻循环
             print(f"[本轮失败] {e}", file=sys.stderr, flush=True)
         try:
-            _time.sleep(interval)
+            # Keep consuming manifests/new candidates while the observer's
+            # slower upstream cycle runs independently. No task is timed out.
+            _time.sleep(min(interval, 1.0))
         except KeyboardInterrupt:
             print("收到退出信号", flush=True)
             return 0
