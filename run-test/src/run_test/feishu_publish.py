@@ -146,8 +146,9 @@ def shape(block):
 
 
 class Publisher:
-    def __init__(self, client, folder, root):
+    def __init__(self, client, folder, root, domain=""):
         self.api, self.folder, self.root = client, folder, Path(root)
+        self.domain = domain
         self.state = {}
         self.path = None
 
@@ -268,6 +269,108 @@ class Publisher:
         raise UncertainWrite('移动请求已提交，等待远端目录确认')
 
     def publish(self, pointer, plan, *, still_current=lambda: True):
+        if plan.get('parts'):
+            return self._publish_parts(pointer, plan, still_current=still_current)
+        return self._publish_single(pointer, plan, still_current=still_current)
+
+    def _publish_parts(self, pointer, plan, *, still_current):
+        """多文档发布（用户 2026-10-26：完整版本集）——先建全部篇并逐篇
+        回读校验（shape 含全文与链接，零丢失），全部通过才晋升主篇、归档
+        旧版本（含旧续篇）并记 published；失败/中断留在暂存可续传，
+        绝不半套发布。"""
+        pr, fingerprint = pointer['pr_number'], pointer['fingerprint']
+        self.path = self.root / self.folder / f'PR_{pr}' / (fingerprint + '.json')
+        if self.path.exists():
+            self.state = json.loads(self.path.read_text(encoding='utf-8'))
+        else:
+            self.state = {'pr_number': pr, 'fingerprint': fingerprint,
+                          'folder': self.folder, 'status': 'staging'}
+            self.save()
+        if self.state['status'] == 'published':
+            return {**self.state['receipt'], 'changed': False}
+        staging = self.unique_object('staging', self.folder, '报告上传暂存', 'folder')
+        version = self.unique_object('version_folder', staging, f'PR_{pr}_{fingerprint}', 'folder')
+        parts = plan['parts']
+        toc_by_part = {pi: [] for pi in range(len(parts))}
+        docs = [self.unique_object(f'part{p["part_index"]}-doc', version,
+                                   plan['title'] + p['title_suffix'], 'docx')
+                for p in parts]
+        # 旧消费方/旧测试读取主篇 token 的兼容键（单篇回执同形）。
+        self.state['document_id'] = docs[0]
+        self.save()
+        for pi, part in enumerate(parts):
+            doc = docs[pi]
+            toc_ops = []
+            for i, operation in enumerate(part['operations']):
+                if operation['op'] == 'toc':
+                    links = [result_docs.text_block('text', plan['title'] + p['title_suffix'],
+                                        link=f'{self.domain}/docx/{docs[p["part_index"]]}')
+                             for p in parts[1:]]
+                    toc_ops.append({'op': 'append', 'parent': 'document',
+                                    'body': {'index': -1,
+                                             'children': [result_docs.text_block('heading4', '本报告分篇（续篇链接）', bold=True)] + links}})
+                    self.append(f'part{pi}-toc', doc, doc, toc_ops[-1]['body']['children'])
+                    toc_by_part[pi].append(toc_ops[-1])
+                    continue
+                created = self.append(f'part{pi}-root-{i}', doc, doc, operation['body']['children'])
+                if operation['op'] == 'table':
+                    table = created[0]
+                    cells = table.get('table', {}).get('cells')
+                    if not cells:
+                        table = next(b for b in self.api.blocks(doc) if b['block_id'] == table['block_id'])
+                        cells = table['table']['cells']
+                    if len(cells) != len(operation['cell_children']):
+                        raise PublishError('建表返回单元格数量异常')
+                    for j, (cell, children) in enumerate(zip(cells, operation['cell_children'])):
+                        self.append(f'cell-{pi}-{i}-{j}', doc, cell, children)
+            if part.get('over_budget'):
+                # 单测试节超出软预算：保持连续如实标注（官方硬限未核实）。
+                self.state[f'part{pi}-over-budget'] = True
+                self.save()
+        # 逐篇回读校验：TOC 占位不计（其真实链接块由 toc_by_part 提供）。
+        verifications = [self.verify(doc, {'operations': [op for op in part['operations']
+                                                          if op.get('op') != 'toc'] + toc_by_part[pi]})
+                         for part, doc, pi in zip(parts, docs, range(len(parts)))]
+        if not still_current():
+            raise PublishError('本地结果已更新；已验证的旧版本留在暂存，未替换当前文档')
+        titles = {plan['title'] + p['title_suffix'] for p in parts}
+        # 完整版本集：全部篇（主篇+续篇）进入目标目录——与历史
+        # PR#194758/-1/-2 同层布局一致；逐一晋升后再归档旧版本。
+        for pi, doc in enumerate(docs):
+            self.move(f'promoted-{pi}', doc, self.folder)
+        # 旧版本集 = 主篇名 + 主篇名-数字（历史续篇命名）——篇数变化
+        # （多篇变单篇/续篇增减）时旧续篇一并归档。
+        def _is_old_version(name):
+            if name == plan['title']:
+                return True
+            if name.startswith(plan['title'] + '-'):
+                return name[len(plan['title']) + 1:].isdigit()
+            return False
+
+        old_docs = [f for f in self.api.files(self.folder)
+                    if f['type'] == 'docx' and _is_old_version(f['name'])
+                    and f['token'] not in set(docs)]
+        if old_docs:
+            history = self.unique_object('history', self.folder, '历史测试报告', 'folder')
+            for old in old_docs:
+                self.move('archived-' + old['token'], old['token'], history)
+        for suffix in [p['title_suffix'] for p in parts]:
+            matches = [f for f in self.api.files(self.folder)
+                       if f['type'] == 'docx' and f['name'] == plan['title'] + suffix]
+            if len(matches) != 1 or matches[0]['token'] not in docs:
+                raise PublishError('发布后目录对账未通过（篇级），未标记完成')
+        receipt = {'pr_number': pr, 'document_id': docs[0], 'fingerprint': fingerprint,
+                   'verification': verifications[0],
+                   'parts': [{'part_index': p['part_index'], 'role': p['role'],
+                              'title': plan['title'] + p['title_suffix'],
+                              'document_id': doc, 'verification': v}
+                             for p, doc, v in zip(parts, docs, verifications)],
+                   'archived': [f['token'] for f in old_docs], 'changed': True}
+        self.state.update(status='published', receipt=receipt)
+        self.save()
+        return receipt
+
+    def _publish_single(self, pointer, plan, *, still_current):
         pr, fingerprint = pointer['pr_number'], pointer['fingerprint']
         self.path = self.root / self.folder / f'PR_{pr}' / (fingerprint + '.json')
         if self.path.exists():
@@ -330,7 +433,8 @@ def publish(config, pr):
     conn = sqlite3.connect(root / 'publish-lock.db', timeout=1)
     try:
         conn.execute('BEGIN IMMEDIATE')
-        worker = Publisher(Feishu(cfg), cfg['FEISHU_TEST_FOLDER_TOKEN'], root)
+        worker = Publisher(Feishu(cfg), cfg['FEISHU_TEST_FOLDER_TOKEN'], root,
+                           domain=cfg.get('FEISHU_DOMAIN', ''))
         def still_current():
             return result_docs.digest(result_docs.encoded(result_docs.load_report(config, pr)).encode()) == pointer['fingerprint']
         receipt = worker.publish(pointer, plan, still_current=still_current)

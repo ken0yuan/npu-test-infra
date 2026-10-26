@@ -302,12 +302,44 @@ def text_block(kind, text, *, bold=False, folded=False, link=None):
     return {'block_type': types[kind], kind: {'elements': elements, 'style': block_style}}
 
 
-def feishu_plan(model):
-    """Ordered append operations; table cells are resolved by the future uploader.
+def _blocks_size(blocks):
+    """块列表的（块数, 文本字符量）——文档级预算的计算单位。"""
+    field = {2: 'text', 5: 'heading3', 6: 'heading4', 14: 'code'}
+    n_blocks = len(blocks)
+    n_chars = 0
+    for child in blocks:
+        f = field.get(child['block_type'])
+        if f:
+            for e in child[f].get('elements', []):
+                n_chars += len(e.get('text_run', {}).get('content', ''))
+    return n_blocks, n_chars
 
-    No copied document/block IDs. Normal append payloads are native Docx block
-    bodies. Table cells cannot be populated until the server returns their IDs.
+
+def _plan_op_size(op):
+    """一个计划操作的（块数, 文本字符量）。"""
+    if op['op'] == 'table':
+        cells = op.get('cell_children', [])
+        blocks = 1 + sum(len(cell) for cell in cells)
+        chars = sum(_blocks_size(cell)[1] for cell in cells)
+        return blocks, chars
+    return _blocks_size(op.get('body', {}).get('children', []))
+
+
+DEFAULT_DOC_BUDGET = {'doc_max_blocks': 50, 'doc_max_chars': 500_000}
+
+
+def feishu_plan(model, budget=None):
+    """v2：按文档级预算拆主篇与续篇（用户 2026-10-26 澄清——拆分粒度是
+    文档，不是把 8000 字符分块做成产品行为；块内 8000 切分只是文本元素
+    内部细节，拼接零丢失，由发布器逐篇回读校验）。
+
+    budget 缺省用保守值：低于本租户历史成功样本（60 块、636,744 字符/篇；
+    单块实测 ~90k 字符）。正式默认待官方限制核实后经 settings 固化；
+    单测试节超预算时独立成篇并标记 over_budget（保持该测试连续）。
     """
+    budget = dict(budget or DEFAULT_DOC_BUDGET)
+    max_blocks = max(int(budget.get('doc_max_blocks') or 50), 1)
+    max_chars = max(int(budget.get('doc_max_chars') or 500_000), 1)
     operations = []
 
     def append(blocks):
@@ -329,18 +361,66 @@ def feishu_plan(model):
             text_block('text', '执行实例：' + count_text(model['instance_counts']))])
     for warning in model['warnings']:
         append([text_block('text', '证据提示：' + warning)])
-    append([text_block('heading4', '前后对比（基线 → 本次）', bold=True)])
+    header_size = sum(_plan_op_size(op)[0] for op in operations)
+    header_chars = sum(_plan_op_size(op)[1] for op in operations)
+    header_ops = operations[:]
+    operations = []
+
+    def _ops_size(ops):
+        blocks = chars = 0
+        for op in ops:
+            b, c = _plan_op_size(op)
+            blocks += b
+            chars += c
+        return blocks, chars
+
+    # 逻辑节：逐测试整节移动（一个测试不跨篇，保证连续性）。
+    test_sections = []
     for test in model['tests']:
-        append([text_block('text', f"{ICONS[test['outcome']]} {test['test_function']} [{test['device']}]：{test['comparison_text']}")])
-    for test in model['tests']:
-        append([text_block('heading4', detail_title(test), bold=True, folded=True)])
+        section = [text_block('heading4', detail_title(test), bold=True, folded=True)]
         for note in detail_notes(test):
             for offset in range(0, len(note), 8000):
-                append([text_block('text', note[offset:offset+8000])])
+                section.append(text_block('text', note[offset:offset+8000]))
         log = test['log']['text']
-        append([text_block('code', log[i:i+8000]) for i in range(0, len(log), 8000)] or [text_block('code', '')])
-    return {'schema': 'feishu-report-plan/1', 'title': model['title'],
-            'status': 'local_unpublished', 'operations': operations}
+        section.extend([text_block('code', log[i:i+8000]) for i in range(0, len(log), 8000)] or [text_block('code', '')])
+        test_sections.append((detail_title(test), section))
+
+    parts = [{'role': 'main', 'title_suffix': '', 'ops': list(header_ops),
+              'over': header_size > max_blocks or header_chars > max_chars}]
+
+    def _part_append(part, blocks_list):
+        # 节内容以一个 append 操作进入（publisher 端仍按 40 块批量上传）。
+        part['ops'].append({'op': 'append', 'parent': 'document',
+                            'body': {'index': -1, 'children': blocks_list}})
+
+    _part_append(parts[0], [text_block('heading4', '前后对比（基线 → 本次）', bold=True)])
+    for test in model['tests']:
+        _part_append(parts[0], [text_block('text', f"{ICONS[test['outcome']]} {test['test_function']} [{test['device']}]：{test['comparison_text']}")])
+    cur_blocks, cur_chars = _ops_size(parts[0]['ops'])
+    for label, section in test_sections:
+        blocks, chars = _blocks_size(section)
+        fits = (cur_blocks + blocks <= max_blocks and cur_chars + chars <= max_chars)
+        if fits:
+            _part_append(parts[-1], section)
+            cur_blocks += blocks
+            cur_chars += chars
+        else:
+            parts.append({'role': 'continuation', 'title_suffix': f'-{len(parts)}',
+                          'ops': [], 'over': False})
+            _part_append(parts[-1], section)
+            parts[-1]['over'] = blocks > max_blocks or chars > max_chars
+            cur_blocks, cur_chars = _blocks_size(section)
+    if len(parts) > 1:
+        parts[0]['ops'].append({'op': 'toc',
+                                'titles': [model['title'] + p['title_suffix'] for p in parts[1:]]})
+    parts_out = [{'part_index': i, 'role': ('main' if i == 0 else 'continuation'),
+                  'title_suffix': p['title_suffix'], 'over_budget': p['over'],
+                  'operations': p['ops']} for i, p in enumerate(parts)]
+    # 扁平 operations = 全部篇依序拼接：无丢失校验与旧消费方兼容。
+    flattened = [op for p in parts_out for op in p['operations']]
+    return {'schema': 'feishu-report-plan/2', 'title': model['title'],
+            'status': 'local_unpublished', 'part_count': len(parts_out),
+            'parts': parts_out, 'operations': flattened}
 
 
 def _atomic(path, text):

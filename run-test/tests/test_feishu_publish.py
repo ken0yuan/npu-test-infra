@@ -6,6 +6,7 @@ import urllib.parse
 import pytest
 
 from run_test.feishu_publish import Publisher, PublishError, UncertainWrite, credentials, block_text
+from run_test import result_docs
 from run_test.result_docs import build_report, feishu_plan
 from test_result_docs import row_for, item
 
@@ -164,3 +165,83 @@ def test_configuration_is_selective_and_does_not_echo_secret(tmp_path):
     path.write_text(path.read_text().replace('tenant.feishu.cn', 'evil.example'))
     with pytest.raises(PublishError) as e: credentials(path)
     assert 'never-print' not in str(e.value)
+
+
+# ---------------------------------------------------------------------------
+# 多文档拆分与完整版本集发布（用户 2026-10-26）
+# ---------------------------------------------------------------------------
+
+def _v2_plan(pr=77, parts=2, title='PR#77'):
+    """构造 v2 多篇计划：每篇一个 append 操作（含可校验文本）。"""
+    def ops(tag, size):
+        return [{'op': 'append', 'parent': 'document',
+                 'body': {'index': -1,
+                          'children': [result_docs.text_block(
+                              'text', f'{tag}-' * 10 + f'[{size}]')]}}]
+    parts_list = [{'part_index': 0, 'role': 'main', 'title_suffix': '',
+                   'operations': ops('main', 0) + ([{'op': 'toc',
+                                                     'titles': [f'{title}-1', f'{title}-2'][:parts - 1]}]
+                                                    if parts > 1 else [])}]
+    for i in range(1, parts):
+        parts_list.append({'part_index': i, 'role': 'continuation',
+                           'title_suffix': f'-{i}', 'operations': ops(f'cont{i}', i)})
+    return {'schema': 'feishu-report-plan/2', 'title': title,
+            'status': 'local_unpublished', 'part_count': parts, 'parts': parts_list,
+            'operations': [op for p in parts_list for op in p['operations']]}
+
+
+def _doc_names(api, folder):
+    return sorted(f['name'] for f in api.files(folder) if f['type'] == 'docx')
+
+
+def test_multi_part_publish_verifies_links_and_archives_old_continuations(tmp_path):
+    api = FakeFeishu()
+    api.entries['target'].append({'token': 'legacy-main', 'name': 'PR#77', 'type': 'docx'})
+    api.entries['target'].append({'token': 'legacy-cont', 'name': 'PR#77-1', 'type': 'docx'})
+    p, plan = {'pr_number': 77, 'fingerprint': 'b' * 64}, _v2_plan(parts=2)
+    receipt = Publisher(api, 'target', tmp_path, domain='https://x').publish(p, plan)
+    names = _doc_names(api, 'target')
+    assert names == ['PR#77', 'PR#77-1']  # 新版本集完整替换（含旧续篇归档）
+    assert receipt['changed'] and len(receipt['parts']) == 2
+    assert all(v['content_verified'] for v in
+               [receipt['verification']] + [p_['verification'] for p_ in receipt['parts']])
+    assert sorted(receipt['archived']) == ['legacy-cont', 'legacy-main']
+    # 主篇 TOC 含续篇链接
+    main_doc = receipt['document_id']
+    toc_blocks = [b for b in api.blocks(main_doc)
+                  if b.get('text', {}).get('elements')
+                  and any(e.get('text_run', {}).get('text_element_style', {}).get('link')
+                          for e in b['text']['elements'])]
+    assert toc_blocks  # 续篇链接已写入主篇
+
+
+def test_multi_part_idempotent_rescan(tmp_path):
+    api = FakeFeishu()
+    p, plan = {'pr_number': 77, 'fingerprint': 'c' * 64}, _v2_plan(parts=2)
+    first = Publisher(api, 'target', tmp_path).publish(p, plan)
+    assert first['changed']
+    before = api.mutations
+    again = Publisher(api, 'target', tmp_path).publish(p, plan)
+    assert not again['changed'] and api.mutations == before  # 幂等：零 API 调用
+
+
+def test_part_count_change_archives_old_continuation(tmp_path):
+    api = FakeFeishu()
+    p1 = {'pr_number': 77, 'fingerprint': 'd' * 64}
+    Publisher(api, 'target', tmp_path).publish(p1, _v2_plan(parts=2))
+    p2 = {'pr_number': 77, 'fingerprint': 'e' * 64}
+    Publisher(api, 'target', tmp_path).publish(p2, _v2_plan(parts=1))
+    assert _doc_names(api, 'target') == ['PR#77']  # 多篇变单篇：旧续篇一并归档
+
+
+def test_incomplete_publish_stays_staging_then_completes(tmp_path):
+    api = FakeFeishu()
+    p, plan = {'pr_number': 77, 'fingerprint': 'f' * 64}, _v2_plan(parts=2)
+    api.lose_response = True  # 续篇 append 中断
+    with pytest.raises(UncertainWrite):
+        Publisher(api, 'target', tmp_path).publish(p, plan)
+    state = json.loads((tmp_path / 'target' / 'PR_77' / (p['fingerprint'] + '.json')).read_text())
+    assert state['status'] == 'staging'  # 未完整发布绝不记 published
+    receipt = Publisher(api, 'target', tmp_path).publish(p, plan)  # 断点续传
+    assert receipt['changed'] and len(receipt['parts']) == 2
+    assert _doc_names(api, 'target') == ['PR#77', 'PR#77-1']
