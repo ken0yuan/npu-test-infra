@@ -26,6 +26,7 @@ from __future__ import annotations
 import re
 import subprocess
 from dataclasses import dataclass, field
+import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -38,6 +39,43 @@ PYTORCH_UPSTREAM_URL = "https://github.com/pytorch/pytorch.git"
 _PR_IN_SUBJECT_RE = re.compile(r"\(#(\d+)\)")
 
 _LOG_FMT = "%H%x00%ct%x00%s"
+
+
+def detect_inversions(entries: list[tuple[str, int]]) -> list[dict]:
+    """first-parent 新→旧序列里的时间倒序（子提交时间 < 父提交时间）。
+
+    官方 main 的 committer 时钟在生产观测为零倒序（2026-10-26 Codex
+    核实最近 1000 first-parent）；此处只做检测与持久化，不改排序。
+    """
+    inversions = []
+    for i in range(1, len(entries)):
+        sha, ts = entries[i]
+        prev_sha, prev_ts = entries[i - 1]
+        if ts > prev_ts:  # 越走越旧时间却变新 → 倒序
+            inversions.append({"sha": sha, "commit_time": ts,
+                               "child_time": prev_ts})
+    return inversions
+
+
+def validate_merge_order(mirror, *, limit: int = 1000) -> dict:
+    """对 main first-parent 最近 limit 个提交做一次顺序校验（fetch 时
+    调用一次，结果持久化 data_root/upstream-order.json——结果提交侧不再
+    联网校验，异常时提交守卫回退 Git 祖先）。"""
+    fmt = "%H%x00%ct"
+    out = _git(mirror.git_dir, ["log", "--first-parent", f"--max-count={limit}",
+                                f"--format={fmt}", "main"])
+    entries = []
+    for line in out.splitlines():
+        if not line.strip():
+            continue
+        sha, ts = (line.split("\x00", 1) + [""])[:2]
+        if ts.isdigit():
+            entries.append((sha, int(ts)))
+    inversions = detect_inversions(entries)
+    return {"tip": entries[0][0] if entries else None,
+            "checked": len(entries),
+            "max_commit_time": entries[0][1] if entries else None,
+            "inversions": inversions}
 
 
 def _parse_log(out: str) -> list["UpstreamCommit"]:

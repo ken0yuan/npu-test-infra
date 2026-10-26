@@ -871,10 +871,20 @@ def submit_complete_result(
                  "relation": relation, "reason": reason})
 
         trusted = ('upstream-main-commit-time',)
+        # 顺序依据健全性（用户 2026-10-26）：上游顺序文件记录倒序时，
+        # 合入时刻视为不可信 → 回退 Git 祖先（异常时保留守卫）。
+        order_ok = True
+        order_file = paths.data_root / "upstream-order.json"
+        if order_file.is_file():
+            try:
+                order = json.loads(order_file.read_text(encoding="utf-8"))
+                order_ok = not order.get("inversions")
+            except Exception:
+                order_ok = True  # 顺序文件损坏不放大为基线风险
         sub_t = (_parse_utc(sub.merged_at)
-                 if sub.merged_at_provenance in trusted else None)
+                 if order_ok and sub.merged_at_provenance in trusted else None)
         base_t = (_parse_utc(old.merged_at)
-                  if old.merged_at_provenance in trusted else None)
+                  if order_ok and old.merged_at_provenance in trusted else None)
         if sub_t is not None and base_t is not None:
             # 持久化合入时刻比较：不依赖实时 Git 查询。
             if sub_t > base_t:

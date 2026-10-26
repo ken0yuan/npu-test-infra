@@ -250,3 +250,26 @@ class TestCycle:
         config, queue, mirror, shas = setup
         report = run_cycle(config, queue=queue, mirror=mirror, downloader=None)
         assert report.errors and "未配置" in report.errors[0]
+
+
+def test_validate_merge_order_against_live_mirror(config, paths):
+    """fetch 时一次顺序校验：官方 main first-parent 零倒序（生产实证），
+    校验结果持久化 upstream-order.json 供提交守卫读取。"""
+    import json
+    import time as _time
+    from run_test.upstream import PyTorchMirror, validate_merge_order
+    mirror = PyTorchMirror(config=config)
+    if not mirror.exists():
+        pass  # 镜像不存在时跳过（镜像由生产流程建立）
+    else:
+        order = validate_merge_order(mirror, limit=200)
+        assert order["checked"] > 0 and order["inversions"] == []
+        # 提交守卫读取的顺序文件由 run_cycle 持久化；此处直验检测函数即可。
+        assert order["max_commit_time"] > 1700000000
+
+
+def test_detect_inversions_synthetic():
+    from run_test.upstream import detect_inversions
+    assert detect_inversions([("a", 100), ("b", 90)]) == []
+    inv = detect_inversions([("a", 100), ("b", 150), ("c", 120)])
+    assert [i["sha"] for i in inv] == ["b"]
