@@ -385,8 +385,13 @@ class PytestRunner:
 
     def run_function(self, test_function: str, device: str, *,
                      source_root: str | Path | None = None,
-                     artifact_dir: str | Path | None = None) -> FunctionRunOutcome:
-        """Run ordinary pytest with built-in collection and JUnit; no capture extension."""
+                     artifact_dir: str | Path | None = None,
+                     extra_env: dict | None = None) -> FunctionRunOutcome:
+        """Run ordinary pytest with built-in collection and JUnit; no capture extension.
+
+        extra_env：调用方注入的额外环境变量（如等卡门禁钉定的
+        ASCEND_RT_VISIBLE_DEVICES），覆盖同名默认变量。
+        """
         runtime_nodeid = str(test_function).strip()
         tf = self._source_function_key(runtime_nodeid)
         dev = require_execution_device(validate_device(device))
@@ -394,6 +399,8 @@ class PytestRunner:
         cwd = str(Path(source_root) / "test") if source_root else None
         nodeid = runtime_nodeid[5:] if source_root and runtime_nodeid.startswith("test/") else runtime_nodeid
         env = test_execution_env(dev, source_root, tf)
+        if extra_env:
+            env = {**env, **extra_env}
         artifact = Path(artifact_dir) if artifact_dir else None
         if artifact is None and self.artifact_root:
             artifact = self.artifact_root / f"{dev}-{tf.replace('/', '_').replace(':', '_')}"

@@ -40,6 +40,14 @@ from .record import FunctionResult, Submission, SubmitReport, submit_complete_re
 _DEFAULT = object()
 
 
+def _wait_free_npu_cards(need: int, timeout: float, interval: float):
+    """等卡门禁默认探针，转发 run_test.npu_cards；等待过程打到 pipeline 日志。"""
+    from .npu_cards import wait_free_cards
+
+    return wait_free_cards(need, timeout, interval,
+                           log=lambda msg: print(msg, flush=True))
+
+
 def _ts() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%f")
 
@@ -106,10 +114,14 @@ class Executor:
         downloader=_DEFAULT,
         runner=None,
         persist: Callable[..., SubmitReport] | None = None,
+        npu_probe: Callable[[int, float, float], tuple[list[int], str]] | None = None,
     ):
         self.config = config
         self.paths = store_paths(config)
         self.queue = queue_store or QueueStore(config)
+        # 等卡门禁的探测函数（参数 need/timeout/interval → (空闲卡, 原因)），
+        # 默认走 run_test.npu_cards；测试注入假探针避免 shell out。
+        self.npu_probe = npu_probe or _wait_free_npu_cards
         self.downloader = (
             make_downloader(config.get("obs")) if downloader is _DEFAULT else downloader
         )
@@ -197,6 +209,14 @@ class Executor:
         if not ok:
             self.queue.mark_blocked(task.task_id, reason)
             return RunOutcome(task.task_id, "blocked", reason)
+        # 等卡门禁（用户 2026-10-26 要求）：下载安装照常完成，仅在执行
+        # 测试前确认空闲 NPU 卡，不够就等待。本轮仅串行等待、不钉卡
+        # （按测试真实需求申请与设备租约是遗留项，见修复日志）。
+        ok, reason, free_cards = self._wait_for_free_npu(task)
+        if not ok:
+            self.queue.mark_blocked(task.task_id, reason or "等待空闲 NPU 卡未成功")
+            return RunOutcome(task.task_id, "blocked", reason)
+        print(f"[等卡] 通过：空闲 NPU {len(free_cards)} 张，开始执行", flush=True)
         self.queue.transition(task.task_id, q.STATE_TESTING, "开始按清单执行")
         submission = self._run(task, source_root)
         if submission is None:
@@ -570,7 +590,29 @@ class Executor:
                 self._save_diagnostics(task, out, "preflight-4-collect-target")
         return True, ""
 
-    def _run(self, task: q.Task, source_root: Path) -> Submission | None:
+    def _wait_for_free_npu(self, task: q.Task) -> tuple[bool, str, list[int]]:
+        """等卡门禁：accelerator 清单项执行前确认空闲 NPU 卡数量。
+
+        executor.wait_free_npu_cards 未配置（或 0）= 不启用门禁（不猜默认值）。
+        配置后：卡够 → 返回空闲卡列表；不够 → 每
+        wait_free_npu_interval_seconds 轮询一次，超过
+        wait_free_npu_timeout_seconds（0=一直等）→ 返回失败原因（blocked）。
+        返回 (ok, 原因, 空闲卡列表)。
+        """
+        cfg = (self.config.get("executor") or {})
+        need = int(cfg.get("wait_free_npu_cards") or 0)
+        if need <= 0 or not any(
+            x.get("device") == "accelerator" for x in (task.test_manifest or [])
+        ):
+            return True, "", []
+        timeout = float(cfg.get("wait_free_npu_timeout_seconds") or 0)
+        interval = max(float(cfg.get("wait_free_npu_interval_seconds") or 30), 1.0)
+        cards, why = self.npu_probe(need, timeout, interval)
+        if not cards:
+            return False, why, []
+        return True, "", cards
+
+    def _run(self, task: q.Task, source_root: Path, extra_env: dict | None = None) -> Submission | None:
         """按清单执行测试，构造一份完整提交。中断时自行处理状态并返回 None。"""
         # 以 DB 最新绑定刷新快照：set_task_torch_npu 只写库不改调用方的
         # 旧内存对象，沿用旧快照会让 torch_npu_commit 停留 None，
@@ -623,7 +665,8 @@ class Executor:
             elif not runtime_nodes:
                 runtime_nodes = [tf]
             outcomes = [
-                self.runner.run_function(node, dev, source_root=source_root)
+                self.runner.run_function(node, dev, source_root=source_root,
+                                         extra_env=extra_env)
                 for node in runtime_nodes
             ]
             complete = all(outcome.completed for outcome in outcomes)

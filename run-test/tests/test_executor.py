@@ -33,9 +33,11 @@ class FakeRunner:
         self.counts_map = counts_map or {}
         self.incomplete = incomplete or set()
         self.source_roots: list = []
+        self.extra_envs: list = []
 
-    def run_function(self, tf, dev, *, source_root=None):
+    def run_function(self, tf, dev, *, source_root=None, extra_env=None):
         self.source_roots.append(source_root)
+        self.extra_envs.append(extra_env)
         if (tf, dev) in self.incomplete:
             return FunctionRunOutcome.incomplete(tf, dev, "模拟：未收集到测试")
         return FunctionRunOutcome(

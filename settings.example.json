@@ -3,12 +3,22 @@
   "baseline_dirs": [
     "test"
   ],
+  "reports": {
+    "enabled": false,
+    "feishu": {
+      "enabled": false,
+      "env_file": null
+    }
+  },
   "executor": {
     "test_python_env": null,
     "allowed_devices": [
       "cpu"
     ],
-    "function_timeout_seconds": 600
+    "function_timeout_seconds": 600,
+    "wait_free_npu_cards": 1,
+    "wait_free_npu_interval_seconds": 30,
+    "wait_free_npu_timeout_seconds": 21600
   },
   "upstream": {
     "cycle_interval_seconds": 3600,
