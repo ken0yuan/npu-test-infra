@@ -119,10 +119,10 @@ Error > Failed > No Result > Skipped > Passed。部分实例跳过归入 Skipped
 
 ### 发布到飞书
 
-将飞书专用配置保存在仓库外的受限文件（服务器示例 `/root/.config/npu-test-infra/feishu.env`，
-目录权限 0700、文件权限 0600），其中只需 `FEISHU_APP_ID`、`FEISHU_APP_SECRET`、
+将飞书专用配置保存在仓库根目录 `.env`（例如 `/home/workspace-ycy/npu-test-infra/.env`），
+文件权限设为 0600。可先复制 `.env.example` 再填写真实值；`.gitignore` 已忽略 `.env` 与 `.env.*`，仅允许无凭据的示例模板入库。其中只需 `FEISHU_APP_ID`、`FEISHU_APP_SECRET`、
 `FEISHU_DOMAIN`、`FEISHU_TEST_FOLDER_TOKEN`。不要把认证内容提交 Git 或写入运行日志。
-在本机 `settings.json` 配置 `reports.feishu.env_file` 指向该文件。
+在本机 `settings.json` 配置 `reports.feishu.env_file` 指向仓库 `.env` 的绝对路径。`settings.json` 同样由 Git 忽略；监控进程每轮重新读取配置。
 
 ```bash
 bash run.sh report publish --pr 191432
