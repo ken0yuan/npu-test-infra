@@ -14,7 +14,14 @@ select 在后台线程持续产清单，executor 主线程就绪即消费——�
 
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
 from typing import Any
+
+# 筛选子进程登记（进程内存活；跨轮防重复派生；轮间由同任务筛选锁兜底）。
+_SELECTION_IN_FLIGHT: dict = {}
+_SELECTION_FAILURES: dict = {}
 
 
 def make_runner(config: dict):
@@ -83,6 +90,41 @@ def run_selection(
         return 2
 
     paths = store_paths(config)
+    # 同任务筛选互斥（防轮间重复派生；非阻塞，占用即跳过 rc=3）。
+    # contextmanager 保证成功/异常/占用都关闭 fd（评审阻塞项 3）。
+    import fcntl
+    lock_dir = paths.data_root / "selection" / task_id
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    lock_fd = os.open(lock_dir / ".selection.lock", os.O_CREAT | os.O_RDWR)
+    try:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print("已有筛选进程在运行（锁占用）；本轮跳过", file=sys.stderr)
+            return 3
+        # 子进程模式：stderr 落任务文件（评审阻塞项 2——PIPE 只在退出后
+        # 读取，>64KB 会撑爆管道令子进程永久阻塞）。
+        log_path = paths.data_root / "selection" / task_id / "select-one.stderr.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        _err = open(log_path, "ab")
+        try:
+            sys.stderr = _err
+            return _run_selection_body(config, store, task, task_id, paths)
+        finally:
+            sys.stderr = sys.__stderr__
+            _err.close()
+    finally:
+        os.close(lock_fd)
+
+
+def _run_selection_body(
+    config: dict,
+    store,
+    task,
+    task_id: str,
+    paths,
+) -> int:
+    """筛选主体（持锁后运行）：源码暂存 → P0/P1 筛选 → 设备判定 → 清单。"""
     sha = task.pytorch_commit
     mirror = PyTorchMirror(config=config)
     mirror.ensure()
@@ -209,81 +251,76 @@ def pipeline_once(config: dict, *, max_tasks_per_round: int = 50) -> dict[str, A
     except Exception as e:  # 阶段失败不终止轮
         report["select_errors"].append(f"prefilter 阶段失败: {e}")
 
-    # ② select 移入后台线程：单任务失败只记账（下一轮或人工处置）。
-    # 独立 QueueStore 实例——连接不跨线程共用（db.connect 每方法新建连接）。
+    # ② selector 后台线程：持续消费（轮内新到任务也筛选）；每个任务的
+    # 筛选在独立进程组（评审阻塞项①③：隔离、无整任务超时、外部操作各
+    # 有自身限制）。③ executor 主线程并行消费。
     import threading
 
-    def note_selection_failure(task, message):
-        report['select_errors'].append(message)
-        from .issue_ledger import selection_error
-        try:
-            selection_error(config, task, message)
-        except Exception as error:
-            report['select_errors'].append(f'{task.task_id}: 台账写入失败: {error}')
+    attempted: set[str] = set()  # 与主线程共享：收班判定=无未尝试候选
+    stop_event = threading.Event()
+    max_in_flight = max(int((config.get("selector") or {}).get("max_in_flight") or 2), 1)
+    max_failures = max(int((config.get("selector") or {}).get("max_failures") or 3), 1)
+    config_path = config.get("_config_path") or "settings.json"
+    sel_command = config.get("_selection_command") or [
+        sys.executable, "-m", "run_test.pipeline", "select-one",
+        "--task", "{task_id}", "--config", config_path]
 
-    sel_cfg = (config.get("selector") or {})
-    select_timeout = float(sel_cfg.get("task_timeout_seconds") or 900)
-    config_path = config.get("_config_path") or str(
-        paths.data_root.parent.parent / "settings.json") if False else config.get(
-        "_config_path") or "settings.json"
+    def _reap() -> None:
+        """回收已结束子进程：rc 记账；连续失败达上限转 blocked（证据留痕）。"""
+        for tid, proc in list(_SELECTION_IN_FLIGHT.items()):
+            rc = proc.poll()
+            if rc is None:
+                continue
+            del _SELECTION_IN_FLIGHT[tid]
+            if rc == 3:
+                report["select_errors"].append(f"{tid}: 已有筛选在运行，本轮跳过")
+            elif rc == 0:
+                report["selected"].append(tid)
+            else:
+                _SELECTION_FAILURES[tid] = _SELECTION_FAILURES.get(tid, 0) + 1
+                message = f"{tid}: select 退出码 {rc}"
+                if _SELECTION_FAILURES[tid] >= max_failures:
+                    try:
+                        store.mark_blocked(
+                            tid, f"筛选连续失败 {_SELECTION_FAILURES[tid]} 次：{message}；"
+                                 "转 blocked 待人工核实")
+                    except Exception as mark_error:
+                        report["select_errors"].append(f"{message}；转 blocked 失败: {mark_error}")
+                    report["select_errors"].append(message)
+                else:
+                    report["select_errors"].append(message)
 
     def _select_worker() -> None:
-        """持续消费：循环刷新 pending_analysis 候选（轮内新到任务也处理）；
-        每个任务的筛选在独立子进程运行（超时/卡死只杀该子进程组，不冻结
-        队列），超时上限 selector.task_timeout_seconds。"""
-        select_store = QueueStore(config)
-        attempted: set[str] = set()
-        import os as _os
-        import signal as _signal
-        import subprocess as _subprocess
-        import sys as _sys
         while True:
-            pending = [t for t in select_store.list_tasks(STATE_PENDING_ANALYSIS)
-                       if t.task_id not in attempted]
-            if not pending:
+            _reap()
+            candidates = [t for t in select_store.list_tasks(STATE_PENDING_ANALYSIS)
+                          if t.task_id not in attempted
+                          and t.task_id not in _SELECTION_IN_FLIGHT]
+            if not candidates:
                 if stop_event.is_set():
                     break
-                time.sleep(1)
+                time.sleep(0.5)
                 continue
-            for task in pending:
-                if stop_event.is_set():
-                    return
+            for task in candidates:
+                if stop_event.is_set() or len(_SELECTION_IN_FLIGHT) >= max_in_flight:
+                    break
                 attempted.add(task.task_id)
-                try:
-                    proc = _subprocess.Popen(
-                        [_sys.executable, "-m", "run_test.pipeline", "select-one",
-                         "--task", task.task_id, "--config", config_path],
-                        cwd=str(_os.getcwd()), stdout=_subprocess.DEVNULL,
-                        stderr=_subprocess.PIPE, text=True,
-                        start_new_session=True)
-                    try:
-                        _, err = proc.communicate(timeout=select_timeout)
-                        rc = proc.returncode
-                    except _subprocess.TimeoutExpired:
-                        # 只杀该任务的筛选进程组（含孤儿子进程），任务留在
-                        # pending_analysis 下轮重试，证据入台账。
-                        _os.killpg(_os.getpgid(proc.pid), _signal.SIGKILL)
-                        proc.communicate()
-                        note_selection_failure(
-                            task, f"{task.task_id}: 筛选超时（>{select_timeout:.0f}s），"
-                                  "子进程组已终止；任务保留待重试")
-                        continue
-                    if rc == 0:
-                        report["selected"].append(task.task_id)
-                    else:
-                        note_selection_failure(
-                            task, f"{task.task_id}: select 退出码 {rc} {((err or '')[-300:])}")
-                except Exception as e:
-                    note_selection_failure(task, f"{task.task_id}: {e}")
+                cmd = [c.replace("{task_id}", task.task_id) if isinstance(c, str) else c
+                       for c in sel_command]
+                env = dict(os.environ)
+                env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1]) + (
+                    ":" + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+                _SELECTION_IN_FLIGHT[task.task_id] = subprocess.Popen(
+                    cmd, stdout=subprocess.DEVNULL, env=env,
+                    start_new_session=True)
+            time.sleep(0.5)
 
-    stop_event = threading.Event()
     selector = threading.Thread(
         target=_select_worker, name="pipeline-select", daemon=True,
     )
     selector.start()
 
     # ③ executor 主线程并行消费；blocked/failed 也算消费完成，继续下一个。
-    # 上限防单轮失控（正常一轮远少于该数）。
     runner = make_runner(config)
     executor = Executor(
         config, downloader=make_downloader(config.get("obs")), runner=runner,
@@ -292,12 +329,14 @@ def pipeline_once(config: dict, *, max_tasks_per_round: int = 50) -> dict[str, A
     while len(report["executed"]) < cap:
         outcome = executor.run_once()
         if outcome.outcome == "idle":
-            remaining = store.list_tasks(STATE_PENDING_ANALYSIS)
-            if remaining:
-                time.sleep(0.5)  # 还有待筛选任务：等 selector 产出清单
+            unattempted = [t for t in store.list_tasks(STATE_PENDING_ANALYSIS)
+                           if t.task_id not in attempted
+                           and t.task_id not in _SELECTION_IN_FLIGHT]
+            if unattempted:
+                time.sleep(0.5)  # 还有未筛选任务：等 selector 产出清单
                 continue
             if selector.is_alive():
-                stop_event.set()  # 队列已清空：通知 selector 收班
+                stop_event.set()  # 候选已尽：通知 selector 收班
                 time.sleep(0.5)
                 continue
             break
@@ -309,3 +348,28 @@ def pipeline_once(config: dict, *, max_tasks_per_round: int = 50) -> dict[str, A
     stop_event.set()
     selector.join()
     return report
+
+
+def main(argv=None) -> int:
+    """`python -m run_test.pipeline select-one --task T --config C` 子进程入口。"""
+    import argparse
+
+    parser = argparse.ArgumentParser(prog="run_test.pipeline")
+    sub = parser.add_subparsers(dest="command", required=True)
+    sel = sub.add_parser("select-one", help="单任务筛选（子进程隔离入口）")
+    sel.add_argument("--task", required=True)
+    sel.add_argument("--config", default="settings.json")
+    args = parser.parse_args(argv)
+    if args.command == "select-one":
+        from .config import load_config
+        from .task_queue import QueueStore
+
+        config = load_config(args.config)
+        config["_config_path"] = args.config
+        store = QueueStore(config)
+        return run_selection(config, store, args.task)
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

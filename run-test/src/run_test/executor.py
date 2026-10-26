@@ -236,7 +236,7 @@ class Executor:
 
         # 阶段 5：立即清理（成功写库后不等待、不设保留期）。
         self.queue.transition(task.task_id, q.STATE_CLEANING, "写库完成，立即清理")
-        self._safe_cleanup(task.work_dir)
+        self._cleanup_task_artifacts(task)
         self.queue.transition(task.task_id, q.STATE_DONE, "本任务完成")
         return RunOutcome(task.task_id, "done", str(submission.pr_number))
 
@@ -262,9 +262,18 @@ class Executor:
         source_pkg = packages / "pytorch-source.tar.gz"
         # 拆分包格式（2026-10-22 起）：torch_npu 独立对象，与主体包同下。
         npu_pkg = packages / "wheels-npu.tar.gz"
-        downloads = [(task.obs_wheels_url, wheels_pkg), (task.obs_source_url, source_pkg)]
+        # 任务级源码复用（用户 2026-10-26）：筛选阶段已下载并解压校验的
+        # 源码归档直接复用，wheel 三件套照常下载——消除同任务二次下载。
+        staged_source = (self.paths.data_root / "selection" / task.task_id /
+                         "source-staging" / "pytorch-source.tar.gz")
+        reuse_source = staged_source.is_file() and staged_source.stat().st_size > 0
+        downloads = [(task.obs_wheels_url, wheels_pkg)]
+        if not reuse_source:
+            downloads.append((task.obs_source_url, source_pkg))
         if task.obs_wheels_npu_url:
             downloads.append((task.obs_wheels_npu_url, npu_pkg))
+        if reuse_source:
+            print(f"[源码复用] 使用筛选阶段暂存归档: {staged_source}", flush=True)
         # 下载重试：次数/间隔来自 store.json（queue.download_retries /
         # download_retry_interval_seconds）；未配置（null）= 不重试，保持
         # "不猜默认值"约定。逐文件重试——源码包大，不因 wheels 失败重下它。
@@ -289,6 +298,9 @@ class Executor:
         try:
             for url, pkg in downloads:
                 _download_with_retry(url, pkg)
+            if reuse_source:
+                import shutil as _shutil
+                _shutil.copy2(staged_source, source_pkg)
         except ObsDownloadError as e:
             self.queue.bump_retry(task.task_id)
             reason = f"OBS 下载失败（共尝试 {max_attempts} 次）: {e}"
@@ -822,6 +834,27 @@ class Executor:
     # 清理与诊断
     # ------------------------------------------------------------------
 
+    def _cleanup_task_artifacts(self, task: q.Task) -> None:
+        """任务完成清理（用户 2026-10-26 生命周期要求）：工作目录（wheel
+        归档、解压源码树、torch_npu 包）+ 筛选源码暂存 + 计划目录一并删除；
+        失败上抛由 cleaning 重试机制处理，不假报 done。共享 source_cache
+        遗留副本在无在用引用时尽力删除（失败仅记录，非本任务独占产物）。
+        """
+        self._safe_cleanup(task.work_dir)
+        import shutil as _shutil
+        staging = self.paths.data_root / "selection" / task.task_id
+        if staging.exists():
+            _shutil.rmtree(staging)
+        sha10 = (task.pytorch_commit or "")[:10]
+        cache = self.paths.data_root / "source_cache" / sha10
+        if cache.exists():
+            active = [t for t in self.queue.list_tasks()
+                      if t.state not in q.TERMINAL_STATES
+                      and (t.pytorch_commit or "").startswith(sha10)
+                      and t.task_id != task.task_id]
+            if not active:
+                _shutil.rmtree(cache, ignore_errors=True)
+
     def _safe_cleanup(self, work_dir: str | Path) -> None:
         """删除本任务临时目录；绝对路径必须位于 task_work 根内。
 
@@ -838,7 +871,7 @@ class Executor:
 
     def _resume_cleaning(self, task: q.Task) -> None:
         try:
-            self._safe_cleanup(task.work_dir)
+            self._cleanup_task_artifacts(task)
             self.queue.transition(task.task_id, q.STATE_DONE, "清理完成（中断续清理）")
         except Exception as e:
             attempts = self.queue.bump_cleanup_attempt(task.task_id)

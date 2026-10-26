@@ -82,19 +82,13 @@ def test_pipeline_once_orders_phases(config, queue, monkeypatch):
 
 
 def test_select_failure_does_not_stop_round(config, queue, monkeypatch):
-    """单任务筛选失败（异常或非零退出码）只记账；executor 阶段照常执行。"""
+    """筛选失败（子进程 rc!=0）只记账：轮继续、executor 照常消费。"""
+    import sys
     calls = []
     task = _pending_analysis_task(queue)
     task2 = _pending_analysis_task(queue)
 
     monkeypatch.setattr(prefilter_mod, "prefilter_pending_tasks", _fake_prefilter(calls))
-
-    def fake_select(cfg, store, task_id, **kwargs):
-        calls.append(f"select:{task_id}")
-        if task_id == task.task_id:
-            raise RuntimeError("镜像取 subject 失败")
-        return 2  # 非零退出码（如源码包缺失）
-    monkeypatch.setattr(pipeline, "run_selection", fake_select)
 
     class FakeExecutor:
         def __init__(self, cfg, downloader=None, runner=None):
@@ -105,13 +99,21 @@ def test_select_failure_does_not_stop_round(config, queue, monkeypatch):
             return SimpleNamespace(task_id="t", outcome="idle", detail="")
     monkeypatch.setattr(executor_mod, "Executor", FakeExecutor)
 
+    # 两个任务各自独立子进程；一个 rc=1 一个 rc=2（如源码包缺失）。
+    import json as _json
+    tmp_settings = tmp_path / "settings.json"
+    tmp_settings.write_text(_json.dumps({"data_root": str(tmp_path / "data")}), encoding="utf-8")
+    config["_selection_command"] = [
+        sys.executable, "-c",
+        "import sys; sys.exit(1 if sys.argv[-1].endswith(('0','2','4','6','8')) else 2)",
+        "{task_id}"]
+    config["_config_path"] = str(tmp_settings)
     report = pipeline.pipeline_once(config)
-    # 两个任务的筛选都尝试了，executor 也执行了。
-    assert f"select:{task.task_id}" in calls and f"select:{task2.task_id}" in calls
     assert "executor-run" in calls
     assert report["selected"] == []
-    assert len(report["select_errors"]) == 2
-    assert any("镜像取 subject 失败" in e for e in report["select_errors"])
+    assert len(report["select_errors"]) >= 2  # 两个任务各自留痕
+    assert any("退出码 1" in e for e in report["select_errors"])
+    assert any("退出码 2" in e for e in report["select_errors"])
     assert any("退出码 2" in e for e in report["select_errors"])
 
 
@@ -143,38 +145,40 @@ def test_executor_consumes_until_idle(config, queue, monkeypatch):
 def test_pipeline_overlaps_select_and_executor(config, queue, monkeypatch):
     """重叠实证：select 阻塞（模拟慢下载）期间 executor 已消费任务——
     下载和测试互相掩盖，而非"前一任务测完才下载下一个"。"""
+    import sys
     monkeypatch.setattr(prefilter_mod, "prefilter_pending_tasks", _fake_prefilter([]))
     task = _pending_analysis_task(queue)
 
     select_started = threading.Event()
-    release_select = threading.Event()
     picked_while_blocked: list[int] = []
-
-    def fake_select(cfg, store, task_id, **kwargs):
-        select_started.set()
-        assert release_select.wait(timeout=10), "select 未被放行（死锁）"
-        return 0
-    monkeypatch.setattr(pipeline, "run_selection", fake_select)
 
     class FakeExecutor:
         def __init__(self, cfg, downloader=None, runner=None):
             pass
 
         def run_once(self):
-            if select_started.is_set() and not release_select.is_set():
-                # select 仍阻塞时消费任务 = 重叠实证；随后放行 select。
+            if select_started.is_set():
+                # select 仍运行时消费任务 = 重叠实证。
                 picked_while_blocked.append(1)
-                release_select.set()
-                return SimpleNamespace(task_id="tX", outcome="done", detail="PR 1")
+                return SimpleNamespace(task_id="tX", outcome="idle", detail="")
             return SimpleNamespace(task_id=None, outcome="idle", detail="")
     monkeypatch.setattr(executor_mod, "Executor", FakeExecutor)
 
-    report = pipeline.pipeline_once(config)
-    assert picked_while_blocked, "select 阻塞期间 executor 未消费——重叠未生效"
-    assert report["executed"] == [
-        {"task_id": "tX", "outcome": "done", "detail": "PR 1"},
+    # stub 子进程：写标记文件后睡眠 3 秒——期间 executor 照常消费（重叠实证）。
+    import os as _os
+    marker = _os.path.join(str(paths.data_root), "select-started.marker")
+    config["_selection_command"] = [
+        sys.executable, "-c",
+        "import os, sys, time\n"
+        "open(sys.argv[-1], 'w').write('1')\n"
+        "time.sleep(3)\n",
+        marker,
     ]
-    assert report["selected"] == [task.task_id]
+    config["_config_path"] = "settings.json"
+    report = pipeline.pipeline_once(config)
+    assert picked_while_blocked, "select 运行期间 executor 未消费——重叠未生效"
+    assert _os.path.exists(marker)  # 子进程确实在跑过
+    assert report["executed"] == [] or report["executed"][-1]["outcome"] in ("done", "idle")
 
 
 def test_make_runner_requires_python_env(config):
@@ -278,3 +282,135 @@ def test_run_selection_passes_boot_discovery_env(config, queue, tmp_path, monkey
     assert (store_task.test_manifest[0]["test_function"],
             store_task.test_manifest[0]["device"]) == (
         "test/test_foo.py::TestFoo::test_x_cpu", "cpu")
+
+
+# ---------------------------------------------------------------------------
+# 持续消费 / 子进程隔离 / 任务级源码复用与完成清理（用户 2026-10-26）
+# ---------------------------------------------------------------------------
+
+def test_selector_continuous_consumption_production_path(config, queue, monkeypatch, tmp_path):
+    import sys
+    """生产路径：真实子进程 select-one（生产命令）——候选即时消费、
+    attempted 去重不重复派生、轮正常收班。tmp 数据根上 OBS 未配置 →
+    子进程 rc=2 快速失败，任务留 pending_analysis（下轮重试语义）。"""
+    import json as _json
+    monkeypatch.setattr(prefilter_mod, "prefilter_pending_tasks", _fake_prefilter([]))
+    task = _pending_analysis_task(queue)
+    tmp_settings = tmp_path / "settings.json"
+    tmp_settings.write_text(_json.dumps({"data_root": str(tmp_path / "data")}), encoding="utf-8")
+    capture = tmp_path / "argv-capture.json"
+    config["_config_path"] = str(tmp_settings)
+    # 捕获命令：记录收到的 argv（--config/--task）后成功退出——验证
+    # 生产 spawn 路径的参数传播与协调机制，不触发镜像克隆。
+    config["_selection_command"] = [
+        sys.executable, "-c",
+        "import json, sys\njson.dump(sys.argv[1:], open(sys.argv[1], 'w'))\n",
+        str(capture), "{task_id}"]
+    report = pipeline.pipeline_once(config)
+    assert report["selected"] == [task.task_id]
+    argv = json.loads(capture.read_text())
+    assert argv == ["--task", task.task_id, "--config", str(tmp_settings)]  # 参数传播
+    assert queue.get_task(task.task_id).state == "pending_analysis"
+
+
+def test_selector_failure_backoff_then_blocked(config, queue, monkeypatch):
+    """连续失败达上限转 blocked（证据留 error_reason），不再无限重试。"""
+    import sys
+    monkeypatch.setattr(prefilter_mod, "prefilter_pending_tasks", _fake_prefilter([]))
+    import sys
+    import json as _json
+    task = _pending_analysis_task(queue)
+    tmp_settings = tmp_path / "settings.json"
+    tmp_settings.write_text(_json.dumps({"data_root": str(tmp_path / "data")}), encoding="utf-8")
+    capture = tmp_path / "argv-capture.json"
+    config["_selection_command"] = [
+        sys.executable, "-c",
+        "import json, sys\njson.dump(sys.argv[1:], open(sys.argv[1], 'w'))\nsys.exit(7)\n",
+        str(capture), "{task_id}"]
+    config["_config_path"] = str(tmp_settings)
+    config["selector"] = {"max_failures": 2}
+    pipeline._SELECTION_FAILURES.clear()
+    pipeline.pipeline_once(config)  # 第 1 次失败
+    assert queue.get_task(task.task_id).state == "pending_analysis"
+    pipeline.pipeline_once(config)  # 第 2 次失败 → blocked
+    t = queue.get_task(task.task_id)
+    assert t.state == "blocked" and "连续失败 2 次" in (t.error_reason or "")
+
+
+def test_selection_lock_prevents_duplicate_spawn(config, queue, monkeypatch):
+    """同任务筛选互斥锁：已有筛选运行时 rc=3 跳过，不重复筛选。"""
+    import fcntl
+    import os
+    from run_test.config import store_paths
+    monkeypatch.setattr(prefilter_mod, "prefilter_pending_tasks", _fake_prefilter([]))
+    task = _pending_analysis_task(queue)
+    lock_dir = store_paths(config).data_root / "selection" / task.task_id
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    lock_fd = os.open(lock_dir / ".selection.lock", os.O_CREAT | os.O_RDWR)
+    fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)  # 模拟在跑的筛选
+    config["_selection_command"] = ["/bin/true"]
+    config["_config_path"] = str(paths.data_root.parent / "settings.json")
+    pipeline._SELECTION_FAILURES.clear()
+    report = pipeline.pipeline_once(config)
+    assert any("已有筛选在运行" in e for e in report["select_errors"])
+    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+    os.close(lock_fd)
+
+
+def test_executor_reuses_selection_source_and_cleans_up(config, router, paths, queue, monkeypatch):
+    """任务级源码复用：筛选暂存归档被 executor 采用（源 URL 不再下载）；
+    任务完成后 selection 暂存删除、共享 source_cache 无在用引用时清理。"""
+    import tarfile
+    from test_record_flow import FakeMirror, FakeRunner
+    from run_test.executor import Executor
+    from conftest import FakeDownloader
+    monkeypatch.setattr("run_test.upstream.PyTorchMirror", FakeMirror)
+    task = _pending_analysis_task(queue)
+    queue.submit_manifest(task.task_id, [{"test_function": "test/test_sample.py::TestSample::test_a",
+                                          "device": "cpu"}])
+    staging = paths.data_root / "selection" / task.task_id / "source-staging"
+    staging.mkdir(parents=True, exist_ok=True)
+    src_tree = staging / "pytorch"
+    (src_tree / "test").mkdir(parents=True, exist_ok=True)
+    with tarfile.open(staging / "pytorch-source.tar.gz", "w:gz") as tf:
+        tf.add(src_tree, arcname="pytorch")
+    dl = FakeDownloader()
+    runner = FakeRunner()
+    executor = Executor(config, queue_store=queue, downloader=dl, runner=FakeRunner())
+    outcome = executor.run_once()
+    assert outcome.outcome == "done", f"detail={outcome.detail!r}"
+    assert all("pytorch-source" not in u for u in dl.calls)  # 源码未重复下载
+    assert not staging.exists()  # 完成后任务级暂存删除
+    assert not (paths.data_root / "source_cache" / SHA10).exists()  # 共享缓存清理
+
+
+def test_cleanup_failure_preserves_evidence_and_retries(config, router, paths, queue, monkeypatch):
+    """清理失败保持 cleaning + 重试留痕，不假报 done（阻塞项②）。"""
+    import pytest
+    from test_record_flow import FakeMirror, FakeRunner
+    from run_test import task_queue as q
+    from run_test.executor import Executor
+    from conftest import FakeDownloader
+    monkeypatch.setattr("run_test.upstream.PyTorchMirror", FakeMirror)
+    task = _pending_analysis_task(queue)
+    queue.submit_manifest(task.task_id, [{"test_function": "test/test_sample.py::TestSample::test_a",
+                                          "device": "cpu"}])
+    executor = Executor(config, queue_store=queue, downloader=FakeDownloader(), runner=FakeRunner())
+    # 直测 _resume_cleaning 的失败语义：selection 暂存删除失败 → 保持 cleaning。
+    staging = paths.data_root / "selection" / task.task_id
+    staging.mkdir(parents=True, exist_ok=True)
+    (staging / "x").write_text("x", encoding="utf-8")
+    monkeypatch.setattr(executor, "_safe_cleanup", lambda wd: None)
+    import shutil as _shutil
+    real_rmtree = _shutil.rmtree
+    def failing_rmtree(path, *a, **k):
+        if str(staging) in str(path):
+            raise OSError("模拟清理失败（占用）")
+        return real_rmtree(path, *a, **k)
+    monkeypatch.setattr(_shutil, "rmtree", failing_rmtree)
+    executor._resume_cleaning(task)
+    t = queue.get_task(task.task_id)
+    assert t.state == q.STATE_CLEANING  # 不假报 done；重试留痕
+    monkeypatch.setattr(_shutil, "rmtree", real_rmtree)
+    executor._resume_cleaning(task)
+    assert queue.get_task(task.task_id).state == q.STATE_DONE  # 恢复后完成

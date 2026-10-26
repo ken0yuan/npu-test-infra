@@ -376,6 +376,7 @@ def cmd_pipeline(args: argparse.Namespace) -> int:
     from .pipeline import pipeline_once
 
     config = _load_config(args.config)
+    config["_config_path"] = args.config  # 子进程筛选需要配置路径
 
     def _once() -> int:
         report = pipeline_once(config)
