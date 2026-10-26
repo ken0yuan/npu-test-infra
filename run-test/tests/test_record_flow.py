@@ -979,3 +979,62 @@ def test_backfill_merged_at_idempotent_and_kept(config, router, monkeypatch, pat
     finally:
         conn.close()
     assert row.merged_at == "2026-10-26T01:00:00+00:00"  # 未被覆盖
+
+
+def test_backfill_lease_released_when_backup_raises(config, router, monkeypatch, paths):
+    """安全探针 1：备份抛异常时执行位必须随 with 释放，不得泄漏。"""
+    import run_test.upstream as up
+    import run_test.record as rec
+    from run_test.record import backfill_merged_at
+    from run_test.process_lock import executor_lease
+    from run_test.config import store_paths
+    monkeypatch.setattr(up, 'PyTorchMirror', FakeMirror)
+    sub = make_submission(pr_number=1, pytorch_commit=COMMIT_A,
+                          items=[(TF_A, "cpu", Counts(1, 0, 0, 0))])
+    submit_complete_result(config, sub, router)
+    monkeypatch.setattr(rec, '_backup_database',
+                        lambda src, root: (_ for _ in ()).throw(RuntimeError("备份盘满")))
+    lock_path = store_paths(config).queue_db.with_suffix(".executor.lock")
+    with pytest.raises(RuntimeError):
+        backfill_merged_at(config)
+    with executor_lease(lock_path) as acquired:
+        assert acquired is True  # 异常路径后租约已释放，可再次获取
+
+
+def test_backfill_migrates_preupgrade_baseline_schema(config, router, monkeypatch, paths):
+    """安全探针 2：老 schema（无合入元数据列）先备份原样、再幂等迁移，
+    回填不再抛 no such column。"""
+    import run_test.upstream as up
+    from run_test.record import backfill_merged_at
+    from run_test.baseline_store import baseline_db_path, BaselineRouter
+    from run_test.db import connect
+    monkeypatch.setattr(up, 'PyTorchMirror', FakeMirror)
+    sub = make_submission(pr_number=1, pytorch_commit=COMMIT_A,
+                          items=[(TF_A, "cpu", Counts(1, 0, 0, 0))])
+    submit_complete_result(config, sub, router)
+    # 构造升级前 schema：删掉三列（SQLite 重建表模拟）。
+    router_obj = BaselineRouter(config.get("baseline_dirs", []), store_paths(config).baselines_root)
+    for d in router_obj.dirs:
+        conn = connect(baseline_db_path(router_obj.managed_root(d)))
+        try:
+            conn.executescript("""
+                CREATE TABLE baseline_old AS SELECT
+                    test_function, device, pytorch_commit, torch_npu_environment,
+                    pass_count, fail_count, error_count, skip_count, log_path,
+                    coverage_status, instance_ids, environment_fingerprint
+                FROM baseline;
+                DROP TABLE baseline;
+                ALTER TABLE baseline_old RENAME TO baseline;
+            """)
+            conn.commit()
+        finally:
+            conn.close()
+    FakeMirror.commit_times = {COMMIT_A: "2026-10-26T01:00:00+00:00"}
+    stats = backfill_merged_at(config)  # 不应抛 OperationalError
+    assert stats["baseline_backfilled"] == 1
+    conn = connect(baseline_db_path(router_obj.managed_root(router_obj.dirs[0])))
+    try:
+        row = conn.execute("SELECT merged_at FROM baseline").fetchone()
+        assert row["merged_at"] == "2026-10-26T01:00:00+00:00"
+    finally:
+        conn.close()

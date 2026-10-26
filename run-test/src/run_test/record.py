@@ -973,6 +973,19 @@ def _backup_database(src, backup_root) -> dict:
 
 def backfill_merged_at(config, refresh_reports: bool = False,
                        use_lease: bool = True) -> dict:
+    """租约入口：with 形式保证异常路径也释放执行位（评审安全探针 1）。"""
+    from .process_lock import executor_lease
+
+    paths = store_paths(config)
+    if use_lease:
+        with executor_lease(paths.queue_db.with_suffix(".executor.lock")) as lease:
+            if not lease:
+                return {"lease": "busy"}
+            return _backfill_locked(config, refresh_reports)
+    return _backfill_locked(config, refresh_reports)
+
+
+def _backfill_locked(config, refresh_reports: bool) -> dict:
     """存量行 merged_at 回填（用户 2026-10-26 方案第 3/5 条）。
 
     - 只回填 NULL（幂等；已有值保持——跨重试不丢失、不静默改写）；
@@ -987,22 +1000,18 @@ def backfill_merged_at(config, refresh_reports: bool = False,
     from .process_lock import executor_lease
     from .upstream import PyTorchMirror
 
-    # 维护写库必须持执行位租约（用户 2026-10-26 评审阻塞项 4）：
-    # 租约忙时如实返回 busy，不排队不阻塞、调用方稍后重试。
-    # 备份在同一租约内完成（评审 315432：备份+变更持同一租约，唯一
-    # run ID + 来源清单；老 schema 由 sqlite 在线备份原样保留）。
+    # 持执行位租约的维护主体（评审阻塞项 4：备份+变更同一租约内完成，
+    # 唯一 run ID + 来源清单；先备份原始 schema——含未升级的老库——再
+    # 幂等迁移，之后才查询新列（评审安全探针 2）。
     paths = store_paths(config)
-    lease_cm = executor_lease(paths.queue_db.with_suffix(".executor.lock"))
-    lease = lease_cm.__enter__() if use_lease else True
-    if not lease:
-        return {"lease": "busy"}
     import secrets as _secrets
 
     run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + _secrets.token_hex(4)
     backup_root = paths.data_root / "merged-at-backups" / run_id
     backup_root.mkdir(parents=True, exist_ok=True)
     manifest = {"run_id": run_id, "sources": []}
-    from .baseline_store import BaselineRouter as _Router
+    from .baseline_store import BaselineRouter as _Router, ensure_baseline_db
+    from .pr_store import ensure_pr_db
     _router = _Router(config.get("baseline_dirs", []), paths.baselines_root)
     for src in [paths.queue_db, paths.pr_db] + [
             baseline_db_path(_router.managed_root(d)) for d in _router.dirs]:
@@ -1010,6 +1019,10 @@ def backfill_merged_at(config, refresh_reports: bool = False,
             manifest["sources"].append(_backup_database(src, backup_root))
     (backup_root / "manifest.json").write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    # 备份完成后才升级原库：幂等补列，老 schema 行安全迁移到新列。
+    ensure_pr_db(paths.data_root)
+    for d in _router.dirs:
+        ensure_baseline_db(_router.managed_root(d))
     stats = {"lease": "acquired", "run_id": run_id, "backup": str(backup_root),
              "pr_backfilled": 0, "pr_kept": 0,
              "pr_unresolved": 0, "baseline_backfilled": 0, "baseline_kept": 0,
@@ -1087,6 +1100,4 @@ def backfill_merged_at(config, refresh_reports: bool = False,
         from .result_docs import generate
         for pr in stats["reports_refreshed"]:
             generate(config, pr)  # 受控刷新：回填与报告再生成同一次维护内完成
-    if use_lease:
-        lease_cm.__exit__(None, None, None)
     return stats
