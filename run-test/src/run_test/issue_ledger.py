@@ -338,43 +338,79 @@ class Ledger:
             raise
 
     def _render(self):
+        """单一台账文件（用户 2026-10-26 决策）：一个问题一节，DB 为账本，
+        markdown 只做人读摘要——出现次数/涉及 PR 聚合，证据留指针不贴全文。"""
         self.docs.mkdir(parents=True, exist_ok=True)
-        rows = self.conn.execute('SELECT f.identifier,f.namespace,o.* FROM occurrences o JOIN families f '
-                                 'ON f.id=o.family_id ORDER BY o.first_seen,o.event_key').fetchall()
-        books = {'未分类错误.md': [], '测试用例筛选问题.md': [], '已修复清单.md': [], '已修复错误档案.md': []}
+        open_lines, resolved_lines = [], []
+        rows = self.conn.execute(
+            'SELECT f.identifier,f.namespace,f.kind,o.* FROM occurrences o JOIN families f '
+            'ON f.id=o.family_id ORDER BY o.first_seen,o.event_key').fetchall()
+        families = {}
         for row in rows:
             if row['namespace'] in ('C', 'X'):
                 continue
+            fam = families.setdefault(row['identifier'], {
+                'namespace': row['namespace'], 'kind': row['kind'],
+                'state': row['state'], 'count': 0, 'first': row['first_seen'],
+                'last': row['first_seen'], 'prs': [], 'tests': [], 'latest': row,
+            })
+            fam['count'] += 1
+            fam['last'] = max(fam['last'], row['last_seen'])
             body = json.loads(row['payload'])
-            lines = [f'## {row["identifier"]} · PR {body.get("pr_number")} · {body["kind"]}',
-                f'- 事件：`{row["event_key"]}`；任务：`{body["task_id"]}`',
-                f'- 提交：`{body.get("pytorch_commit")}`；设备：`{body["device"]}`；阶段：`{body["phase"]}`',
-                f'- 测试：`{body["test_function"]}`；状态：{row["state"]}；结论：待核对因果，不自动判 PR 回归。']
-            if body['missing_modules']:
+            pr = body.get('pr_number')
+            if pr and pr not in fam['prs']:
+                fam['prs'].append(pr)
+            tf = body.get('test_function')
+            if tf and tf not in fam['tests']:
+                fam['tests'].append(tf)
+            fam['latest'] = row  # 行序按 first_seen，最后一条即最近
+        for identifier, fam in sorted(families.items()):
+            latest = fam['latest']
+            body = json.loads(latest['payload'])
+            head = (f"### {identifier} · {fam['kind']}"
+                    + (f" · PR {'/'.join(str(p) for p in fam['prs'][:5])}"
+                       + (f" 等{len(fam['prs'])}个" if len(fam['prs']) > 5 else '')
+                       if fam['prs'] else ''))
+            lines = [head,
+                f"- 状态：{fam['state']}；出现：{fam['count']} 次"
+                f"（{fam['first'][:19]} → {fam['last'][:19]}）",
+                f"- 涉及 PR：{len(fam['prs'])} 个；测试函数：{len(fam['tests'])} 个"
+                + (f"；最近：{fam['tests'][-1][:80]}" if fam['tests'] else ''),
+                f"- 最近任务：`{body.get('task_id')}`；设备：`{body.get('device')}`；阶段：`{body.get('phase')}`",
+                '- 结论：待核对因果，不自动判 PR 回归。']
+            if body.get('missing_modules'):
                 lines.append('- 缺失模块：' + ', '.join(body['missing_modules']))
-            for ev in body['evidence']:
-                lines.extend([f'- 原证据：`{ev["source"]}`；快照：`{ev["snapshot"]}`；SHA256：`{ev["sha256"]}`',
-                              f'  从第 {ev["line_start"]} 行摘录：', *['> ' + s for s in ev['quote'].splitlines()]])
-            page = ('已修复错误档案.md' if row['state'] == 'resolved' else
-                    '测试用例筛选问题.md' if row['namespace'] == 'S' else '未分类错误.md')
-            books[page].append('\n'.join(lines))
-            if row['state'] == 'resolved':
-                destination = '测试用例筛选问题.md' if row['namespace'] == 'S' else '未分类错误.md'
-                books[destination].append(f'## {row["identifier"]} · 已修复\n原始事件 `{row["event_key"]}` 已迁入《已修复错误档案.md》。')
-        for row in self.conn.execute('SELECT f.identifier,r.* FROM resolutions r JOIN families f '
-                                     'ON f.id=r.family_id ORDER BY r.id'):
+            ev = body['evidence'][0] if body.get('evidence') else None
+            if ev:
+                lines.append(f"- 证据（最近）：`{ev['snapshot']}`；SHA256：`{ev['sha256']}`"
+                             f"（全部快照按需查库，不在此展开）")
+            if fam['state'] == 'resolved':
+                resolved_lines.append('\n'.join(lines))
+            else:
+                open_lines.append('\n'.join(lines))
+        for row in self.conn.execute('SELECT f.identifier,f.kind,r.* FROM resolutions r '
+                                     'JOIN families f ON f.id=r.family_id ORDER BY r.id'):
             ev = json.loads(row['evidence'])
-            books['已修复清单.md'].append(f'## {row["identifier"]} · {row["verified_at"]}\n'
-                f'{row["note"]}\n\n验证证据：`{ev["source"]}`；快照：`{ev["snapshot"]}`；SHA256：`{ev["sha256"]}`')
-        for name, entries in books.items():
-            text = '# ' + name[:-3] + '\n\n自动生成自 issues.db；新部署编号使用 U-new/S-new，不冒用历史 U/S 编号。\n'
-            text += '\n\n'.join(entries) + '\n'
-            path = self.docs / name
-            if not path.exists() or path.read_text(encoding='utf-8') != text:
-                with tempfile.NamedTemporaryFile(dir=self.docs, delete=False) as stream:
-                    temporary = Path(stream.name)
-                    stream.write(text.encode('utf-8'))
-                os.replace(temporary, path)
+            resolved_lines.append('\n'.join([
+                f"### {row['identifier']} · {row['kind']} · 已核验修复",
+                f"- 核验时间：{row['verified_at']}；说明：{row['note']}",
+                f"- 验证证据：`{ev['source']}`；快照：`{ev['snapshot']}`；SHA256：`{ev['sha256']}`"]))
+        sections = []
+        if open_lines:
+            sections.append('## 待处理（open）\n\n' + '\n\n'.join(open_lines))
+        if resolved_lines:
+            sections.append('## 已修复（resolved）\n\n' + '\n\n'.join(resolved_lines))
+        text = ('# 问题总览\n\n'
+                '自动生成自 issues.db（一个问题一节；出现次数/涉及 PR 聚合，'
+                '证据快照按需查库）。新部署编号使用 U-new/S-new，不冒用历史编号；'
+                'skip/no_result 不算通过，不自动判 PR 回归。\n'
+                + ('\n\n'.join(sections) + '\n' if sections else '\n（当前无问题记录）\n'))
+        path = self.docs / '问题总览.md'
+        if not path.exists() or path.read_text(encoding='utf-8') != text:
+            with tempfile.NamedTemporaryFile(dir=self.docs, delete=False) as stream:
+                temporary = Path(stream.name)
+                stream.write(text.encode('utf-8'))
+            os.replace(temporary, path)
 
 
 def scan(config, snap=None):

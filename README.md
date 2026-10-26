@@ -71,7 +71,7 @@ bash run.sh ledger resolve U-new-000001 --note '修复与回验说明' --evidenc
 ```
 
 `data/runtime/issue-ledger/issues.db` 保存发生记录；原始证据按 SHA256 留快照，任务清理或 PR 重跑后仍可核对。
-四本 Markdown 账由数据库生成，默认在 `data/runtime/issue-ledger/views/`；可用本机配置
+问题台账 `问题总览.md`（一个问题一节，出现次数与涉及 PR 聚合）由数据库生成，默认在 `data/runtime/issue-ledger/views/`；可用本机配置
 `issue_ledger.docs_root` 指向 `docs/run_test/台账/`。新部署使用 `U-new-` / `S-new-`，不冒用遗失的历史编号。
 重复扫描不重复立账；已知 C 签名和显式配置的文件级 X 规则保留观察记录，不另立 U/S。
 跳过、超时、未取得结果均不算通过；已知签名也不自动证明环境故障或排除 PR 因果。

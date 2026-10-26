@@ -76,7 +76,7 @@ def test_known_signature_is_not_turned_into_unknown_U(config):
                     counts={'pass': 0, 'fail': 1, 'error': 0, 'skip': 0})
     report = scan(config, snap)
     assert report['by_namespace'] == {'C': 1}
-    assert 'PR 1' not in (Path(report['docs_root'])/'未分类错误.md').read_text()
+    assert 'PR 1' not in (Path(report['docs_root'])/'问题总览.md').read_text()
     assert events(config)[0]['body']['assessment'] == 'known_signature_needs_review'
 
 
@@ -153,9 +153,11 @@ def test_resolve_requires_evidence_and_archives_original_record(config):
         ledger.resolve(identifier, 'timeout fix independently verified', proof)
         ledger.render()
         assert ledger.summary()['open'] == 0
-        assert 'timeout fix independently verified' in (ledger.docs/'已修复清单.md').read_text()
-        assert 'execution_status' in (ledger.docs/'已修复错误档案.md').read_text()
-        assert '已修复' in (ledger.docs/'未分类错误.md').read_text()
+        overview = (ledger.docs/'问题总览.md').read_text()
+        assert 'timeout fix independently verified' in overview
+        assert '已修复（resolved）' in overview
+        # 原始记录归档在账本（DB）内——视图只做摘要，不粘贴证据全文。
+        assert any('execution_status' in e['payload'] for e in events(config))
     finally:
         ledger.close()
     assert scan(config, snap)['open'] == 0  # Scanning old evidence never reopens a verified closure.
