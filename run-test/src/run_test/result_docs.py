@@ -447,13 +447,6 @@ def feishu_plan(model, budget=None):
     parts_out = [{'part_index': i, 'role': ('main' if i == 0 else 'continuation'),
                   'title_suffix': p['title_suffix'], 'over_budget': p['over'],
                   'operations': p['ops']} for i, p in enumerate(parts)]
-    import sys as _sys
-    _sizes = [_blocks_size([b for op in p['operations'] if op.get('body')
-                            for b in op['body'].get('children', [])]) for p in parts_out]
-    print(f"[DEBUG] max_chars={max_chars} max_blocks={max_blocks} parts={len(parts_out)} "
-          f"sizes={_sizes} test_log_len={[len(t['log']['text']) for t in model['tests']]}",
-          flush=True, file=_sys.stderr)
-
     # 扁平 operations = 全部篇依序拼接：无丢失校验与旧消费方兼容。
     flattened = [op for p in parts_out for op in p['operations']]
     return {'schema': 'feishu-report-plan/2', 'title': model['title'],
