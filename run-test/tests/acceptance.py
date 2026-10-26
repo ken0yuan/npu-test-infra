@@ -53,6 +53,11 @@ def run_scenario(root, mode):
     cfg.update(data_root=str(root/'runtime'), baseline_dirs=['test/demo'], demo_mode=mode)
     cfg['skill']['ref'] = 'bf9b16e'
     cfg['executor'].update(test_python_env=sys.executable, function_timeout_seconds=1 if mode=='timeout' else 30)
+    # Discovery has its own environment, as in production. The executor may
+    # replace its packages while another task is being selected.
+    discovery = root / 'discovery-venv'
+    subprocess.run([sys.executable, '-m', 'venv', '--without-pip', str(discovery)], check=True)
+    discovery_python = discovery / ('Scripts/python.exe' if os.name == 'nt' else 'bin/python')
     (root/'config.json').write_text(json.dumps(cfg,indent=2),encoding='utf-8')
     paths = store_paths(cfg)
     ensure_pr_db(paths.data_root)
@@ -103,7 +108,7 @@ def run_scenario(root, mode):
     prefilter=prefilter_pending_tasks(cfg,queue=queue,mirror_dir=mirror)
     assert prefilter['kept']==1 and not prefilter['errors'], prefilter
     with patch('run_test.obs.make_downloader',return_value=downloader):
-        assert run_selection(cfg,queue,task.task_id,device='cpu',python_env=sys.executable)==0
+        assert run_selection(cfg,queue,task.task_id,device='cpu',python_env=str(discovery_python))==0
     manifest=queue.get_task(task.task_id).test_manifest
     assert manifest and len(manifest)==1,manifest
     executor=DemoExecutor(cfg,queue_store=queue,downloader=downloader,

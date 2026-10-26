@@ -19,6 +19,31 @@ GIT_ENV = {
     "GIT_COMMITTER_EMAIL": "t@t",
 }
 
+
+@pytest.mark.parametrize('discovery_failed', [False, True])
+def test_many_candidates_parse_declarations_once(tmp_path, monkeypatch, discovery_failed):
+    """Real native matching emits one entry per case; keep file work bounded."""
+    from run_test import runner
+    path=tmp_path/'test/test_many.py';path.parent.mkdir()
+    path.write_text('class TestMany:\n'+''.join(f'    def test_{i}(self): pass\n' for i in range(100)))
+    calls=[];original=runner.declared_class_methods
+    def counted(path,*args,**kwargs):
+        calls.append(path)
+        return original(path,*args,**kwargs)
+    monkeypatch.setattr(runner,'declared_class_methods',counted)
+    def discover(*args,**kwargs):
+        if discovery_failed:raise RuntimeError('fixture missing dependency')
+        return [f'TestMany.test_{i}' for i in range(100)]
+    monkeypatch.setattr(selection,'discover_cases',discover)
+    report={'p0':[],'p1':[{'path':'test/test_many.py','test_nodes':[f'TestMany.test_{i}'],
+                          'evidence':[],'score':10} for i in range(100)],
+            'analysis_gaps':[],'notes':[]}
+    selection.finalize_plan(tmp_path,report,15,1,interpreter='fixture')
+    assert len(calls)==(0 if discovery_failed else 1)
+    assert report['candidate_count']==100 and report['selected_count']==15
+    assert len(report['deferred_tests'])==85
+    assert {x['test_nodes'][0] for x in report['p1']+report['deferred_tests']}=={f'TestMany.test_{i}' for i in range(100)}
+
 FOO_V1 = "def alpha():\n    return 1\n"
 FOO_V2 = "def alpha():\n    return 2\n\ndef beta():\n    return alpha()\n"
 TEST_FOO = (

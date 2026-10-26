@@ -252,22 +252,6 @@ class TestCycle:
         assert report.errors and "未配置" in report.errors[0]
 
 
-def test_validate_merge_order_against_live_mirror(config, paths):
-    """fetch 时一次顺序校验：官方 main first-parent 零倒序（生产实证），
-    校验结果持久化 upstream-order.json 供提交守卫读取。"""
-    import json
-    import time as _time
-    from run_test.upstream import PyTorchMirror, validate_merge_order
-    mirror = PyTorchMirror(config=config)
-    if not mirror.exists():
-        pass  # 镜像不存在时跳过（镜像由生产流程建立）
-    else:
-        order = validate_merge_order(mirror, limit=200)
-        assert order["checked"] > 0 and order["inversions"] == []
-        # 提交守卫读取的顺序文件由 run_cycle 持久化；此处直验检测函数即可。
-        assert order["max_commit_time"] > 1700000000
-
-
 def test_detect_inversions_synthetic():
     from run_test.upstream import detect_inversions
     assert detect_inversions([("a", 100), ("b", 90)]) == []
@@ -331,7 +315,7 @@ def test_validate_and_persist_order_snapshot(tmp_path, config):
     assert snapshot["order"] == [c3, c2, c1]  # 新→旧
     assert snapshot["schema"] == "upstream-order/1"
     persist_order_snapshot(config, snapshot)
-    loaded = load_order_snapshot(config)
+    loaded = load_order_snapshot(config, expected_source="file:///fixture")
     assert loaded["order"] == [c3, c2, c1] and loaded["source"] == "file:///fixture"
     # 原子性：无临时残留
     assert not list((tmp_path / "data").glob("upstream-order.json.tmp*"))

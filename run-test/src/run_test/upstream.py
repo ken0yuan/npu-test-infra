@@ -28,6 +28,7 @@ import os
 import subprocess
 from dataclasses import dataclass, field
 import json
+import hashlib
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -61,6 +62,12 @@ def detect_inversions(entries: list[tuple[str, int]]) -> list[dict]:
 ORDER_SNAPSHOT_SCHEMA = "upstream-order/1"
 
 
+def _order_digest(snapshot):
+    payload = {key: snapshot[key] for key in
+               ('schema', 'source', 'tip', 'checked_tip', 'checked', 'order', 'times')}
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+
+
 def validate_merge_order(mirror, *, limit: int = 1000) -> dict:
     """fetch 时一次校验并构建**合入序快照**（用户 2026-10-26 评审阻塞项
     1/4：成员绑定——持久化完整 first-parent SHA 序列，提交守卫仅在双方
@@ -80,8 +87,10 @@ def validate_merge_order(mirror, *, limit: int = 1000) -> dict:
         if ts.isdigit():
             shas.append(sha)
             times.append(int(ts))
+    if not shas or any(not re.fullmatch(r'[0-9a-f]{40}|[0-9a-f]{64}', sha) for sha in shas):
+        raise UpstreamError('Invalid or empty first-parent history')
     entries = list(zip(shas, times))
-    return {"schema": ORDER_SNAPSHOT_SCHEMA,
+    snapshot = {"schema": ORDER_SNAPSHOT_SCHEMA,
             "source": mirror.repo_url,
             "tip": shas[0] if shas else None,
             "checked_tip": shas[0] if shas else None,
@@ -90,6 +99,8 @@ def validate_merge_order(mirror, *, limit: int = 1000) -> dict:
             "order": shas,          # 新→旧完整 first-parent 序列（成员绑定）
             "times": times,         # 元数据（committer 时刻，不参与排序）
             "inversions": detect_inversions(entries)}
+    snapshot['sha256'] = _order_digest(snapshot)
+    return snapshot
 
 
 def persist_order_snapshot(config, snapshot: dict) -> Path:
@@ -98,15 +109,22 @@ def persist_order_snapshot(config, snapshot: dict) -> Path:
     paths = store_paths(config)
     target = paths.data_root / "upstream-order.json"
     target.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8',
-                                     dir=target.parent, delete=False) as stream:
-        temporary = Path(stream.name)
-        stream.write(json.dumps(snapshot, ensure_ascii=False, indent=2) + '\n')
-    os.replace(temporary, target)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8',
+                                         dir=target.parent, delete=False) as stream:
+            temporary = Path(stream.name)
+            stream.write(json.dumps(snapshot, ensure_ascii=False, indent=2) + '\n')
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, target)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
     return target
 
 
-def load_order_snapshot(config) -> dict | None:
+def load_order_snapshot(config, *, expected_source=PYTORCH_UPSTREAM_URL) -> dict | None:
     """读取并校验顺序快照；缺失/损坏/schema 不符 → None（调用方回退
     本地祖先，绝不只凭标签信任）。"""
     paths = store_paths(config)
@@ -117,14 +135,22 @@ def load_order_snapshot(config) -> dict | None:
         snap = json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return None
-    if (not isinstance(snap, dict)
-            or snap.get("schema") != ORDER_SNAPSHOT_SCHEMA
-            or not isinstance(snap.get("order"), list)
-            or not snap.get("tip")
-            or not snap.get("source")):
+    try:
+        order, times = snap['order'], snap['times']
+        if (snap['schema'] != ORDER_SNAPSHOT_SCHEMA or snap['source'] != expected_source
+                or not isinstance(order, list) or not order
+                or any(not isinstance(sha, str) or not re.fullmatch(r'[0-9a-f]{40}|[0-9a-f]{64}', sha) for sha in order)
+                or len(set(order)) != len(order)
+                or type(snap['checked']) is not int or snap['checked'] != len(order)
+                or snap['tip'] != order[0] or snap['checked_tip'] != order[0]
+                or not isinstance(times, list) or len(times) != len(order)
+                or any(type(ts) is not int or ts < 0 for ts in times)
+                or snap.get('sha256') != _order_digest(snap)):
+            return None
+    except (KeyError, TypeError, ValueError):
         return None
-    if snap.get("inversions"):
-        return None  # 有倒序的快照不可作排序依据
+    # Clock inversions are diagnostic metadata. First-parent positions still
+    # establish order; timestamps must never override that relationship.
     return snap
 
 

@@ -853,14 +853,21 @@ def test_merge_order_unknown_relation_preserves_baseline(config, router, paths, 
 # merged_at 合入序方案（用户 2026-10-26 七条要求之测试矩阵）
 # ---------------------------------------------------------------------------
 
+def _verified_order(config, commits):
+    import run_test.upstream as up
+    snapshot = {'schema': up.ORDER_SNAPSHOT_SCHEMA, 'source': up.PYTORCH_UPSTREAM_URL,
+                'tip': commits[0], 'checked_tip': commits[0], 'checked': len(commits),
+                'order': commits, 'times': [1] * len(commits), 'inversions': []}
+    snapshot['sha256'] = up._order_digest(snapshot)
+    up.persist_order_snapshot(config, snapshot)
+
+
 def test_merged_at_timezone_equivalence_is_ambiguous(config, router, monkeypatch):
     """时区写法不同但同刻（+08:00 与 Z）：不同 commit 视为歧义，保守保留。"""
     import run_test.upstream as up
     monkeypatch.setattr(up, 'PyTorchMirror', FakeMirror)
 
-    def forbidden(*a, **k):
-        raise AssertionError("同刻歧义不应触发 Git 查询")
-    monkeypatch.setattr(up.PyTorchMirror, 'merge_relation', forbidden)
+    monkeypatch.setattr(up.PyTorchMirror, 'merge_relation', lambda *a: 'unknown')
     first = make_submission(pr_number=1, pytorch_commit=COMMIT_B,
                             merged_at="2026-10-26T12:00:00+08:00",
                             merged_at_provenance="upstream-main-commit-time",
@@ -873,13 +880,14 @@ def test_merged_at_timezone_equivalence_is_ambiguous(config, router, monkeypatch
     report = submit_complete_result(config, same_instant, router)
     rec = _baseline(router, TF_A, "cpu")
     assert rec.pytorch_commit == COMMIT_B and rec.counts == Counts(3, 0, 0, 0)
-    assert report.checks["baseline_skipped_merge_order"][0]["reason"] == "equal_merged_at_ambiguous"
+    assert report.checks["baseline_skipped_merge_order"][0]["reason"] == "relation_unknown"
 
 
 def test_merged_at_newer_applies_without_git_query(config, router, monkeypatch):
-    """两侧均有可信合入时刻：正常执行不触发实时 Git 祖先查询。"""
+    """双方精确 commit 在有效快照中：按位置比较，不触发 Git 查询。"""
     import run_test.upstream as up
     monkeypatch.setattr(up, 'PyTorchMirror', FakeMirror)
+    _verified_order(config, [COMMIT_B, COMMIT_A])
 
     def forbidden(self, a, b):
         raise AssertionError("时间戳路径不应做 Git 祖先查询")
@@ -917,9 +925,10 @@ def test_merged_at_invalid_falls_back_then_preserves(config, router, monkeypatch
 
 
 def test_merged_at_older_submission_skipped(config, router, monkeypatch):
-    """提交合入时刻早于基线：行与日志都不回退（时间戳路径）。"""
+    """提交在有效快照中位于基线之前：行与日志都不回退。"""
     import run_test.upstream as up
     monkeypatch.setattr(up, 'PyTorchMirror', FakeMirror)
+    _verified_order(config, [COMMIT_B, COMMIT_A])
     monkeypatch.setattr(up.PyTorchMirror, 'merge_relation',
                         lambda self, a, b: (_ for _ in ()).throw(
                             AssertionError("时间戳可判时不查 Git")))
@@ -935,7 +944,7 @@ def test_merged_at_older_submission_skipped(config, router, monkeypatch):
     report = submit_complete_result(config, earlier, router)
     rec = _baseline(router, TF_A, "cpu")
     assert rec.pytorch_commit == COMMIT_B and rec.counts == Counts(5, 0, 0, 0)
-    assert report.checks["baseline_skipped_merge_order"][0]["reason"] == "submission_merged_earlier"
+    assert report.checks["baseline_skipped_merge_order"][0]["reason"] == "verified_first_parent_order"
 
 
 def test_rerun_without_merged_at_preserves_known_value(config, router, monkeypatch):

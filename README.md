@@ -58,10 +58,12 @@ bash start.sh stop
 
 `start.sh` 管理 watchdog、cycle、pipeline、bug_monitor、brief 五常驻。服务日志在 `data/service/`，简报在 `data/logs/简报.log`。`run.sh` 是业务命令入口；`verify.sh` 运行工具回归和四场景隔离验收，输出在 `data/validation/`。
 
-基线合入序保护（2026-10-26）：结果提交自带 `merged_at`（来源
-`upstream-main-commit-time`，任务登记时持久化），提交前与基线的合入时刻
-比较——更早提交保留现有基线（行与日志均不回退）并留痕；时刻缺失/无效/
-同刻歧义时回退 Git 祖先关系，仍不可得则保守保留。存量行回填：
+基线合入序保护（2026-10-26）：fetch 官方 main 后原子保存最近 1000 个
+first-parent 完整 commit 的顺序快照。提交与当前基线都在有效快照内时按位置比较；
+缺失、损坏或未覆盖时回退本地 Git 祖先关系，仍不可得则保守保留。
+旧结果不能回退基线行和日志，同 commit 重测仍允许刷新。`merged_at`（来源
+`upstream-main-commit-time`）保存官方 committer 时间及来源，作为元数据，不能覆盖合入先后。
+新 commit 不继承旧 commit 的时间。存量行回填：
 `bash run.sh merged-at-backfill`（先备份、只填 NULL、幂等、不触发报告刷新）。
 结果库为 `data/runtime/pr_results.db`，基线位于 `data/runtime/baselines/`，队列位于 `data/runtime/queue/`。同 PR 重跑替换当前结果，保留历史日志；`no_result` 不推动基线；`done` 表示任务处理结束，不等于测试通过。
 
@@ -117,7 +119,7 @@ bash run.sh report scan
 Error > Failed > No Result > Skipped > Passed。部分实例跳过归入 Skipped，全部实例
 通过才归入 Passed；中断前观察计数单独展示，不冒充完整结果。
 只使用本次 `baseline-diff.json` 的历史快照；缺失、不可比或身份冲突均明确处理，
-不拿已更新的当前基线反推过去。日志缺失显示证据提示，长日志分块保留；HTML 转义，
+不拿已更新的当前基线反推过去。日志缺失显示证据提示，长文档拆续篇且全文保留；HTML 转义，
 终端颜色码仅从展示文本中去除，SHA256 仍对应原文件。
 
 样例来源、与旧实现的边界及统计口径见 [报告还原说明](docs/report-generation.md)。
@@ -156,7 +158,7 @@ venv/test/bin/python -m api_test_relations doctor
 
 ## 验证与边界
 
-当前已验证 Linux ARM64 CPU 的真实测试与插件采集；NPU 需要具备 CANN 和实际昇腾设备的目标机验收。四场景验收中的下载、装包和硬件检查使用替身，不能充当真实硬件执行证据。
+Linux ARM64 CPU 测试与插件采集已有验证；本次还在服务器实际 NPU 流水线观察 PR200299 完成测试、落库、清理及四篇飞书发布，具体结果与限制见综合验收记录。四场景隔离验收中的下载、装包和硬件检查使用替身，不能充当真实硬件执行证据。
 
 目录迁移说明见 [布局说明](docs/LAYOUT.md)，运行规则见 [流水线策略](docs/pipeline-policies.md)。历史材料与原包校验清单仅在本地 `docs/archive/` 中保留，旧路径不代表当前入口。
 
@@ -164,6 +166,8 @@ venv/test/bin/python -m api_test_relations doctor
 
 主仓库只提交入口脚本、`settings.example.json`、`run-test/`、`.gitmodules`、`plugin/` 的子模块引用和当前文档；插件源码在各自仓库中维护。`.gitignore` 排除本机配置、凭据、虚拟环境、运行数据和历史归档。提交前用 `git status --short` 核对文件；不要使用 `git add -f` 绕过这些规则。
 
-飞书多文档阶段修复、配置与验收证据见 [2026-10-26 报告验收记录](docs/run_test/report-acceptance-20261026.md)；整体流水线尚待最终验收。
+完整功能、运维步骤、独立验收及部署证据见 [2026-10-26 综合验收记录](docs/run_test/final-acceptance-20261026.md)。
 
-流水线筛选、预取与清理阶段验收见 [2026-10-26 流水线验收记录](docs/run_test/pipeline-acceptance-20261026.md)；整体流水线尚待最终验收。
+本次交付水印：**AI-Assisted-By: OpenAI Codex**。逐文件改动及前期协作归属见综合验收记录；Git 签名使用仓库所有者既有 GPG 身份。
+
+阶段细节保留在 [报告验收记录](docs/run_test/report-acceptance-20261026.md) 和 [流水线验收记录](docs/run_test/pipeline-acceptance-20261026.md)；其中早期“待重载”状态以综合记录为准。

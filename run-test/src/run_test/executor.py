@@ -237,6 +237,9 @@ class Executor:
             return RunOutcome(task.task_id, "failed", str(e))
 
         # 阶段 5：立即清理（成功写库后不等待、不设保留期）。
+        from .task_staging import atomic_json, task_root
+        atomic_json(task_root(self.config, task) / 'cleanup-intent.json',
+                    {'outcome': 'done', 'reason': '写库完成，清理完成'})
         self.queue.transition(task.task_id, q.STATE_CLEANING, "写库完成，立即清理")
         try:
             self._timed(task, 'cleanup', self._cleanup_task_artifacts, task)
@@ -889,7 +892,14 @@ class Executor:
     def _resume_cleaning(self, task: q.Task) -> None:
         try:
             self._cleanup_task_artifacts(task)
-            self.queue.transition(task.task_id, q.STATE_DONE, "清理完成（中断续清理）")
+            # An aborted installation/test must remain failed after a cleanup
+            # retry; deleting its files does not create a completed result.
+            from .task_staging import task_root
+            intent = task_root(self.config, task) / 'cleanup-intent.json'
+            value = json.loads(intent.read_text()) if intent.exists() else {}
+            aborted = value.get('outcome') == 'failed' or (task.error_reason or '').startswith('中断:')
+            self.queue.transition(task.task_id, q.STATE_FAILED if aborted else q.STATE_DONE,
+                                  value.get('reason', '清理完成（中断续清理）'))
         except Exception as e:
             attempts = self.queue.bump_cleanup_attempt(task.task_id)
             limit = int((self.config.get("queue") or {}).get("cleanup_retries") or 5)
@@ -903,6 +913,9 @@ class Executor:
         """中断路径：保存诊断 → 清理本任务临时资源 → 标记 failed。"""
         self._save_diagnostics(task, reason, "abort")
         try:
+            from .task_staging import atomic_json, task_root
+            atomic_json(task_root(self.config, task) / 'cleanup-intent.json',
+                        {'outcome': 'failed', 'reason': reason})
             self.queue.transition(task.task_id, q.STATE_CLEANING, f"中断: {reason}")
             if task.work_dir:
                 self._cleanup_task_artifacts(task)
@@ -910,6 +923,10 @@ class Executor:
         except q.QueueError:
             # 状态已处于终态（可能此前已处理），诊断已保存即可。
             pass
+        except Exception as error:
+            # Keep cleaning pending, retain the abort outcome, and let the next
+            # executor turn retry under its lease rather than escaping twice.
+            self._save_diagnostics(task, str(error), 'cleanup')
 
     def _save_diagnostics(self, task: q.Task, text: str, tag: str) -> None:
         d = self.paths.diagnostics_root / task.task_id

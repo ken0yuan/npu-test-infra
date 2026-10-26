@@ -240,6 +240,38 @@ def test_actual_selection_entry_reads_effective_config_without_network(config,tm
     assert '--config' in cmd and str(cp) in cmd
 
 
+def test_aborted_task_stays_failed_after_cleanup_retry(config,queue,paths,monkeypatch):
+    task=verified_task(queue)
+    task=queue.claim_next()
+    work=Path(task.work_dir);work.mkdir(parents=True)
+    (work/'failed-install.txt').write_text('fixture')
+    executor=executor_mod.Executor(config,queue_store=queue)
+    original=task_staging.remove_staging
+    def fail(*args):raise OSError('cleanup interrupted')
+    monkeypatch.setattr(task_staging,'remove_staging',fail)
+    executor._abort(task,'installation failed')
+    assert queue.get_task(task.task_id).state=='cleaning'
+    monkeypatch.setattr(task_staging,'remove_staging',original)
+    executor.run_once()
+    final=queue.get_task(task.task_id)
+    assert final.state=='failed'
+    assert final.error_reason=='installation failed'
+    assert not work.exists()
+
+
+@pytest.mark.skipif(os.name=='nt',reason='POSIX staging symlink boundary')
+def test_staging_rejects_external_symlink(config,queue,tmp_path):
+    task=_pending_analysis_task(queue)
+    root=task_staging.task_root(config,task);root.mkdir(parents=True)
+    external=tmp_path/'outside';external.mkdir()
+    sentinel=external/'pytorch-source.tar.gz';sentinel.write_bytes(b'untouched')
+    (root/'source-staging').symlink_to(external,target_is_directory=True)
+    dl=FakeDownloader()
+    with pytest.raises(ValueError,match='outside task'):
+        task_staging.stage_package(config,task,'pytorch-source.tar.gz',dl)
+    assert not dl.calls and sentinel.read_bytes()==b'untouched'
+
+
 def test_runner_and_cli_contract(config):
     config['executor']['test_python_env']=None
     assert pipeline.make_runner(config) is None

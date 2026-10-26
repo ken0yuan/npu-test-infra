@@ -845,7 +845,12 @@ def finalize_plan(tree_root: Path, report: dict, limit: int, timeout: int, pr_te
                         cache[path] = str(error)
                         report["analysis_gaps"].append({"path": path, "reason": str(error)})
                 discovered = cache[path]
-                declared = declarations.setdefault(path, declared_class_methods(tree_root / path))
+                # setdefault(path, parse(...)) evaluates parse for EVERY case.
+                # Native path matching can emit thousands of entries per file.
+                # Failed discovery uses static identities and needs no parsing.
+                if not isinstance(discovered, str) and path not in declarations:
+                    declarations[path] = declared_class_methods(tree_root / path)
+                declared = declarations.get(path, {})
                 for family in entry["test_nodes"]:
                     owner, _, method = family.rpartition(".")
                     # P1-2（2026-09-20）：精确变体匹配取代裸 startswith——

@@ -50,8 +50,20 @@ def checksum(path):
     return result.hexdigest()
 
 
+def package_path(config, task, name):
+    identity(task, name)  # Only the three supported artifact names are valid.
+    root = task_root(config, task)
+    staging = root / 'source-staging'
+    if staging.is_symlink() or staging.resolve().parent != root:
+        raise ValueError('Refusing staging path outside task')
+    path = staging / name
+    if path.is_symlink() or path.with_suffix(path.suffix + '.json').is_symlink():
+        raise ValueError('Refusing symlinked task package')
+    return path
+
+
 def verified_package(config, task, name):
-    path = task_root(config, task) / 'source-staging' / name
+    path = package_path(config, task, name)
     try:
         metadata = json.loads(path.with_suffix(path.suffix + '.json').read_text(encoding='utf-8'))
         if metadata['identity'] == identity(task, name) and path.stat().st_size == metadata['size']:
@@ -68,7 +80,7 @@ def stage_package(config, task, name, downloader):
         return old
     if downloader is None:
         raise ValueError('OBS downloader is not configured')
-    path = task_root(config, task) / 'source-staging' / name
+    path = package_path(config, task, name)
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(path.name + '.partial')
     temporary.unlink(missing_ok=True)

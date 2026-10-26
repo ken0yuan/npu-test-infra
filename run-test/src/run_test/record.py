@@ -843,8 +843,8 @@ def submit_complete_result(
     diffs = read_old_baselines(router, sub)
 
     # 2.5 合入序防护决策（用户 2026-10-26 merged_at 方案，须先于日志写入）：
-    # 优先比较持久化的合入时刻（不查 Git）；一侧缺失/无效时回退 Git 祖先
-    # 关系（ancestry 守卫保留，时间戳路径经端到端验证前不拆除）；两种途径
+    # 优先比较经校验的 first-parent 快照位置；未覆盖时回退本地 Git 祖先
+    # 关系。merged_at 仅是绑定 commit 的元数据，不参与先后排序；两种途径
     # 都无法建立先后 → 保守保留现有基线（DB 行与日志都不动）并留痕。
     # 更晚合入 / 同 commit 重跑照常刷新；PR 结果库照常记录该次提交。
     from .upstream import PyTorchMirror, load_order_snapshot, order_position
@@ -852,6 +852,7 @@ def submit_complete_result(
     mirror = PyTorchMirror(config=config)
     merge_skipped: list[dict] = []
     apply_keys: set[tuple[str, str]] = set()
+    order_snapshot = load_order_snapshot(config)
     for d in diffs:
         if not d.comparable:
             continue
@@ -870,31 +871,17 @@ def submit_complete_result(
                  "submission_commit": sub.pytorch_commit,
                  "relation": relation, "reason": reason})
 
-        trusted = ('upstream-main-commit-time',)
-        # 顺序依据健全性（用户 2026-10-26）：上游顺序文件记录倒序时，
-        # 合入时刻视为不可信 → 回退 Git 祖先（异常时保留守卫）。
-        order_ok = True
-        order_file = paths.data_root / "upstream-order.json"
-        if order_file.is_file():
-            try:
-                order = json.loads(order_file.read_text(encoding="utf-8"))
-                order_ok = not order.get("inversions")
-            except Exception:
-                order_ok = True  # 顺序文件损坏不放大为基线风险
-        sub_t = (_parse_utc(sub.merged_at)
-                 if order_ok and sub.merged_at_provenance in trusted else None)
-        base_t = (_parse_utc(old.merged_at)
-                  if order_ok and old.merged_at_provenance in trusted else None)
-        if sub_t is not None and base_t is not None:
-            # 持久化合入时刻比较：不依赖实时 Git 查询。
-            if sub_t > base_t:
-                apply_keys.add((d.test_function, d.device))
-            elif sub_t < base_t:
-                _skip('submission_older', 'submission_merged_earlier')
-            else:
-                # 同刻不同 commit：无可信顺序时按歧义保守保留。
-                _skip('equal_merged_at', 'equal_merged_at_ambiguous')
-            continue
+        if order_snapshot is not None:
+            sub_position = order_position(order_snapshot, sub.pytorch_commit)
+            base_position = order_position(order_snapshot, old.pytorch_commit)
+            if sub_position is not None and base_position is not None:
+                if sub_position < base_position:
+                    apply_keys.add((d.test_function, d.device))
+                else:
+                    _skip('submission_older', 'verified_first_parent_order')
+                continue
+        # No valid membership proof: use the existing local mirror only.
+        # An asserted timestamp/provenance label cannot bypass this guard.
         relation = mirror.merge_relation(sub.pytorch_commit, old.pytorch_commit)
         if relation in ('a_later', 'equal'):
             apply_keys.add((d.test_function, d.device))
