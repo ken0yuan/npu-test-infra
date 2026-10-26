@@ -275,3 +275,50 @@ class TestTaskInfo:
         assert task.obs_remote_time == "2026-09-17T00:00:00Z"
         assert task.enqueued_at  # 入队时间
         assert task.history  # 状态迁移历史（中断恢复用）
+
+
+class TestSplitBundleRegistration:
+    """拆分包格式（2026-10-22 起）：独立 torch_npu 对象随任务登记。"""
+
+    PT_URL = ("obs://pytorch-ci-cache/7day-cache/"
+              "wheels-pytorch-bbbbbbbbbb-py311-torch-npu-builder-aarch64-"
+              "torch-master-202610200103-e0dcc43e-aarch64-v2.tar.gz")
+    NPU_URL = ("obs://pytorch-ci-cache/7day-cache/"
+               "wheels-torchnpu-abcdef0123-bbbbbbbbbb-py311-torch-npu-builder-aarch64-"
+               "torch-master-202610200103-e0dcc43e-aarch64-v2.tar.gz")
+
+    def test_register_split_bundle_keeps_npu_object(self, queue):
+        task, created = queue.register_candidate(
+            self.PT_URL, SOURCE_URL,
+            obs_wheels_version="v2", obs_source_version="s1",
+            obs_wheels_npu_url=self.NPU_URL, obs_wheels_npu_version="v2",
+        )
+        assert created is True
+        stored = queue.get_task(task.task_id)
+        assert stored.obs_wheels_npu_url == self.NPU_URL
+        assert stored.obs_wheels_npu_version == "v2"
+
+    def test_split_bundle_npu_variant_change_is_new_candidate(self, queue):
+        """同一主体包配不同 torch_npu 构建，是不同对象组合，必须重新排队。"""
+        queue.register_candidate(self.PT_URL, SOURCE_URL, obs_wheels_npu_url=self.NPU_URL)
+        other = self.NPU_URL.replace("e0dcc43e", "8a315d17")
+        task2, created = queue.register_candidate(self.PT_URL, SOURCE_URL, obs_wheels_npu_url=other)
+        assert created is True
+        assert len(queue.list_tasks()) == 2
+
+    def test_same_split_combination_dedup(self, queue):
+        queue.register_candidate(
+            self.PT_URL, SOURCE_URL,
+            obs_wheels_npu_url=self.NPU_URL, obs_wheels_npu_version="v2",
+        )
+        _, created = queue.register_candidate(
+            self.PT_URL, SOURCE_URL,
+            obs_wheels_npu_url=self.NPU_URL, obs_wheels_npu_version="v2",
+        )
+        assert created is False
+
+    def test_legacy_registration_unaffected(self, queue):
+        """legacy 组合去重键不变（不因拆分包字段引入而重复排队）。"""
+        queue.register_candidate(WHEELS_URL, SOURCE_URL, obs_wheels_version="v1")
+        _, created = queue.register_candidate(WHEELS_URL, SOURCE_URL, obs_wheels_version="v1")
+        assert created is False

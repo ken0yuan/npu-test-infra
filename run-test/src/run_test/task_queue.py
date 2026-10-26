@@ -45,6 +45,10 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- 候选登记信息（OBS 对象）
     obs_wheels_url        TEXT NOT NULL,
     obs_source_url        TEXT NOT NULL,
+    -- 拆分包格式（2026-10-22 起构建方拆分）：独立 torch_npu 包对象；
+    -- legacy/qualified 格式 torch_npu 在主体包内，此列为 NULL。
+    obs_wheels_npu_url    TEXT,
+    obs_wheels_npu_version TEXT,
     obs_wheels_version    TEXT,
     obs_source_version    TEXT,
     obs_remote_time       TEXT,
@@ -218,6 +222,8 @@ class Task:
     state: str
     obs_wheels_url: str
     obs_source_url: str
+    obs_wheels_npu_url: str | None = None
+    obs_wheels_npu_version: str | None = None
     obs_wheels_version: str | None = None
     obs_source_version: str | None = None
     obs_remote_time: str | None = None
@@ -259,6 +265,8 @@ def _row_to_task(row: sqlite3.Row) -> Task:
         state=row["state"],
         obs_wheels_url=row["obs_wheels_url"],
         obs_source_url=row["obs_source_url"],
+        obs_wheels_npu_url=row["obs_wheels_npu_url"],
+        obs_wheels_npu_version=row["obs_wheels_npu_version"],
         obs_wheels_version=row["obs_wheels_version"],
         obs_source_version=row["obs_source_version"],
         obs_remote_time=row["obs_remote_time"],
@@ -296,8 +304,12 @@ def _new_task_id() -> str:
 def _object_key(
     wheels_url: str, wheels_version: str | None,
     source_url: str, source_version: str | None,
+    npu_url: str | None = None, npu_version: str | None = None,
 ) -> str:
-    return f"{wheels_url}|{wheels_version or ''}|{source_url}|{source_version or ''}"
+    key = f"{wheels_url}|{wheels_version or ''}|{source_url}|{source_version or ''}"
+    if npu_url or npu_version:
+        key += f"|{npu_url or ''}|{npu_version or ''}"
+    return key
 
 
 def validate_manifest(manifest: Any) -> list[dict]:
@@ -349,8 +361,24 @@ class QueueStore:
         conn = self._connect()
         try:
             conn.executescript(SCHEMA)
+            self._migrate(conn)
         finally:
             conn.close()
+
+    # 拆分包格式新增列；CREATE TABLE IF NOT EXISTS 不会改已有库，逐列补齐。
+    _MIGRATE_COLUMNS = {
+        "tasks": {
+            "obs_wheels_npu_url": "TEXT",
+            "obs_wheels_npu_version": "TEXT",
+        },
+    }
+
+    def _migrate(self, conn: sqlite3.Connection) -> None:
+        for table, columns in self._MIGRATE_COLUMNS.items():
+            existing = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+            for name, decl in columns.items():
+                if name not in existing:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
 
     def _connect(self) -> sqlite3.Connection:
         return connect(self.db_path)
@@ -364,11 +392,15 @@ class QueueStore:
         *,
         obs_wheels_version: str | None = None,
         obs_source_version: str | None = None,
+        obs_wheels_npu_url: str | None = None,
+        obs_wheels_npu_version: str | None = None,
         obs_remote_time: str | None = None,
         expiry_rule: str | None = None,
     ) -> tuple[Task, bool]:
         """登记一个 OBS 对象组合为候选任务。
 
+        拆分包格式下 obs_wheels_npu_url 为独立 torch_npu 包（必填时缺省
+        由调用方负责——对象不齐时调用方应等待，同 obs_source_url 约定）。
         同一 (URL, 版本标识) 组合重复登记不产生新任务（只刷新 last_seen）。
         登记后立即处于 identity_pending：候选不是已获准的测试任务。
         返回 (task, created)。
@@ -380,7 +412,8 @@ class QueueStore:
                 "obs_source_url 不能为空；对象不齐时调用方应等待两个对象都出现后再登记"
             )
         key = _object_key(obs_wheels_url, obs_wheels_version,
-                          obs_source_url, obs_source_version)
+                          obs_source_url, obs_source_version,
+                          obs_wheels_npu_url, obs_wheels_npu_version)
         now = _now()
         conn = self._connect()
         try:
@@ -408,14 +441,16 @@ class QueueStore:
                 """
                 INSERT INTO tasks
                     (task_id, state, obs_wheels_url, obs_source_url,
+                     obs_wheels_npu_url, obs_wheels_npu_version,
                      obs_wheels_version, obs_source_version, obs_remote_time,
                      expiry_rule, expires_at, enqueued_at, updated_at,
                      state_changed_at, history)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)
                 """,
                 (
                     task_id, STATE_IDENTITY_PENDING,
                     obs_wheels_url, obs_source_url,
+                    obs_wheels_npu_url, obs_wheels_npu_version,
                     obs_wheels_version, obs_source_version, obs_remote_time,
                     expiry_rule, now, now, now,
                     json.dumps(history, ensure_ascii=False),

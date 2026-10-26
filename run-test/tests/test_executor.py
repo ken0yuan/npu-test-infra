@@ -5,6 +5,7 @@
 """
 
 import itertools
+import platform
 import subprocess
 
 import pytest
@@ -57,6 +58,8 @@ def fake_pip(monkeypatch):
         stdout = ""
         if "import torch" in joined:
             stdout = COMMIT_A  # 安装后的 git_version 与任务锁定一致
+        elif "import sys" in joined:
+            stdout = "310"  # 解释器版本探针（qualified/split 包名带 python_tag 时触发）
         elif "uninstall" in joined:
             stdout = "Skipping torch_npu as it is not installed."
         elif "install" in joined:
@@ -145,6 +148,54 @@ class TestFullFlow:
         assert set(runner.source_roots) == {
             paths.task_work_root / task.task_id / "source" / "pytorch"
         }
+
+    def test_split_bundle_downloads_npu_object_and_backfills(self, config, queue, paths, fake_pip):
+        """拆分包格式（2026-10-22 起）：torch_npu 在独立对象中，执行端必须
+        下载三个对象、跨两个 wheels 包找齐 wheel，并从 npu wheel 读出精确
+        commit 回写（torch_npu_short 与包内 git_version 一致性核验通过）。"""
+        arch = platform.machine()
+        pt_url = (f"obs://pytorch-ci-cache/7day-cache/"
+                  f"wheels-pytorch-{SHA10}-py310-torch-npu-builder-{arch}-"
+                  f"torch-master-202610200103-e0dcc43e-{arch}-v2.tar.gz")
+        npu_url = (f"obs://pytorch-ci-cache/7day-cache/"
+                   f"wheels-torchnpu-{COMMIT_NPU[:10]}-{SHA10}-py310-torch-npu-builder-{arch}-"
+                   f"torch-master-202610200103-e0dcc43e-{arch}-v2.tar.gz")
+        ver = f"split-v{next(_version_counter)}"
+        task, _ = queue.register_candidate(
+            pt_url, SOURCE_URL, obs_wheels_version=ver, obs_source_version=ver,
+            obs_wheels_npu_url=npu_url, obs_wheels_npu_version=ver,
+        )
+        queue.register_identity_rule("r", "规则", "测试 fixture")
+        queue.verify_identity(
+            task.task_id, "r",
+            {"pr_number": 123457, "pytorch_commit": COMMIT_A,
+             "torch_npu_commit": None, "binding": "拆分包绑定"},
+        )
+        queue.prefilter_outcome(task.task_id, True)
+        task = queue.submit_manifest(task.task_id, [{"test_function": TF_A, "device": "cpu"}])
+
+        runner = FakeRunner(counts_map={(TF_A, "cpu"): Counts(1, 0, 0, 0)})
+        dl = FakeDownloader()
+        executor = Executor(config, queue_store=queue, downloader=dl, runner=runner)
+        outcome = executor.run_once()
+        assert outcome.outcome == "done"
+        assert npu_url in dl.calls  # 独立 torch_npu 对象确实被下载
+
+        conn = connect(paths.pr_db)
+        try:
+            pr = get_pr_result(conn, 123457)
+        finally:
+            conn.close()
+        assert pr.torch_npu_environment["torch_npu_commit"] == COMMIT_NPU
+
+    def test_split_bundle_missing_npu_url_stays_legacy(self, config, queue, fake_pip):
+        """npu URL 为空（legacy 登记）时不下载第三个对象。"""
+        task = verified_task(queue)
+        dl = FakeDownloader()
+        executor = Executor(config, queue_store=queue, downloader=dl, runner=FakeRunner())
+        outcome = executor.run_once()
+        assert outcome.outcome == "done"
+        assert not any("wheels-npu" in c or "torchnpu" in c for c in dl.calls)
 
     def test_wheel_commit_backfill_reaches_submission(self, config, queue, paths, fake_pip):
         """身份绑定 torch_npu_commit=None 时，执行端从包内 wheel 读出精确

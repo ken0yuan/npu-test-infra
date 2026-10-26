@@ -3,7 +3,7 @@ import sys
 
 import pytest
 
-from run_test.artifacts import inventory, select_wheel, wheel_identity
+from run_test.artifacts import inventory, select_bundle, select_wheel, wheel_identity
 from run_test.config import ConfigError
 from run_test.device_detect import make_device_resolver
 from run_test.device_policy import ExecutionDeviceResolver, execution_env
@@ -69,3 +69,46 @@ def test_multiple_builds_require_explicit_filter():
     with pytest.raises(ValueError, match='多个 wheel'):
         select_wheel(listing, BUCKET, SHA, {})
     assert select_wheel(listing, BUCKET, SHA, {'obs':{'wheel_name_contains':['cann-a3']}}) == other
+
+
+# 2026-10-22 起构建方把全量 wheels 包拆成两个 -vN 对象（实证 2026-10-26）：
+# wheels-pytorch-{sha}-…（torch+torchvision）+ wheels-torchnpu-{npu}-{sha}-…（torch_npu）。
+PT_NAME = f'{BUCKET}/wheels-pytorch-{SHA}-py311-torch-npu-builder-aarch64-torch-master-202610200103-e0dcc43e-aarch64-v2.tar.gz'
+NPU_NAME = f'{BUCKET}/wheels-torchnpu-abcdef0123-{SHA}-py311-torch-npu-builder-aarch64-torch-master-202610200103-e0dcc43e-aarch64-v2.tar.gz'
+
+
+def test_split_bundle_identity():
+    pt = wheel_identity(PT_NAME)
+    assert pt['format'] == 'split-pytorch'
+    assert pt['pytorch_short'] == SHA and pt['python_tag'] == '311'
+    assert pt['architecture'] == 'aarch64'
+    npu = wheel_identity(NPU_NAME)
+    assert npu['format'] == 'split-torchnpu'
+    assert npu['torch_npu_short'] == 'abcdef0123'
+    assert npu['pytorch_short'] == SHA
+
+
+def test_split_bundle_pairing():
+    listing = {PT_NAME:{}, NPU_NAME:{}, f'{BUCKET}/pytorch-source-{SHA}.tar.gz':{}}
+    assert select_bundle(listing, BUCKET, SHA, {}) == {'wheels':PT_NAME, 'wheels_npu':NPU_NAME}
+    pair = inventory(listing, BUCKET, {})['unique_pairs'][0]
+    assert pair['wheels'] == PT_NAME and pair['wheels_npu'] == NPU_NAME
+
+
+def test_split_bundle_without_npu_object_reports_missing_npu():
+    listing = {PT_NAME:{}, f'{BUCKET}/pytorch-source-{SHA}.tar.gz':{}}
+    bundle = select_bundle(listing, BUCKET, SHA, {})
+    assert bundle == {'wheels':PT_NAME, 'wheels_npu':None}
+
+
+def test_torchnpu_without_v_suffix_is_still_a_different_product():
+    listing = {NPU_NAME.replace('-aarch64-v2.tar.gz','-aarch64.tar.gz'):{},
+               f'{BUCKET}/pytorch-source-{SHA}.tar.gz':{}}
+    assert inventory(listing, BUCKET, {})['unique_pairs'] == []
+
+
+def test_multiple_npu_builds_require_explicit_filter():
+    other = NPU_NAME.replace('e0dcc43e', '8a315d17')
+    listing = {PT_NAME:{}, NPU_NAME:{}, other:{}, f'{BUCKET}/pytorch-source-{SHA}.tar.gz':{}}
+    with pytest.raises(ValueError, match='多个 wheel'):
+        select_bundle(listing, BUCKET, SHA, {})

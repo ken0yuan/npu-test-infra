@@ -240,6 +240,11 @@ class Executor:
 
         wheels_pkg = packages / "wheels.tar.gz"
         source_pkg = packages / "pytorch-source.tar.gz"
+        # 拆分包格式（2026-10-22 起）：torch_npu 独立对象，与主体包同下。
+        npu_pkg = packages / "wheels-npu.tar.gz"
+        downloads = [(task.obs_wheels_url, wheels_pkg), (task.obs_source_url, source_pkg)]
+        if task.obs_wheels_npu_url:
+            downloads.append((task.obs_wheels_npu_url, npu_pkg))
         # 下载重试：次数/间隔来自 store.json（queue.download_retries /
         # download_retry_interval_seconds）；未配置（null）= 不重试，保持
         # "不猜默认值"约定。逐文件重试——源码包大，不因 wheels 失败重下它。
@@ -262,8 +267,8 @@ class Executor:
                         time.sleep(interval)
 
         try:
-            _download_with_retry(task.obs_wheels_url, wheels_pkg)
-            _download_with_retry(task.obs_source_url, source_pkg)
+            for url, pkg in downloads:
+                _download_with_retry(url, pkg)
         except ObsDownloadError as e:
             self.queue.bump_retry(task.task_id)
             reason = f"OBS 下载失败（共尝试 {max_attempts} 次）: {e}"
@@ -272,11 +277,17 @@ class Executor:
 
         # 对象与任务版本对应性核验：远端对象名中的短 commit 必须与任务
         # 锁定的完整 commit 一致（这只是完整性检查，不是身份放行依据）。
-        for url, pkg in ((task.obs_wheels_url, wheels_pkg), (task.obs_source_url, source_pkg)):
-            m = re.search(r"([0-9a-f]{10,40})", Path(url.rsplit("/", 1)[-1]).stem)
-            if m and not task.pytorch_commit.startswith(m.group(1)):
+        # 拆分包的 torch_npu 对象名前缀是 npu 短 commit，pytorch 短 commit
+        # 在第二个段——用 wheel_identity 取，取不到再退回文件名首个哈希。
+        from .artifacts import wheel_identity
+        for url, _pkg in downloads:
+            short = (wheel_identity(url) or {}).get("pytorch_short")
+            if short is None:
+                m = re.search(r"([0-9a-f]{10,40})", Path(url.rsplit("/", 1)[-1]).stem)
+                short = m.group(1) if m else None
+            if short and not task.pytorch_commit.startswith(short):
                 reason = (
-                    f"对象 {url} 的版本标识 {m.group(1)} 与任务锁定的 "
+                    f"对象 {url} 的版本标识 {short} 与任务锁定的 "
                     f"{task.pytorch_commit} 不对应，不安装、不测试"
                 )
                 self.queue.mark_blocked(task.task_id, reason)
@@ -286,6 +297,8 @@ class Executor:
         try:
             wheels_dir = self._extract(wheels_pkg, packages / "wheels")
             self._extract(source_pkg, source)
+            if task.obs_wheels_npu_url:
+                self._extract(npu_pkg, packages / "wheels")
         except (tarfile.TarError, OSError) as e:
             reason = f"压缩包损坏或解压失败: {e}"
             self.queue.mark_blocked(task.task_id, reason)
@@ -311,8 +324,13 @@ class Executor:
             )
             self.queue.mark_blocked(task.task_id, reason)
             return False, reason
-        from .artifacts import wheel_identity
-        named_npu = (wheel_identity(task.obs_wheels_url) or {}).get("torch_npu_short")
+        # torch_npu 短 commit 与包名一致性：拆分包从独立 npu 对象名取，
+        # legacy/qualified 从主体包名取（包内自带 torch_npu）。
+        named_npu = None
+        if task.obs_wheels_npu_url:
+            named_npu = (wheel_identity(task.obs_wheels_npu_url) or {}).get("torch_npu_short")
+        if named_npu is None:
+            named_npu = (wheel_identity(task.obs_wheels_url) or {}).get("torch_npu_short")
         if named_npu and not torch_npu_commit.startswith(named_npu):
             reason = "torch_npu wheel 内 commit 与 OBS 包名不一致；不安装、不测试"
             self.queue.mark_blocked(task.task_id, reason)

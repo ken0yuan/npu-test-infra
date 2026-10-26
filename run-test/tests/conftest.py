@@ -101,6 +101,40 @@ def make_pr_log_dir(base: Path | None = None, tag: str = "run") -> Path:
     return d
 
 
+def make_pytorch_wheels_tar(dest: Path, sha10: str) -> Path:
+    """构造拆分包格式的 wheels-pytorch 包（torch + torchvision 占位 wheel）。
+
+    对应 2026-10-22 起构建方拆分格式（实证 2026-10-26：b43489ea06 包内
+    torch-2.16.0a0 + torchvision-0.30.0a0 两个 wheel）。
+    """
+    staging = dest.parent / f"{dest.stem}-staging"
+    staging.mkdir(parents=True, exist_ok=True)
+    (staging / "torch-2.15.0a0+gitunknown-cp310-cp310-linux_aarch64.whl").write_bytes(b"fake")
+    (staging / "torchvision-0.30.0a0+a034671-py3-none-linux_aarch64.whl").write_bytes(b"fake")
+    with tarfile.open(dest, "w:gz") as tf:
+        tf.add(staging, arcname=".")
+    return dest
+
+
+def make_torch_npu_tar(dest: Path, npu_commit: str = COMMIT_NPU) -> Path:
+    """构造拆分包格式的 wheels-torchnpu 包（仅 torch_npu wheel，真实 zip
+    结构，内含 version.py 的 git_version）。"""
+    import zipfile
+
+    staging = dest.parent / f"{dest.stem}-staging"
+    staging.mkdir(parents=True, exist_ok=True)
+    whl = staging / "torch_npu-2.15.0a0-cp310-cp310-linux_aarch64.whl"
+    with zipfile.ZipFile(whl, "w") as z:
+        z.writestr(
+            "torch_npu/version.py",
+            f"__version__ = '2.15.0a0'\n"
+            f"git_version = '{npu_commit}'\n",
+        )
+    with tarfile.open(dest, "w:gz") as tf:
+        tf.add(staging, arcname=".")
+    return dest
+
+
 def make_wheels_tar(dest: Path, sha10: str, torch_npu_commit: str = COMMIT_NPU) -> Path:
     """构造含 torch / torch_npu 两个 wheel 的 tar.gz。
 
@@ -158,7 +192,12 @@ class FakeDownloader:
         dest = Path(dest)
         dest.parent.mkdir(parents=True, exist_ok=True)
         name = url.rsplit("/", 1)[-1]
-        if name.startswith("wheels-"):
+        if name.startswith("wheels-pytorch-"):
+            sha10 = name[len("wheels-pytorch-"):].split("-")[0]
+            make_pytorch_wheels_tar(dest, sha10)
+        elif name.startswith("wheels-torchnpu-"):
+            make_torch_npu_tar(dest)
+        elif name.startswith("wheels-"):
             sha10 = name[len("wheels-"):].split(".")[0]
             make_wheels_tar(dest, sha10)
         else:

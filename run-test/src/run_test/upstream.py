@@ -284,17 +284,26 @@ def run_cycle(
 
     for row in pending:
         sha10 = row["sha"][:10]
-        from .artifacts import select_wheel
+        from .artifacts import select_bundle, wheel_identity
         try:
-            wheels_url = select_wheel(listing, bucket, sha10, config)
+            bundle = select_bundle(listing, bucket, sha10, config)
         except ValueError as error:
             report.errors.append(str(error))
             queue.update_upstream_commit(row["sha"], state="pending", note=str(error))
             continue
+        wheels_url = bundle["wheels"]
+        npu_url = bundle["wheels_npu"]
         source_url = f"{bucket}/pytorch-source-{sha10}.tar.gz"
-        wheels_meta = listing.get(wheels_url)
+        wheels_meta = listing.get(wheels_url) if wheels_url else None
         source_meta = listing.get(source_url)
-        if wheels_meta is None or source_meta is None:
+        npu_meta = listing.get(npu_url) if npu_url else None
+        # 拆分包格式下 torch_npu 独立成对象；主体包已选中但 npu 包未出现
+        # 视为对象不齐，继续等待（同 source 缺失语义）。
+        npu_required = bool(wheels_url) and (
+            wheel_identity(wheels_url) or {}
+        ).get("format") == "split-pytorch"
+        if (wheels_meta is None or source_meta is None
+                or (npu_required and npu_meta is None)):
             discovered = datetime.fromisoformat(row["discovered_at"])
             if discovered.tzinfo is None:
                 discovered = discovered.replace(tzinfo=timezone.utc)
@@ -313,6 +322,8 @@ def run_cycle(
             wheels_url, source_url,
             obs_wheels_version=wheels_meta.get("etag"),
             obs_source_version=source_meta.get("etag"),
+            obs_wheels_npu_url=npu_url,
+            obs_wheels_npu_version=npu_meta.get("etag") if npu_meta else None,
             obs_remote_time=wheels_meta.get("last_modified"),
         )
         if not created:
