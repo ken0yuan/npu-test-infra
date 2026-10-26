@@ -1,0 +1,6 @@
+[submodule "plugin/api-test-relations"]
+	path = plugin/api-test-relations
+	url = git@github.com:ken0yuan/api-test-relations-plugin.git
+[submodule "plugin/trace_api_chain"]
+	path = plugin/trace_api_chain
+	url = git@github.com:ken0yuan/trace_api_chain.git
