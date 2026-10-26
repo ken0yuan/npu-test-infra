@@ -29,15 +29,41 @@ class BaselineHistoryError(RuntimeError):
 def maintenance(config, wait_seconds=0):
     """Wait at a task boundary; never interrupt a running executor."""
     paths = store_paths(config)
+    lock_path = paths.queue_db.with_suffix(".executor.lock")
+    # The pipeline can immediately claim its next task. A blocking flock joins
+    # the kernel wait queue instead of missing the tiny gap between tasks.
+    import signal
+    import threading
+    if (os.name == "posix" and wait_seconds > 0
+            and threading.current_thread() is threading.main_thread()
+            and hasattr(signal, "setitimer")
+            and signal.getitimer(signal.ITIMER_REAL) == (0, 0)):
+        import fcntl
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with lock_path.open("a+b") as handle:
+            def timed_out(signum, frame):
+                raise BaselineHistoryError("executor busy; retry after the task or use --wait-seconds")
+            previous_handler = signal.signal(signal.SIGALRM, timed_out)
+            try:
+                signal.setitimer(signal.ITIMER_REAL, wait_seconds)
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            finally:
+                signal.setitimer(signal.ITIMER_REAL, 0)
+                signal.signal(signal.SIGALRM, previous_handler)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        return
     deadline = time.monotonic() + max(0, wait_seconds)
     while True:
-        with executor_lease(paths.queue_db.with_suffix(".executor.lock")) as acquired:
+        with executor_lease(lock_path) as acquired:
             if acquired:
                 yield
                 return
         if time.monotonic() >= deadline:
             raise BaselineHistoryError("executor busy; retry after the task or use --wait-seconds")
-        time.sleep(min(1, max(0, deadline - time.monotonic())))
+        time.sleep(min(0.05, max(0, deadline - time.monotonic())))
 
 
 def _history_root(config):

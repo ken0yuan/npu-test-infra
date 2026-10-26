@@ -203,3 +203,40 @@ def test_partial_and_missing_results_do_not_create_baselines(config):
     assert report['prs'][0]['baseline_created'] == 0
     assert read_baseline(config, TF_A, 'cpu') is None
     assert read_baseline(config, TF_B, 'cpu') is None
+
+
+def test_timed_lock_wait_preserves_signal_handler(config):
+    import signal
+    paths = store_paths(config)
+    previous = signal.getsignal(signal.SIGALRM)
+    with executor_lease(paths.queue_db.with_suffix('.executor.lock')) as acquired:
+        assert acquired
+        with pytest.raises(BaselineHistoryError, match='busy'):
+            snapshot_baselines(config, wait_seconds=0.03)
+    assert signal.getsignal(signal.SIGALRM) == previous
+    assert signal.getitimer(signal.ITIMER_REAL) == (0, 0)
+    assert list_snapshots(config) == []
+    assert snapshot_baselines(config, wait_seconds=1)['reason'] == 'manual'
+
+
+def test_blocking_wait_acquires_after_other_process_releases(config):
+    import subprocess
+    import sys
+    paths = store_paths(config)
+    lock = paths.queue_db.with_suffix('.executor.lock')
+    script = '''import sys,time
+from run_test.process_lock import executor_lease
+with executor_lease(sys.argv[1]) as acquired:
+    assert acquired
+    print("ready",flush=True)
+    time.sleep(0.3)
+'''
+    child = subprocess.Popen([sys.executable, '-c', script, str(lock)], stdout=subprocess.PIPE, text=True)
+    try:
+        assert child.stdout.readline().strip() == 'ready'
+        assert snapshot_baselines(config, wait_seconds=2)['reason'] == 'manual'
+        assert child.wait(timeout=3) == 0
+    finally:
+        if child.poll() is None:
+            child.terminate()
+            child.wait(timeout=3)
