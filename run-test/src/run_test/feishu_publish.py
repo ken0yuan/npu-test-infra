@@ -285,19 +285,23 @@ class Publisher:
         else:
             self.state = {'pr_number': pr, 'fingerprint': fingerprint,
                           'folder': self.folder, 'status': 'staging'}
-        # schema 钉住（评审阻塞项 5）：resume 时计划 schema 与暂存态不一致
-        # → 弃旧暂存重开（旧暂存文档留在暂存目录无害），绝不跨 schema 续传。
-        if self.state.get('plan_schema') != plan.get('schema'):
+        # Existing published reports remain stable across renderer upgrades.
+        if self.state.get('status') == 'published':
+            return {**self.state['receipt'], 'changed': False}
+        plan_hash = result_docs.digest(result_docs.encoded(plan).encode())
+        if self.state.get('plan_hash') != plan_hash:
+            if self.path.exists():
+                previous = result_docs.digest(self.path.read_bytes())
+                result_docs._atomic(self.path.with_name(self.path.stem + '.superseded-' + previous + '.json'),
+                                    result_docs.encoded(self.state))
             self.state = {'pr_number': pr, 'fingerprint': fingerprint,
                           'folder': self.folder, 'status': 'staging',
-                          'plan_schema': plan.get('schema'),
-                          'resumed_from_migrated_staging': True}
-        self.state['plan_schema'] = plan.get('schema')
-        self.save()
-        if self.state['status'] == 'published':
-            return {**self.state['receipt'], 'changed': False}
+                          'plan_schema': plan.get('schema'), 'plan_hash': plan_hash}
+            self.save()
         staging = self.unique_object('staging', self.folder, '报告上传暂存', 'folder')
-        version = self.unique_object('version_folder', staging, f'PR_{pr}_{fingerprint}', 'folder')
+        # Isolate changed schemas/settings from old remote content as well as receipts.
+        version = self.unique_object('version_folder', staging,
+                                     f'PR_{pr}_{fingerprint}_{plan_hash}', 'folder')
         parts = plan['parts']
         docs = [self.unique_object(f'part{p["part_index"]}-doc', version,
                                    plan['title'] + p['title_suffix'], 'docx')
@@ -326,12 +330,15 @@ class Publisher:
                                  'body': {'index': -1, 'children': nav}})
             for operation in part['operations']:
                 if operation['op'] == 'toc':
-                    links = [result_docs.text_block('text', plan['title'] + p['title_suffix'],
+                    links = [result_docs.text_block('text', plan['title'] + p['title_suffix'] + '\n',
                                                     link=f'{self.domain}/docx/{docs[p["part_index"]]}')
                              for p in parts[1:]]
                     expanded.append({'op': 'append', 'parent': 'document',
                                      'body': {'index': -1,
-                                              'children': [result_docs.text_block('heading4', '本报告分篇（续篇链接）', bold=True)] + links}})
+                                              'children': [result_docs.text_block('heading4', '本报告分篇（续篇链接）', bold=True),
+                                                           {'block_type': 2, 'text': {'elements': [
+                                                               e for link in links for e in link['text']['elements']],
+                                                               'style': {'align': 1}}}]}})
                 else:
                     expanded.append(operation)
             # 40 块传输分片：稳定步 ID（断点续传幂等）；表格块随片上传，
@@ -352,7 +359,7 @@ class Publisher:
                             raise PublishError('建表返回单元格数量异常')
                         for j, (cell, children) in enumerate(zip(cells, op['cell_children'])):
                             for k2 in range(0, len(children), TRANSPORT_BATCH):
-                                self.append(f'cell-{pi}-{k // TRANSPORT_BATCH}-{j}-{k2}',
+                                self.append(f'cell-{pi}-{k // TRANSPORT_BATCH}-{bid}-{j}-{k2}',
                                             doc, cell, children[k2:k2 + TRANSPORT_BATCH])
             expanded_lists.append(expanded)
         verifications = [self.verify(doc, {'operations': expanded_lists[pi]})

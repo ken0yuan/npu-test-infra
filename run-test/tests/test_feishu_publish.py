@@ -26,6 +26,7 @@ class FakeFeishu:
         self.lose_response = False
         self.fail_before = False
         self.moves = []
+        self.child_batches = []
 
     def ident(self):
         self.serial += 1
@@ -60,6 +61,7 @@ class FakeFeishu:
             self.moves.append((doc, body['folder_token']))
             return {}
         if path.endswith('/children'):
+            self.child_batches.append(len(body['children']))
             if self.fail_before:
                 self.fail_before = False
                 raise PublishError('known rejected write')
@@ -92,7 +94,7 @@ def test_end_to_end_verify_promote_and_preserve_old_document(tmp_path):
     p, plan = inputs();worker = Publisher(api, 'target', tmp_path)
     receipt = worker.publish(p, plan)
     assert receipt['verification']['content_verified'] and receipt['archived'] == ['legacy']
-    assert [f['token'] for f in api.files('target') if f['type'] == 'docx'] == [receipt['document_id']]
+    assert {f['token'] for f in api.files('target') if f['type'] == 'docx'} == {p['document_id'] for p in receipt['parts']}
     assert any(f['token'] == 'legacy' for entries in api.entries.values() for f in entries)
     before = api.mutations
     again = Publisher(api, 'target', tmp_path).publish(p, plan)
@@ -103,9 +105,11 @@ def test_timeout_after_append_is_reconciled_without_duplicate(tmp_path):
     api = FakeFeishu();p, plan = inputs();api.lose_response = True
     with pytest.raises(UncertainWrite): Publisher(api, 'target', tmp_path).publish(p, plan)
     receipt = Publisher(api, 'target', tmp_path).publish(p, plan)
-    expected = sum(len(op['body']['children']) for op in plan['operations'])
-    assert receipt['verification']['root_blocks'] == expected
-    assert len(api.documents) == 1
+    assert all(p['verification']['content_verified'] for p in receipt['parts'])
+    assert len(api.documents) == plan['part_count']
+    clean = FakeFeishu()
+    reference = Publisher(clean, 'target', tmp_path / 'reference').publish(p, plan)
+    assert [p['verification'] for p in receipt['parts']] == [p['verification'] for p in reference['parts']]
 
 
 def test_known_rejection_can_retry_without_abandoning_staging(tmp_path):
@@ -256,7 +260,7 @@ def test_big_log_planner_to_publisher_split_without_loss(tmp_path):
     """真实规划→发布链路：700k 字符日志按 500k 文档预算拆篇，跨篇全文
     零丢失、续篇导航齐备、传输批量 ≤40 块。"""
     import run_test.result_docs as rd
-    log = 'L' * 700_000
+    log = ('L中\U0001f680\n' * 175_000) + 'END'
     model = {
         'pr_number': 1, 'pr_url': 'http://x/1', 'title': 'PR#1',
         'pytorch_commit': 'a' * 40,
@@ -286,8 +290,12 @@ def test_big_log_planner_to_publisher_split_without_loss(tmp_path):
     receipt = Publisher(api, 'target', tmp_path, domain='https://x').publish(pointer, plan)
     assert receipt['changed'] and len(receipt['parts']) == plan['part_count']
     # 发布端传输同样 ≤40 块/请求（FakeFeishu 记录的 children POST）
-    import urllib.parse
-    big = [1 for name, call_log in []]  # placeholder；直接检查 api 侧
+    assert max(api.child_batches) <= 40
+    for part in receipt['parts']:
+        actual = api.blocks(part['document_id'])
+        assert len(actual) <= 50
+        assert sum(rd.text_units(block_text(b)) for b in actual) <= 500_000
+        assert all(rd.text_units(block_text(b)) <= rd.BLOCK_TEXT_LIMIT for b in actual)
     # 跨篇回读拼接零丢失（含续篇导航块外的代码内容）
     joined = ''
     for part in receipt['parts']:
@@ -320,14 +328,114 @@ def test_generate_uses_configured_budget(config, router, paths, monkeypatch):
         (Path(sub.pr_log_source_dir) /
          baseline_log_filename(fr.test_function, fr.device)).write_text(log, encoding='utf-8')
     submit_complete_result(config, sub, router)
-    cfg = {**config, 'feishu': {'doc_max_chars': 20_000, 'doc_max_blocks': 50}}
-    _all = [str(f) for f in (store_paths(config).pr_logs_root).rglob('*') if f.is_file()]
-    print(f"[DEBUG] pr_logs tree: {[(f.rsplit('/', 2)[-2:], __import__('os').path.getsize(f)) for f in _all]}", flush=True)
+    cfg = {**config, 'reports': {**config.get('reports', {}), 'feishu': {'doc_max_chars': 20_000, 'doc_max_blocks': 50}}}
     result_docs_module.generate(cfg, 123456)
     plan = json.loads(next((store_paths(cfg).data_root / 'reports')
-                           .glob('PR_123456/*/feishu-plan.json')).read_text())
+                           .glob('PR_123456/*/feishu-plan.json')).read_text(encoding='utf-8'))
     assert plan['part_count'] >= 2  # 20k 预算下 60k 日志必然拆篇
+    assert plan['budget']['doc_max_chars'] == 20_000
     all_ops = [op for p in plan['parts'] for op in p['operations']]
     code_blocks = [b for op in all_ops if op.get('body')
                    for b in op['body']['children'] if b['block_type'] == 14]
     assert code_blocks  # 连续块存在（一篇或跨篇）
+
+
+def _model_with_logs(size=20000, count=1):
+    model = build_report(row_for([item('test_' + str(i)) for i in range(count)]))
+    for test in model['tests']:
+        test['log']['text'] = ('中\U0001f680ab\n' * (size // 5 + 1))[:size]
+    return model
+
+
+def test_normal_log_has_one_visible_code_block():
+    model = _model_with_logs()
+    plan = feishu_plan(model)
+    code = [b for op in plan['operations'] for b in op.get('body', {}).get('children', [])
+            if b['block_type'] == 14]
+    assert len(code) == 1 and block_text(code[0]) == model['tests'][0]['log']['text']
+
+
+def test_old_published_receipt_does_not_republish_on_upgrade(tmp_path):
+    api = FakeFeishu(); pointer, plan = inputs()
+    legacy = {'title': plan['title'], 'operations': [{'op': 'append', 'body': {
+        'index': -1, 'children': [result_docs.text_block('text', 'original published report')]}}]}
+    before = Publisher(api, 'target', tmp_path).publish(pointer, legacy)
+    mutations = api.mutations
+    after = Publisher(api, 'target', tmp_path).publish(pointer, plan)
+    assert not after['changed'] and after['document_id'] == before['document_id']
+    assert api.mutations == mutations
+    assert not list(tmp_path.rglob('*.superseded-*.json'))
+
+
+def test_old_staging_lost_response_is_isolated_during_upgrade(tmp_path):
+    api = FakeFeishu(); pointer, plan = inputs()
+    legacy = {'title': plan['title'], 'operations': [{'op': 'append', 'body': {
+        'index': -1, 'children': [result_docs.text_block('text', 'old staging content')]}}]}
+    api.lose_response = True
+    with pytest.raises(UncertainWrite):
+        Publisher(api, 'target', tmp_path).publish(pointer, legacy)
+    old = deepcopy(api.documents)
+    receipt = Publisher(api, 'target', tmp_path).publish(pointer, plan)
+    assert all(p['verification']['content_verified'] for p in receipt['parts'])
+    assert set(old).isdisjoint(p['document_id'] for p in receipt['parts'])
+    assert all(api.documents[doc] == contents for doc, contents in old.items())
+    assert len(list(tmp_path.rglob('*.superseded-*.json'))) == 1
+    mutations = api.mutations
+    assert not Publisher(api, 'target', tmp_path).publish(pointer, plan)['changed']
+    assert api.mutations == mutations
+
+
+def test_changed_staging_budget_does_not_reuse_partial_documents(tmp_path):
+    api = FakeFeishu(); model = _model_with_logs(60000)
+    pointer = {'pr_number': 77, 'fingerprint': '1' * 64}
+    first = feishu_plan(model)
+    api.lose_response = True
+    with pytest.raises(UncertainWrite):
+        Publisher(api, 'target', tmp_path).publish(pointer, first)
+    old = deepcopy(api.documents)
+    receipt = Publisher(api, 'target', tmp_path).publish(pointer, feishu_plan(model, {'doc_max_chars': 20000}))
+    assert set(old).isdisjoint(p['document_id'] for p in receipt['parts'])
+    assert all(api.documents[doc] == contents for doc, contents in old.items())
+
+
+def test_partial_promotion_keeps_old_set_until_all_parts_are_promoted(tmp_path):
+    api = FakeFeishu(); api.entries['target'].append({'token': 'old', 'name': 'PR#77', 'type': 'docx'})
+    pointer, plan = {'pr_number': 77, 'fingerprint': '2' * 64}, _v2_plan(parts=3)
+    original = api.call
+    def reject_second_move(method, url, body=None):
+        if url.endswith('/move') and len(api.moves) == 1:
+            raise PublishError('second move rejected')
+        return original(method, url, body)
+    api.call = reject_second_move
+    with pytest.raises(PublishError, match='second move'):
+        Publisher(api, 'target', tmp_path).publish(pointer, plan)
+    assert any(f['token'] == 'old' for f in api.files('target'))
+    state = json.loads((tmp_path/'target/PR_77'/ (pointer['fingerprint']+'.json')).read_text(encoding='utf-8'))
+    assert state['status'] == 'staging'
+    api.call = original
+    receipt = Publisher(api, 'target', tmp_path).publish(pointer, plan)
+    assert receipt['archived'] == ['old'] and len(receipt['parts']) == 3
+
+
+@pytest.mark.parametrize('count,budget', [(70, {'doc_max_blocks': 50, 'doc_max_chars': 20000}),
+                                         (2, {'doc_max_blocks': 42, 'doc_max_chars': 2048})])
+def test_actual_complete_documents_respect_budgets(tmp_path, count, budget):
+    model = _model_with_logs(3000, count)
+    plan = feishu_plan(model, budget)
+    api = FakeFeishu()
+    receipt = Publisher(api, 'target', tmp_path).publish({'pr_number': 77, 'fingerprint': '3'*64}, plan)
+    recovered = []
+    for part in receipt['parts']:
+        blocks = api.blocks(part['document_id'])
+        assert len(blocks) <= budget['doc_max_blocks']
+        assert sum(result_docs.text_units(block_text(b)) for b in blocks) <= budget['doc_max_chars']
+        recovered.extend(block_text(b) for b in blocks if b['block_type'] == 14)
+    assert ''.join(recovered) == ''.join(t['log']['text'] for t in model['tests'])
+    assert max(api.child_batches) <= 40
+
+
+@pytest.mark.parametrize('budget', [{'doc_max_blocks': 1}, {'doc_max_chars': 100},
+                                  {'block_max_chars': 100001}, {'doc_max_chars': True}])
+def test_invalid_document_capacity_fails_before_any_publish(budget):
+    with pytest.raises(result_docs.ReportError):
+        feishu_plan(_model_with_logs(), budget)

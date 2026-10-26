@@ -290,7 +290,13 @@ def render_html(model):
     return ''.join(parts) + '</html>\n'
 
 
-TEXT_ELEMENT_LIMIT = 45_000  # 本租户历史成功样本实测（90k 字符块/2 元素）；官方值核实前以此为准
+BLOCK_TEXT_LIMIT = 100_000  # Feishu Docs limits FAQ: 100,000 characters per block.
+TEXT_ELEMENT_LIMIT = 1000  # Internal runs within one block; not visible log chunks.
+
+
+def text_units(text):
+    # Count supplementary Unicode characters conservatively as two UTF-16 units.
+    return len(text.encode('utf-16-le')) // 2
 
 
 def text_block(kind, text, *, bold=False, folded=False, link=None):
@@ -298,9 +304,9 @@ def text_block(kind, text, *, bold=False, folded=False, link=None):
     style = {'bold': bold}
     if link:
         style['link'] = {'url': link}
-    # Split text runs and long code blocks without dropping any characters.
-    elements = [{'text_run': {'content': text[i:i+1000], 'text_element_style': style}}
-                for i in range(0, len(text), 1000)] or [{'text_run': {'content': ''}}]
+    # Internal text runs do not create visible code blocks.
+    elements = [{'text_run': {'content': text[i:i+TEXT_ELEMENT_LIMIT], 'text_element_style': style}}
+                for i in range(0, len(text), TEXT_ELEMENT_LIMIT)] or [{'text_run': {'content': ''}}]
     block_style = {'language': 1, 'wrap': True} if kind == 'code' else {'align': 1, 'folded': folded}
     return {'block_type': types[kind], kind: {'elements': elements, 'style': block_style}}
 
@@ -314,7 +320,7 @@ def _blocks_size(blocks):
         f = field.get(child['block_type'])
         if f:
             for e in child[f].get('elements', []):
-                n_chars += len(e.get('text_run', {}).get('content', ''))
+                n_chars += text_units(e.get('text_run', {}).get('content', ''))
     return n_blocks, n_chars
 
 
@@ -322,7 +328,7 @@ def _plan_op_size(op):
     """一个计划操作的（块数, 文本字符量）。"""
     if op['op'] == 'table':
         cells = op.get('cell_children', [])
-        blocks = 1 + sum(len(cell) for cell in cells)
+        blocks = 1 + 2 * len(cells) + sum(len(cell) for cell in cells)
         chars = sum(_blocks_size(cell)[1] for cell in cells)
         return blocks, chars
     return _blocks_size(op.get('body', {}).get('children', []))
@@ -332,126 +338,126 @@ DEFAULT_DOC_BUDGET = {'doc_max_blocks': 50, 'doc_max_chars': 500_000}
 
 
 def feishu_plan(model, budget=None):
-    """v2：按文档级预算拆主篇与续篇（用户 2026-10-26 澄清——拆分粒度是
-    文档，不是把 8000 字符分块做成产品行为；块内 8000 切分只是文本元素
-    内部细节，拼接零丢失，由发布器逐篇回读校验）。
+    """Pack complete content into bounded documents; split text only at capacity.
 
-    budget 缺省用保守值：低于本租户历史成功样本（60 块、636,744 字符/篇；
-    单块实测 ~90k 字符）。正式默认待官方限制核实后经 settings 固化；
-    单测试节超预算时独立成篇并标记 over_budget（保持该测试连续）。
+    Counts include the document root, table cells and navigation. A normal log
+    stays in one code block. The block cap is separate from document budgets.
     """
-    budget = dict(budget or DEFAULT_DOC_BUDGET)
-    max_blocks = max(int(budget.get('doc_max_blocks') or 50), 1)
-    max_chars = max(int(budget.get('doc_max_chars') or 500_000), 1)
-    operations = []
+    limits = {**DEFAULT_DOC_BUDGET, 'block_max_chars': BLOCK_TEXT_LIMIT, **(budget or {})}
+    for key, minimum in [('doc_max_blocks', 42), ('doc_max_chars', 2048),
+                         ('block_max_chars', 1)]:
+        value = limits[key]
+        if type(value) is not int or value < minimum:
+            raise ReportError(f'{key} must be an integer >= {minimum}')
+    if limits['block_max_chars'] > BLOCK_TEXT_LIMIT:
+        raise ReportError('block_max_chars exceeds the documented block limit')
+    max_blocks, max_chars = limits['doc_max_blocks'], limits['doc_max_chars']
+    stream = []
 
-    def append(blocks):
-        for i in range(0, len(blocks), 40):
-            operations.append({'op': 'append', 'parent': 'document',
-                               'body': {'index': -1, 'children': blocks[i:i+40]}})
+    def add(block, context=None):
+        stream.append(({'op': 'append', 'parent': 'document',
+                        'body': {'index': -1, 'children': [block]}}, context))
 
-    append([text_block('heading3', f"PR #{model['pr_number']}", bold=True, link=model['pr_url']),
-            text_block('text', environment_line(model))])
+    add(text_block('heading3', f"PR #{model['pr_number']}", bold=True, link=model['pr_url']))
+    add(text_block('text', environment_line(model)))
     if model['merged_at']:
-        append([text_block('text', 'Merged at: ' + model['merged_at'])])
-    operations.append({'op': 'table', 'parent': 'document',
+        add(text_block('text', 'Merged at: ' + model['merged_at']))
+    stream.append(({'op': 'table', 'parent': 'document',
         'body': {'index': -1, 'children': [{'block_type': 31,
             'table': {'property': {'row_size': 2, 'column_size': 6}}}]},
         'cell_children': [[text_block('text', value, bold=i < 6)] for i, value in enumerate(
             list(HEADERS) + [str(model['metrics'][h]) for h in HEADERS])],
-        'cell_order': 'row-major; resolve returned table.cells before appending cell_children'})
-    append([text_block('text', model['metric_note']),
-            text_block('text', '执行实例：' + count_text(model['instance_counts']))])
+        'cell_order': 'row-major'}, None))
+    add(text_block('text', model['metric_note']))
+    add(text_block('text', '执行实例：' + count_text(model['instance_counts'])))
     for warning in model['warnings']:
-        append([text_block('text', '证据提示：' + warning)])
-    header_size = sum(_plan_op_size(op)[0] for op in operations)
-    header_chars = sum(_plan_op_size(op)[1] for op in operations)
-    header_ops = operations[:]
-    operations = []
-
-    def _ops_size(ops):
-        blocks = chars = 0
-        for op in ops:
-            b, c = _plan_op_size(op)
-            blocks += b
-            chars += c
-        return blocks, chars
-
-    # 逻辑节：逐测试整节移动（一个测试不跨篇，保证连续性）。
-    # 块内元素按 TEXT_ELEMENT_LIMIT 切分（真实元素上限的租户实证值），
-    # 一个日志=一个连续块，拼接零丢失——8k 不再是产品级分块。
-    def _continuous_block(kind, text):
-        elements = [{'text_run': {'content': text[i:i + TEXT_ELEMENT_LIMIT]}}
-                    for i in range(0, len(text), TEXT_ELEMENT_LIMIT)] or [{'text_run': {'content': ''}}]
-        style = {'language': 1, 'wrap': True} if kind == 'code' else {'align': 1, 'folded': True}
-        block_type = {'text': 2, 'code': 14}[kind]
-        return {'block_type': block_type, kind: {'elements': elements, 'style': style}}
-
-    test_sections = []
+        add(text_block('text', '证据提示：' + warning))
+    add(text_block('heading4', '前后对比（基线 → 本次）', bold=True))
     for test in model['tests']:
-        section = [text_block('heading4', detail_title(test), bold=True, folded=True)]
+        add(text_block('text', f"{ICONS[test['outcome']]} {test['test_function']} [{test['device']}]：{test['comparison_text']}"))
+    for test in model['tests']:
+        label = detail_title(test)
+        add(text_block('heading4', label, bold=True, folded=True), label)
         for note in detail_notes(test):
-            section.append(_continuous_block('text', note))
-        section.append(_continuous_block('code', test['log']['text']))
-        test_sections.append((detail_title(test), section))
+            add(text_block('text', note), label)
+        add(text_block('code', test['log']['text']), label)
 
-    parts = [{'role': 'main', 'title_suffix': '', 'ops': list(header_ops),
-              'over': header_size > max_blocks or header_chars > max_chars}]
+    def split_block(block, capacity):
+        field = {2: 'text', 5: 'heading3', 6: 'heading4', 14: 'code'}[block['block_type']]
+        pieces, elements, used = [], [], 0
+        def finish():
+            result = deepcopy(block)
+            result[field]['elements'] = list(elements)
+            pieces.append(result)
+        for element in block[field]['elements']:
+            text = element.get('text_run', {}).get('content', '')
+            if not text:
+                elements.append(deepcopy(element))
+            while text:
+                if used == capacity:
+                    finish(); elements, used = [], 0
+                take = min(len(text), capacity - used)
+                while take and text_units(text[:take]) > capacity - used:
+                    take -= max(1, (text_units(text[:take]) - (capacity - used) + 1) // 2)
+                if not take:
+                    if not used:
+                        raise ReportError('Block capacity cannot hold a Unicode character')
+                    finish(); elements, used = [], 0
+                    continue
+                fragment = deepcopy(element)
+                fragment['text_run']['content'], text = text[:take], text[take:]
+                elements.append(fragment); used += text_units(fragment['text_run']['content'])
+        if elements:
+            finish()
+        return pieces
 
-    def _part_append(part, blocks_list):
-        # 节内容以一个 append 操作进入（publisher 端仍按 40 块批量上传）。
-        part['ops'].append({'op': 'append', 'parent': 'document',
-                            'body': {'index': -1, 'children': blocks_list}})
+    def pack(toc_reserve):
+        parts = [{'part_index': 0, 'role': 'main', 'title_suffix': '',
+                  'over_budget': False, 'operations': []}]
+        # Root + up to three navigation blocks. TOC uses heading + one link block.
+        used_blocks, used_chars = 4, toc_reserve
+        for operation, label in stream:
+            context = text_block('heading4', (label or model['title']) + '（续）', bold=True)
+            context_chars = _blocks_size([context])[1]
+            capacity = min(limits['block_max_chars'], max_chars - max(toc_reserve, 64) - context_chars)
+            if capacity < 1:
+                raise ReportError('Document budget is too small for continuation context')
+            if operation['op'] == 'table':
+                fragments = [operation]
+            else:
+                fragments = [{'op': 'append', 'parent': 'document',
+                              'body': {'index': -1, 'children': [block]}}
+                             for block in split_block(operation['body']['children'][0], capacity)]
+            for fragment in fragments:
+                n, chars = _plan_op_size(fragment)
+                if used_blocks + n > max_blocks or used_chars + chars > max_chars:
+                    index = len(parts)
+                    parts.append({'part_index': index, 'role': 'continuation',
+                                  'title_suffix': f'-{index}', 'over_budget': False,
+                                  'operations': [{'op': 'append', 'parent': 'document',
+                                                  'body': {'index': -1, 'children': [context]}}]})
+                    used_blocks, used_chars = 5, 64 + context_chars
+                if used_blocks + n > max_blocks or used_chars + chars > max_chars:
+                    raise ReportError('Document budget cannot hold an indivisible report component')
+                parts[-1]['operations'].append(fragment)
+                used_blocks += n; used_chars += chars
+        return parts
 
-    _part_append(parts[0], [text_block('heading4', '前后对比（基线 → 本次）', bold=True)])
-    for test in model['tests']:
-        _part_append(parts[0], [text_block('text', f"{ICONS[test['outcome']]} {test['test_function']} [{test['device']}]：{test['comparison_text']}")])
-    cur_blocks, cur_chars = _ops_size(parts[0]['ops'])
-    for label, section in test_sections:
-        blocks, chars = _blocks_size(section)
-        # 常规路径：整节放入当前篇（预算内）。
-        if (cur_blocks + blocks <= max_blocks and cur_chars + chars <= max_chars) \
-                and not (blocks > max_blocks or chars > max_chars):
-            _part_append(parts[-1], section)
-            cur_blocks += blocks
-            cur_chars += chars
-            continue
-        # 超预算节（或当前篇放不下且节本身超预算）：把节的块序列按预算
-        # 分组拆到一篇或多篇续篇（块为原子，全文零丢失），每篇带上下文头
-        # 与续篇标记，满足"单一超长测试跨篇"。
-        groups, cur, cb, cc = [], [], 0, 0
-        for block in section:
-            b, c = _blocks_size([block])
-            if cur and (cb + b > max_blocks or cc + c > max_chars):
-                groups.append(cur)
-                cur, cb, cc = [], 0, 0
-            cur.append(block)
-            cb += b
-            cc += c
-        if cur:
-            groups.append(cur)
-        total = len(groups)
-        for gi, group in enumerate(groups):
-            if gi > 0 or cur_blocks + _blocks_size(group)[0] > max_blocks \
-                    or cur_blocks + _blocks_size(group)[1] > max_chars:
-                parts.append({'role': 'continuation',
-                              'title_suffix': f'-{len(parts)}', 'ops': [], 'over': False})
-                cur_blocks, cur_chars = 0, 0
-            head = ([text_block('heading4', f'{label}（续 {gi + 1}/{total}）', bold=True, folded=True)]
-                    if gi > 0 else [])
-            _part_append(parts[-1], head + group)
-            cur_blocks, cur_chars = _blocks_size(group)
-    if len(parts) > 1:
-        parts[0]['ops'].append({'op': 'toc',
-                                'titles': [model['title'] + p['title_suffix'] for p in parts[1:]]})
-    parts_out = [{'part_index': i, 'role': ('main' if i == 0 else 'continuation'),
-                  'title_suffix': p['title_suffix'], 'over_budget': p['over'],
-                  'operations': p['ops']} for i, p in enumerate(parts)]
-    # 扁平 operations = 全部篇依序拼接：无丢失校验与旧消费方兼容。
-    flattened = [op for p in parts_out for op in p['operations']]
-    return {'schema': 'feishu-report-plan/2', 'title': model['title'],
-            'status': 'local_unpublished', 'part_count': len(parts_out),
-            'parts': parts_out, 'operations': flattened}
+    reserve = 256
+    for _ in range(12):
+        parts = pack(reserve)
+        titles = [model['title'] + p['title_suffix'] for p in parts[1:]]
+        required = 32 + sum(text_units(t) + 1 for t in titles)
+        if required <= reserve:
+            break
+        reserve = required
+    else:
+        raise ReportError('Document navigation budget did not converge')
+    if titles:
+        parts[0]['operations'].append({'op': 'toc', 'titles': titles})
+    return {'schema': 'feishu-report-plan/3', 'title': model['title'],
+            'status': 'local_unpublished', 'part_count': len(parts), 'parts': parts,
+            'budget': limits, 'operations': [op for part in parts for op in part['operations']]}
 
 
 def _atomic(path, text):
@@ -486,8 +492,9 @@ def _generate_locked(config, pr):
     root = store_paths(config).data_root / 'reports' / f'PR_{pr}'
     # Content-addressed versions preserve reruns; current.json changes last.
     version = root / fingerprint
-    fs = (config.get('feishu') or {})
-    budget = {k: fs[k] for k in ('doc_max_blocks', 'doc_max_chars') if k in fs} or None
+    fs = {**(config.get('feishu') or {}),
+          **((config.get('reports') or {}).get('feishu') or {})}
+    budget = {k: fs[k] for k in ('doc_max_blocks', 'doc_max_chars', 'block_max_chars') if k in fs} or None
     outputs = {'report.json': encoded(model), 'report.html': render_html(model),
                'feishu-plan.json': encoded(feishu_plan(model, budget))}
     changed = False
