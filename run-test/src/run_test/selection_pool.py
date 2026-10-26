@@ -93,11 +93,20 @@ class SelectionPool:
             except Exception as error:
                 self.events.put(('select_errors', 'prefilter: ' + str(error)))
         ready = len(self.store.list_tasks(STATE_PENDING_TEST))
-        allowance = min(self.capacity - len(self.running), self.prefetch_limit - ready - len(self.running))
-        for task in self.store.list_tasks(STATE_PENDING_ANALYSIS):
+        candidates = self.store.list_tasks(STATE_PENDING_ANALYSIS)
+        surviving = set()
+        for task in candidates:
+            lock = task_root(self.config, task) / '.selection.lock'
+            if task.task_id not in self.running and lock.exists():
+                with executor_lease(lock) as available:
+                    if not available:
+                        surviving.add(task.task_id)
+        occupied = len(self.running) + len(surviving)
+        allowance = min(self.capacity - occupied, self.prefetch_limit - ready - occupied)
+        for task in candidates:
             if allowance <= 0 or self.stop.is_set():
                 break
-            if task.task_id in self.running:
+            if task.task_id in self.running or task.task_id in surviving:
                 continue
             directory = task_root(self.config, task)
             try:

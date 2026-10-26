@@ -50,3 +50,7 @@ PYTHONPATH=run-test/src venv/control/bin/python -m pytest -q \
 本机 Windows 全组合有一项现有架构命名测试失败；服务器 Linux 控制环境对应测试通过。未将 Windows 结果包装为全通过。
 
 部署前逐文件校验交接哈希，备份 `data/runtime/maintenance/code-backups/codex-pipeline-20261026T150110Z-19ff7787/`。Codex 本轮只部署源码，未重启生产服务、未中断真实测试、未修改运行基线库。真实队列安全边界重载、生产实测耗时/空间回收数据、合入顺序持久化的综合验收仍待完成；未推送 GitHub。
+
+## Additional restart-boundary review
+
+A constructed coordinator-restart fixture reproduced an off-by-one prefetch limit: one surviving locked worker plus one ready task allowed another task to start. The scheduler now counts externally locked workers against both process slots and ready-plus-running capacity. The fixture failed before the change and passed afterward; all 30 isolated pipeline/executor tests passed in 3.43s. Evidence: data/runtime/maintenance/codex-pipeline-isolated-c9fce354/acceptance.log. Code backup: data/runtime/maintenance/code-backups/codex-pipeline-20261026T151145Z-fc2bf79a/. This was an isolated fixture, not a reported production incident. No service restart or hardware test was performed.

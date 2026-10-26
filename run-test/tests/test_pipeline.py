@@ -128,6 +128,21 @@ def test_prefetch_bound_includes_completed_ready_tasks(config,queue,pool_factory
     assert len(queue.list_tasks('pending_analysis'))==3
 
 
+def test_surviving_worker_counts_against_ready_plus_prefetch_bound(config,queue,pool_factory):
+    surviving=_pending_analysis_task(queue)
+    ready=_pending_analysis_task(queue)
+    queue.submit_manifest(ready.task_id,[{'test_function':TF_A,'device':'cpu'}])
+    waiting=_pending_analysis_task(queue)
+    # The OS lock represents a child surviving a previous coordinator process.
+    with executor_lease(task_staging.task_root(config,surviving)/'.selection.lock') as held:
+        assert held
+        pool,_=pool_factory()
+        assert pool.started.wait(2)
+        time.sleep(.6)
+        assert queue.get_task(waiting.task_id).state=='pending_analysis'
+        assert len(queue.list_tasks('pending_test'))==1
+
+
 def test_selection_failure_is_persistent_bounded_retry(config,queue,pool_factory):
     config['selector']={'max_failures':1}
     task=_pending_analysis_task(queue);pool,_=pool_factory(fail=True)
