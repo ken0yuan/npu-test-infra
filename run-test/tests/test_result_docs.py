@@ -11,6 +11,29 @@ from run_test.identifiers import Counts, baseline_log_filename
 from run_test.record import submit_complete_result
 from conftest import COMMIT_A, COMMIT_B, COMMIT_NPU, make_submission
 
+@pytest.fixture(autouse=True)
+def _deterministic_merge_order(monkeypatch):
+    """结果文档测试统一假定线性推进（提交按 A→B 变新）；合入序防护语义
+    本身由 test_record_flow 覆盖。真实镜像对假 commit 会返回 unknown 而
+    保守跳过刷新，导致报告与基线指纹不一致——这里替换为确定性替身。"""
+    import run_test.upstream as up
+
+    class _FakeMirror:
+        def __init__(self, config=None):
+            pass
+
+        def merge_relation(self, a, b):
+            if a == b:
+                return 'equal'
+            order = [COMMIT_A, COMMIT_B]
+            if a in order and b in order:
+                return 'a_earlier' if order.index(a) < order.index(b) else 'a_later'
+            return 'unknown'
+
+    monkeypatch.setattr(up, 'PyTorchMirror', _FakeMirror)
+
+
+
 
 def row_for(items):
     totals = {k: sum((t.get('counts') or {}).get(k, 0) for t in items) for k in docs.COUNT_KEYS}

@@ -163,10 +163,30 @@ class Submission:
     function_results: list[FunctionResult] = field(default_factory=list)
     # 本次结果对应的 PR 日志目录来源（整目录复制到 pr_logs/PR_<n>/）。
     pr_log_source_dir: str | Path | None = None
+    # main 合入时刻（ISO UTC）与来源类别（upstream-main-commit-time）。
+    # 缺失时合入序防护回退 Git 祖先关系；重试沿用已登记值。
+    merged_at: str | None = None
+    merged_at_provenance: str | None = None
 
 
 def _normalized_instance_ids(ids) -> tuple[str, ...]:
     return tuple(sorted(set(ids or ())))
+
+
+def _parse_utc(value: str | None):
+    """解析 ISO UTC 时刻；无效/缺失返回 None（调用方按不可比较处理）。"""
+    if not value or not isinstance(value, str):
+        return None
+    text = value.strip()
+    if text.endswith(('Z', 'z')):
+        text = text[:-1] + '+00:00'
+    try:
+        moment = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if moment.tzinfo is None:
+        return None  # 无时区视为无效，不做隐式本地化
+    return moment.astimezone(timezone.utc)
 
 def baseline_metadata_comparable(old_record: BaselineRecord | None, *, counts: Counts | None,
                                  coverage_status: str, instance_ids,
@@ -515,6 +535,10 @@ def _write_databases(
     diffs: list[BaselineDiff] | None = None,
     skip_keys: set | None = None,
 ) -> None:
+    old_by_key = {
+        (d.test_function, d.device): d.old_record
+        for d in (diffs or []) if d.old_record is not None
+    }
     # PR 汇总只计取得结果的函数；no_result 不产生任何计数。
     totals = Counts.sum(
         fr.counts for fr in sub.function_results if not fr.is_no_result
@@ -538,6 +562,7 @@ def _write_databases(
                 torch_npu_environment=sub.torch_npu_environment,
                 tests=tests,
                 counts=totals,
+                merged_at=sub.merged_at,
                 no_result_count=no_result_count,
                 log_path=pr_log_rel,
             ),
@@ -568,6 +593,9 @@ def _write_databases(
                 if skip_keys and (fr.test_function, fr.device) in skip_keys:
                     continue
                 _, filename = baseline_logs[(fr.test_function, fr.device)]
+                # 合入元数据：本次提交自带优先；缺失沿用旧基线值（跨重试
+                # 保持已知 merged_at，不因 None 覆盖丢失、不串到无关 commit）。
+                _old = old_by_key.get((fr.test_function, fr.device))
                 upsert_baseline(
                     conn,
                     BaselineRecord(
@@ -580,6 +608,11 @@ def _write_databases(
                         coverage_status=fr.coverage_status,
                         instance_ids=fr.instance_ids,
                         environment_fingerprint=fr.environment_fingerprint,
+                        merged_at=sub.merged_at or (_old.merged_at if _old else None),
+                        merged_at_provenance=(
+                            sub.merged_at_provenance
+                            or (_old.merged_at_provenance if _old else None)),
+                        source_pr_number=sub.pr_number,
                     ),
                 )
             conn.execute("COMMIT")
@@ -680,6 +713,7 @@ def _write_baseline_diff_archive(
             "environment_fingerprint": fr_meta.environment_fingerprint if fr_meta else None,
             "pytorch_commit": sub.pytorch_commit,
             "torch_npu_environment": sub.torch_npu_environment,
+            "merged_at": sub.merged_at,
         }
         if d.new_triage:
             after["triage"] = list(d.new_triage)
@@ -800,8 +834,10 @@ def submit_complete_result(
     # 2. 读取旧基线并对比。
     diffs = read_old_baselines(router, sub)
 
-    # 2.5 合入序防护决策（用户 2026-10-26 要求，须先于日志写入）：更早合入
-    # 的 PR 或关系未知 → 保留现有基线（DB 行与日志都不动）并留痕；
+    # 2.5 合入序防护决策（用户 2026-10-26 merged_at 方案，须先于日志写入）：
+    # 优先比较持久化的合入时刻（不查 Git）；一侧缺失/无效时回退 Git 祖先
+    # 关系（ancestry 守卫保留，时间戳路径经端到端验证前不拆除）；两种途径
+    # 都无法建立先后 → 保守保留现有基线（DB 行与日志都不动）并留痕。
     # 更晚合入 / 同 commit 重跑照常刷新；PR 结果库照常记录该次提交。
     from .upstream import PyTorchMirror
 
@@ -815,11 +851,8 @@ def submit_complete_result(
         if old is None or old.pytorch_commit == sub.pytorch_commit:
             apply_keys.add((d.test_function, d.device))
             continue
-        relation = mirror.merge_relation(sub.pytorch_commit, old.pytorch_commit)
-        if relation in ('a_later', 'equal'):
-            apply_keys.add((d.test_function, d.device))
-        else:
-            reason = 'baseline_newer' if relation == 'a_earlier' else 'relation_unknown'
+
+        def _skip(relation: str, reason: str) -> None:
             print(f"[基线跳过] ({d.test_function}, {d.device}) 与基线 commit "
                   f"{old.pytorch_commit[:10]} 关系 {relation}（{reason}），"
                   f"保留现有基线，DB 与日志均不回退", flush=True)
@@ -828,6 +861,25 @@ def submit_complete_result(
                  "baseline_commit": old.pytorch_commit,
                  "submission_commit": sub.pytorch_commit,
                  "relation": relation, "reason": reason})
+
+        sub_t = _parse_utc(sub.merged_at)
+        base_t = _parse_utc(old.merged_at)
+        if sub_t is not None and base_t is not None:
+            # 持久化合入时刻比较：不依赖实时 Git 查询。
+            if sub_t > base_t:
+                apply_keys.add((d.test_function, d.device))
+            elif sub_t < base_t:
+                _skip('submission_older', 'submission_merged_earlier')
+            else:
+                # 同刻不同 commit：无可信顺序时按歧义保守保留。
+                _skip('equal_merged_at', 'equal_merged_at_ambiguous')
+            continue
+        relation = mirror.merge_relation(sub.pytorch_commit, old.pytorch_commit)
+        if relation in ('a_later', 'equal'):
+            apply_keys.add((d.test_function, d.device))
+        else:
+            reason = 'baseline_newer' if relation == 'a_earlier' else 'relation_unknown'
+            _skip(relation, reason)
 
     # 3. 准备日志（PR 日志 + 每函数/device 基线日志；失败不破坏旧日志）。
     #    只为将刷新的行写基线日志——被防护跳过的行连日志都不覆盖。
@@ -877,3 +929,85 @@ def submit_complete_result(
             "请重放同一份完整提交以修复中断状态"
         )
     return report
+
+
+def backfill_merged_at(config) -> dict:
+    """存量行 merged_at 回填（用户 2026-10-26 方案第 3/5 条）。
+
+    - 只回填 NULL（幂等；已有值保持——跨重试不丢失、不静默改写）；
+    - 按**精确 pytorch_commit** 解析 main 历史 committer 时刻，来源
+      upstream-main-commit-time，不替代 enqueue/finish/OBS 时间；
+    - 已有值与解析值不一致记入 conflicts（保留原值，供人工核对）；
+    - 解析失败（Git 不可用/commit 不在镜像）保持 NULL 并计数；
+    - 不触碰任何 report.json/指纹——避免批量重传副作用。
+    """
+    from .baseline_store import baseline_db_path
+    from .pr_store import set_merged_at
+    from .upstream import PyTorchMirror
+
+    paths = store_paths(config)
+    mirror = PyTorchMirror(config=config)
+    stats = {"pr_backfilled": 0, "pr_kept": 0, "pr_unresolved": 0,
+             "baseline_backfilled": 0, "baseline_kept": 0, "baseline_unresolved": 0,
+             "conflicts": []}
+    cache: dict[str, str | None] = {}
+
+    def ts_for(sha: str):
+        if sha not in cache:
+            try:
+                cache[sha] = mirror.commit_timestamp(sha)
+            except Exception:
+                cache[sha] = None
+        return cache[sha]
+
+    conn = connect(pr_db_path(paths.data_root))
+    try:
+        for row in conn.execute(
+                "SELECT pr_number, pytorch_commit, merged_at FROM pr_results").fetchall():
+            if row["merged_at"]:
+                ts = ts_for(row["pytorch_commit"])
+                if ts and ts != row["merged_at"]:
+                    stats["conflicts"].append(
+                        {"scope": "pr_results", "pr_number": row["pr_number"],
+                         "existing": row["merged_at"], "resolved": ts})
+                stats["pr_kept"] += 1
+                continue
+            ts = ts_for(row["pytorch_commit"])
+            if ts is None:
+                stats["pr_unresolved"] += 1
+                continue
+            set_merged_at(conn, row["pr_number"], ts)
+            stats["pr_backfilled"] += 1
+        conn.commit()
+    finally:
+        conn.close()
+
+    router = BaselineRouter(config.get("baseline_dirs", []), paths.baselines_root)
+    for d in router.dirs:
+        conn = connect(baseline_db_path(router.managed_root(d)))
+        try:
+            for row in conn.execute(
+                    "SELECT test_function, device, pytorch_commit, merged_at "
+                    "FROM baseline").fetchall():
+                if row["merged_at"]:
+                    ts = ts_for(row["pytorch_commit"])
+                    if ts and ts != row["merged_at"]:
+                        stats["conflicts"].append(
+                            {"scope": "baseline", "test_function": row["test_function"],
+                             "device": row["device"], "existing": row["merged_at"],
+                             "resolved": ts})
+                    stats["baseline_kept"] += 1
+                    continue
+                ts = ts_for(row["pytorch_commit"])
+                if ts is None:
+                    stats["baseline_unresolved"] += 1
+                    continue
+                conn.execute(
+                    "UPDATE baseline SET merged_at = ?, merged_at_provenance = ? "
+                    "WHERE test_function = ? AND device = ?",
+                    (ts, "upstream-main-commit-time", row["test_function"], row["device"]))
+                stats["baseline_backfilled"] += 1
+            conn.commit()
+        finally:
+            conn.close()
+    return stats

@@ -20,7 +20,7 @@ from run_test.baseline_store import (
 from run_test.config import store_paths
 from run_test.db import connect
 from run_test.identifiers import Counts
-from run_test.pr_store import get_pr_result, list_pr_results
+from run_test.pr_store import get_pr_result, list_pr_results, pr_db_path
 from run_test.record import (
     FunctionResult,
     RecordError,
@@ -695,9 +695,13 @@ def test_all_no_result_submission_persists_with_zero_counts(config, router, path
 class FakeMirror:
     """按预设祖先关系应答的镜像替身；未登记关系一律 unknown（保守保留现有基线）。"""
     relations: dict = {}
+    commit_times: dict = {}
 
     def __init__(self, config=None):
         pass
+
+    def commit_timestamp(self, sha):
+        return self.commit_times.get(sha)
 
     def is_ancestor(self, older, newer):
         return bool(self.relations.get((older, newer)))
@@ -843,3 +847,133 @@ def test_merge_order_unknown_relation_preserves_baseline(config, router, paths, 
     assert log_path.read_text(encoding='utf-8') == log_before
     skipped = report.checks["baseline_skipped_merge_order"]
     assert skipped and skipped[0]["reason"] == "relation_unknown"
+
+
+# ---------------------------------------------------------------------------
+# merged_at 合入序方案（用户 2026-10-26 七条要求之测试矩阵）
+# ---------------------------------------------------------------------------
+
+def test_merged_at_timezone_equivalence_is_ambiguous(config, router, monkeypatch):
+    """时区写法不同但同刻（+08:00 与 Z）：不同 commit 视为歧义，保守保留。"""
+    import run_test.upstream as up
+    monkeypatch.setattr(up, 'PyTorchMirror', FakeMirror)
+
+    def forbidden(*a, **k):
+        raise AssertionError("同刻歧义不应触发 Git 查询")
+    monkeypatch.setattr(up.PyTorchMirror, 'merge_relation', forbidden)
+    first = make_submission(pr_number=1, pytorch_commit=COMMIT_B,
+                            merged_at="2026-10-26T12:00:00+08:00",
+                            merged_at_provenance="upstream-main-commit-time",
+                            items=[(TF_A, "cpu", Counts(3, 0, 0, 0))])
+    submit_complete_result(config, first, router)
+    same_instant = make_submission(pr_number=2, pytorch_commit=COMMIT_A,
+                                   merged_at="2026-10-26T04:00:00Z",
+                                   merged_at_provenance="upstream-main-commit-time",
+                                   items=[(TF_A, "cpu", Counts(9, 0, 0, 0))])
+    report = submit_complete_result(config, same_instant, router)
+    rec = _baseline(router, TF_A, "cpu")
+    assert rec.pytorch_commit == COMMIT_B and rec.counts == Counts(3, 0, 0, 0)
+    assert report.checks["baseline_skipped_merge_order"][0]["reason"] == "equal_merged_at_ambiguous"
+
+
+def test_merged_at_newer_applies_without_git_query(config, router, monkeypatch):
+    """两侧均有可信合入时刻：正常执行不触发实时 Git 祖先查询。"""
+    import run_test.upstream as up
+    monkeypatch.setattr(up, 'PyTorchMirror', FakeMirror)
+
+    def forbidden(self, a, b):
+        raise AssertionError("时间戳路径不应做 Git 祖先查询")
+    monkeypatch.setattr(up.PyTorchMirror, 'merge_relation', forbidden)
+    first = make_submission(pr_number=1, pytorch_commit=COMMIT_A,
+                            merged_at="2026-10-26T01:00:00Z",
+                            merged_at_provenance="upstream-main-commit-time",
+                            items=[(TF_A, "cpu", Counts(1, 0, 0, 0))])
+    submit_complete_result(config, first, router)
+    second = make_submission(pr_number=2, pytorch_commit=COMMIT_B,
+                             merged_at="2026-10-26T02:00:00Z",
+                             merged_at_provenance="upstream-main-commit-time",
+                             items=[(TF_A, "cpu", Counts(2, 0, 0, 0))])
+    report = submit_complete_result(config, second, router)
+    assert _baseline(router, TF_A, "cpu").pytorch_commit == COMMIT_B
+    assert report.checks["baseline_skipped_merge_order"] == []
+
+
+def test_merged_at_invalid_falls_back_then_preserves(config, router, monkeypatch):
+    """提交侧 merged_at 无效：回退 Git 祖先；关系不可判 → 保留基线并留痕。"""
+    import run_test.upstream as up
+    monkeypatch.setattr(up, 'PyTorchMirror', FakeMirror)
+    first = make_submission(pr_number=1, pytorch_commit=COMMIT_B,
+                            merged_at="2026-10-26T02:00:00Z",
+                            items=[(TF_A, "cpu", Counts(3, 0, 0, 0))])
+    submit_complete_result(config, first, router)
+    FakeMirror.relations = {}  # Git 关系不可判
+    bad = make_submission(pr_number=2, pytorch_commit=COMMIT_A,
+                          merged_at="not-a-timestamp",
+                          items=[(TF_A, "cpu", Counts(9, 9, 9, 9))])
+    report = submit_complete_result(config, bad, router)
+    rec = _baseline(router, TF_A, "cpu")
+    assert rec.pytorch_commit == COMMIT_B and rec.counts == Counts(3, 0, 0, 0)
+    assert report.checks["baseline_skipped_merge_order"][0]["reason"] == "relation_unknown"
+
+
+def test_merged_at_older_submission_skipped(config, router, monkeypatch):
+    """提交合入时刻早于基线：行与日志都不回退（时间戳路径）。"""
+    import run_test.upstream as up
+    monkeypatch.setattr(up, 'PyTorchMirror', FakeMirror)
+    monkeypatch.setattr(up.PyTorchMirror, 'merge_relation',
+                        lambda self, a, b: (_ for _ in ()).throw(
+                            AssertionError("时间戳可判时不查 Git")))
+    first = make_submission(pr_number=2, pytorch_commit=COMMIT_B,
+                            merged_at="2026-10-26T05:00:00Z",
+                            items=[(TF_A, "cpu", Counts(5, 0, 0, 0))])
+    submit_complete_result(config, first, router)
+    earlier = make_submission(pr_number=1, pytorch_commit=COMMIT_A,
+                              merged_at="2026-10-26T01:00:00Z",
+                              items=[(TF_A, "cpu", Counts(1, 1, 1, 1))])
+    report = submit_complete_result(config, earlier, router)
+    rec = _baseline(router, TF_A, "cpu")
+    assert rec.pytorch_commit == COMMIT_B and rec.counts == Counts(5, 0, 0, 0)
+    assert report.checks["baseline_skipped_merge_order"][0]["reason"] == "submission_merged_earlier"
+
+
+def test_rerun_without_merged_at_preserves_known_value(config, router, monkeypatch):
+    """同 commit 重跑且提交未带 merged_at：沿用基线已知值，不因 None 丢失。"""
+    import run_test.upstream as up
+    monkeypatch.setattr(up, 'PyTorchMirror', FakeMirror)
+    first = make_submission(pr_number=1, pytorch_commit=COMMIT_A,
+                            merged_at="2026-10-26T01:00:00Z",
+                            merged_at_provenance="upstream-main-commit-time",
+                            items=[(TF_A, "cpu", Counts(1, 0, 0, 0))])
+    submit_complete_result(config, first, router)
+    rerun = make_submission(pr_number=1, pytorch_commit=COMMIT_A,
+                            items=[(TF_A, "cpu", Counts(2, 2, 2, 2))])
+    submit_complete_result(config, rerun, router)
+    rec = _baseline(router, TF_A, "cpu")
+    assert rec.merged_at == "2026-10-26T01:00:00Z"
+    assert rec.merged_at_provenance == "upstream-main-commit-time"
+
+
+def test_backfill_merged_at_idempotent_and_kept(config, router, monkeypatch, paths):
+    """回填：只填 NULL、幂等；已有值不一致记 conflict 不覆盖。"""
+    import run_test.upstream as up
+    from run_test.record import backfill_merged_at
+    monkeypatch.setattr(up, 'PyTorchMirror', FakeMirror)
+    sub = make_submission(pr_number=1, pytorch_commit=COMMIT_A,
+                          items=[(TF_A, "cpu", Counts(1, 0, 0, 0))])
+    submit_complete_result(config, sub, router)
+    FakeMirror.commit_times = {COMMIT_A: "2026-10-26T01:00:00+00:00"}
+    stats = backfill_merged_at(config)
+    assert stats["pr_backfilled"] == 1 and stats["baseline_backfilled"] == 1
+    again = backfill_merged_at(config)
+    assert again["pr_backfilled"] == 0 and again["pr_kept"] == 1  # 幂等
+    # 已有值与解析值不一致：保留原值并记 conflict。
+    FakeMirror.commit_times[COMMIT_A] = "2026-10-26T09:00:00+00:00"
+    conflicted = backfill_merged_at(config)
+    assert conflicted["pr_backfilled"] == 0
+    assert conflicted["conflicts"] and conflicted["conflicts"][0]["scope"] == "pr_results"
+    conn = connect(pr_db_path(paths.data_root))
+    try:
+        row = get_pr_result(conn, 1)
+    finally:
+        conn.close()
+    assert row.merged_at == "2026-10-26T01:00:00+00:00"  # 未被覆盖

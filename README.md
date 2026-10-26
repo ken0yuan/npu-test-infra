@@ -58,6 +58,11 @@ bash start.sh stop
 
 `start.sh` 管理 watchdog、cycle、pipeline、bug_monitor、brief 五常驻。服务日志在 `data/service/`，简报在 `data/logs/简报.log`。`run.sh` 是业务命令入口；`verify.sh` 运行工具回归和四场景隔离验收，输出在 `data/validation/`。
 
+基线合入序保护（2026-10-26）：结果提交自带 `merged_at`（来源
+`upstream-main-commit-time`，任务登记时持久化），提交前与基线的合入时刻
+比较——更早提交保留现有基线（行与日志均不回退）并留痕；时刻缺失/无效/
+同刻歧义时回退 Git 祖先关系，仍不可得则保守保留。存量行回填：
+`bash run.sh merged-at-backfill`（先备份、只填 NULL、幂等、不触发报告刷新）。
 结果库为 `data/runtime/pr_results.db`，基线位于 `data/runtime/baselines/`，队列位于 `data/runtime/queue/`。同 PR 重跑替换当前结果，保留历史日志；`no_result` 不推动基线；`done` 表示任务处理结束，不等于测试通过。
 
 ## 基线刷新与回滚

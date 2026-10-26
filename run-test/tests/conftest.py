@@ -64,6 +64,8 @@ def make_submission(
     pytorch_commit: str = COMMIT_A,
     items: list[tuple[str, str, Counts]] | None = None,
     pr_log_source_dir: Path | None = None,
+    merged_at: str | None = None,
+    merged_at_provenance: str | None = None,
 ) -> Submission:
     """构造一份完整提交；items 为 (test_function, device, counts) 列表。"""
     if items is None:
@@ -81,6 +83,8 @@ def make_submission(
             "location": "test-env",
             "torch_npu_commit": COMMIT_NPU,
         },
+        merged_at=merged_at,
+        merged_at_provenance=merged_at_provenance,
         function_results=[
             FunctionResult(
                 test_function=tf, device=dev, counts=counts,

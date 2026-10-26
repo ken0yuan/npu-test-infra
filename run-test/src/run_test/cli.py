@@ -544,6 +544,42 @@ def cmd_upstream(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_merged_at_backfill(args: argparse.Namespace) -> int:
+    """merged_at 回填：先做 DB 备份，再按精确 commit 幂等回填（只填 NULL）。"""
+    import sqlite3
+    from datetime import datetime as _dt, timezone as _tz
+
+    from .baseline_store import baseline_db_path
+    from .config import store_paths
+    from .db import connect as _connect
+    from .record import backfill_merged_at
+
+    config = _load_config(args.config)
+    paths = store_paths(config)
+    stamp = _dt.now(_tz.utc).strftime("%Y%m%dT%H%M%SZ")
+    backup_root = paths.data_root / "merged-at-backups" / stamp
+    backup_root.mkdir(parents=True, exist_ok=True)
+    router = BaselineRouter(config.get("baseline_dirs", []), paths.baselines_root)
+    targets = [paths.queue_db, paths.pr_db]
+    targets += [baseline_db_path(router.managed_root(d)) for d in router.dirs]
+    for src in targets:
+        if Path(src).is_file():
+            src_conn = _connect(src)
+            try:
+                dst = backup_root / Path(src).name
+                dst_conn = sqlite3.connect(dst)
+                try:
+                    src_conn.backup(dst_conn)
+                finally:
+                    dst_conn.close()
+            finally:
+                src_conn.close()
+    report = backfill_merged_at(config)
+    report["backup"] = str(backup_root)
+    print(json.dumps(report, ensure_ascii=False, indent=2))
+    return 0
+
+
 def cmd_config_show(args: argparse.Namespace) -> int:
     config = _load_config(args.config)
     print(json.dumps(config, ensure_ascii=False, indent=2))
@@ -736,6 +772,9 @@ def build_parser() -> argparse.ArgumentParser:
     sr.add_argument("--input", required=True, help="提交 JSON 文件路径")
 
     sub.add_parser("config", help="显示当前配置")
+    mab = sub.add_parser("merged-at-backfill",
+                         help="存量 PR/基线行 merged_at 回填（只填 NULL，先备份，不触发报告刷新）")
+    mab.set_defaults(func=cmd_merged_at_backfill)
 
     return p
 

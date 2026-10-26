@@ -185,6 +185,21 @@ class PyTorchMirror:
         )
         return anc.returncode == 0
 
+    def commit_timestamp(self, sha: str) -> str | None:
+        """main 历史上该 commit 的 committer 时间（ISO UTC）。
+
+        land bot 以 squash merge 落 main，该时刻即合入时刻；来源记录为
+        upstream-main-commit-time。解析失败/对象不存在返回 None。
+        """
+        try:
+            out = _git(self.git_dir, ["log", "-1", "--format=%ct", sha])
+        except UpstreamError:
+            return None  # git 不可用/对象缺失：时间未知，调用方保守处理
+        line = out.strip().splitlines()[-1] if out.strip() else ""
+        if not line.isdigit():
+            return None
+        return datetime.fromtimestamp(int(line), tz=timezone.utc).isoformat()
+
     def resolve_full_sha(self, short: str) -> str | None:
         """把短 sha 解析为完整 sha（歧义或不存在返回 None）。"""
         proc = subprocess.run(
@@ -396,6 +411,11 @@ def run_cycle(
             row["sha"], state="queued", task_id=task.task_id,
             note=f"对象齐全，已入队（wheels@{wheels_meta.get('last_modified')}）",
         )
+        # 任务级合入时刻持久化（upstream-main-commit-time）：提交侧基线
+        # 合入序比较优先用它，避免每次提交做实时 Git 祖先查询。
+        if row.get("commit_time"):
+            queue.set_task_merged_at(task.task_id, row["commit_time"],
+                                     "upstream-main-commit-time")
         report.enqueued.append(
             {
                 "task_id": task.task_id,

@@ -43,6 +43,11 @@ CREATE TABLE IF NOT EXISTS baseline (
     error_count           INTEGER NOT NULL CHECK (error_count >= 0),
     skip_count            INTEGER NOT NULL CHECK (skip_count  >= 0),
     log_path              TEXT    NOT NULL,
+    -- 合入序元数据（用户 2026-10-26 merged_at 方案）：基线来源 PR 与
+    -- 其 main 合入时刻（provenance 记录来源类别，如 upstream-main-commit-time）。
+    merged_at             TEXT,
+    merged_at_provenance  TEXT,
+    source_pr_number      INTEGER,
     PRIMARY KEY (test_function, device)
 );
 """
@@ -74,6 +79,9 @@ class BaselineRecord:
     coverage_status: str = "unknown"
     instance_ids: tuple[str, ...] = ()
     environment_fingerprint: dict | None = None
+    merged_at: str | None = None
+    merged_at_provenance: str | None = None
+    source_pr_number: int | None = None
 
 
 class BaselineRouter:
@@ -152,6 +160,9 @@ def ensure_baseline_db(managed_root: Path) -> Path:
             "coverage_status": "ALTER TABLE baseline ADD COLUMN coverage_status TEXT NOT NULL DEFAULT 'unknown'",
             "instance_ids": "ALTER TABLE baseline ADD COLUMN instance_ids TEXT NOT NULL DEFAULT '[]'",
             "environment_fingerprint": "ALTER TABLE baseline ADD COLUMN environment_fingerprint TEXT",
+            "merged_at": "ALTER TABLE baseline ADD COLUMN merged_at TEXT",
+            "merged_at_provenance": "ALTER TABLE baseline ADD COLUMN merged_at_provenance TEXT",
+            "source_pr_number": "ALTER TABLE baseline ADD COLUMN source_pr_number INTEGER",
         }
         for name, sql in migrations.items():
             if name not in cols:
@@ -213,8 +224,9 @@ def upsert_baseline(conn: sqlite3.Connection, record: BaselineRecord) -> None:
         INSERT OR REPLACE INTO baseline
             (test_function, device, pytorch_commit, torch_npu_environment,
              pass_count, fail_count, error_count, skip_count, log_path,
-             coverage_status, instance_ids, environment_fingerprint)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             coverage_status, instance_ids, environment_fingerprint,
+             merged_at, merged_at_provenance, source_pr_number)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             record.test_function,
@@ -229,6 +241,9 @@ def upsert_baseline(conn: sqlite3.Connection, record: BaselineRecord) -> None:
             record.coverage_status,
             json.dumps(list(record.instance_ids), ensure_ascii=False),
             json.dumps(record.environment_fingerprint, ensure_ascii=False) if record.environment_fingerprint is not None else None,
+            record.merged_at,
+            record.merged_at_provenance,
+            record.source_pr_number,
         ),
     )
 
@@ -249,6 +264,9 @@ def row_to_record(row: sqlite3.Row) -> BaselineRecord:
         coverage_status=row["coverage_status"] if "coverage_status" in row.keys() else "unknown",
         instance_ids=tuple(json.loads(row["instance_ids"] or "[]")) if "instance_ids" in row.keys() else (),
         environment_fingerprint=(json.loads(row["environment_fingerprint"]) if "environment_fingerprint" in row.keys() and row["environment_fingerprint"] else None),
+        merged_at=(row["merged_at"] if "merged_at" in row.keys() else None),
+        merged_at_provenance=(row["merged_at_provenance"] if "merged_at_provenance" in row.keys() else None),
+        source_pr_number=(row["source_pr_number"] if "source_pr_number" in row.keys() else None),
     )
 
 

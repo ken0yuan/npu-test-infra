@@ -210,7 +210,8 @@ class TestExecutorGate:
             return list(range(8)), ""
 
         runner = FakeRunner()
-        assert self._executor(config, queue, probe, runner).run_once().outcome == "done"
+        outcome = self._executor(config, queue, probe, runner).run_once()
+        assert outcome.outcome == "done", f"detail={outcome.detail!r}"
         assert calls["n"] == 0
 
 

@@ -774,6 +774,20 @@ class Executor:
         location = task.torch_npu_location or (
             wheel_name.name if wheel_name else "unknown"
         )
+        # 合入时刻：任务已登记的优先；缺失时解析一次（Git 不可用则 None，
+        # 防护回退祖先关系），并持久化回任务供重测沿用。
+        merged_at = task.merged_at
+        provenance = task.merged_at_provenance
+        if not merged_at:
+            try:
+                from .upstream import PyTorchMirror
+                merged_at = PyTorchMirror(config=self.config).commit_timestamp(
+                    task.pytorch_commit)
+                provenance = 'upstream-main-commit-time' if merged_at else None
+            except Exception:
+                merged_at = provenance = None
+            if merged_at:
+                self.queue.set_task_merged_at(task.task_id, merged_at, provenance)
         return Submission(
             pr_number=task.pr_number,
             pytorch_commit=task.pytorch_commit,
@@ -783,6 +797,8 @@ class Executor:
             },
             function_results=results,
             pr_log_source_dir=pr_log_dir,
+            merged_at=merged_at,
+            merged_at_provenance=provenance,
         )
 
     def _persist_with_retry(self, task: q.Task, submission: Submission) -> SubmitReport:

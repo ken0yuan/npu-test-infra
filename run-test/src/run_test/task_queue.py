@@ -236,6 +236,8 @@ class Task:
     identity_rule_id: str | None = None
     identity_evidence: dict | None = None
     identity_verified_at: str | None = None
+    merged_at: str | None = None
+    merged_at_provenance: str | None = None
     analysis_output: str | None = None
     test_manifest: list[dict] | None = None
     work_dir: str | None = None
@@ -279,6 +281,8 @@ def _row_to_task(row: sqlite3.Row) -> Task:
         identity_rule_id=row["identity_rule_id"],
         identity_evidence=json.loads(evidence) if evidence else None,
         identity_verified_at=row["identity_verified_at"],
+        merged_at=(row["merged_at"] if "merged_at" in row.keys() else None),
+        merged_at_provenance=(row["merged_at_provenance"] if "merged_at_provenance" in row.keys() else None),
         analysis_output=row["analysis_output"],
         test_manifest=json.loads(manifest) if manifest else None,
         work_dir=row["work_dir"],
@@ -370,6 +374,8 @@ class QueueStore:
         "tasks": {
             "obs_wheels_npu_url": "TEXT",
             "obs_wheels_npu_version": "TEXT",
+            "merged_at": "TEXT",
+            "merged_at_provenance": "TEXT",
         },
     }
 
@@ -968,6 +974,22 @@ class QueueStore:
                 "INSERT OR REPLACE INTO mirror_state (id, repo_url, last_tip, last_fetch_at) "
                 "VALUES (1, ?, ?, ?)",
                 (repo_url, tip, _now()),
+            )
+        finally:
+            conn.close()
+
+    def set_task_merged_at(self, task_id: str, merged_at: str | None,
+                           provenance: str | None = None) -> None:
+        """登记任务的 main 合入时刻（upstream-main-commit-time 等来源）。
+
+        merged_at 供提交侧基线合入序比较使用；重测/重试沿用已登记值，
+        不随执行过程改写。"""
+        conn = self._connect()
+        try:
+            conn.execute(
+                "UPDATE tasks SET merged_at = ?, merged_at_provenance = ?, "
+                "updated_at = ? WHERE task_id = ?",
+                (merged_at, provenance, _now(), task_id),
             )
         finally:
             conn.close()
