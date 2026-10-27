@@ -1,4 +1,4 @@
-"""从已合入 main 的 PR commit 产出 ≤15 个具体测试用例的选择器。
+"""从已合入 main 的 PR commit 选择有作用域身份的测试候选。
 
 移植自用户指定的筛选器 ~/pytorch-commit-pre-check/scripts/（2026-09-17）：
 ``detect_test_impact.py`` 的 P0/P1 证据分级 + ``cpp_test_selection.py`` 的
@@ -29,9 +29,9 @@ C++ 候选与 ``finalize_plan`` 全局预算（15 上限）。选择语义与原
   analysis_gaps。
 - 测试服务器不构建 C++（无 build/bin），gtest 候选无法本地枚举，按原
   降级路径转入 ci_recommendations。
-- Python 家族展开的解释器默认取 ``executor.test_python_env``；发现失败
-  （环境问题）静态回退 family 节点（score 打 50 分折），记 analysis_gaps，
-  不阻塞其余选择。
+- 生产控制环境只选源码 family，不导入测试或接触执行器正在换包的环境。
+  当前 PR 安装完成后，Executor 用真实解释器、源码、设备收集运行节点；
+  未收集的 family 不标成具体 case。独立调用仍可显式要求建议性动态发现。
 - ``plan_to_manifest`` 把结论桥接为队列清单（``test/x.py::Class::func``
   + device）；清单层只允许一级类名与固定 device 字面值，放不下的节点
   记入 manifest_skipped。
@@ -279,6 +279,7 @@ class TestVisitor(ast.NodeVisitor):
         self.info = TestInfo(path="")
         self.test_stack: list[str] = []
         self.class_stack: list[str] = []
+        self.function_depth = 0
 
     def visit_ClassDef(self, node: ast.ClassDef) -> Any:
         self.class_stack.append(node.name)
@@ -310,13 +311,17 @@ class TestVisitor(ast.NodeVisitor):
         self.generic_visit(node)
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> Any:
-        is_test = node.name.startswith("test")
+        # Nested helpers belong to their enclosing test's references, not to
+        # the module/class namespace collected by pytest or unittest.
+        is_test = self.function_depth == 0 and node.name.startswith("test")
         if is_test:
             name = ".".join([*self.class_stack, node.name])
             self.test_stack.append(name)
             start = min([node.lineno] + [d.lineno for d in node.decorator_list])
             self.info.test_nodes[name] = (start, node.end_lineno or node.lineno)
+        self.function_depth += 1
         self.generic_visit(node)
+        self.function_depth -= 1
         if is_test:
             self.test_stack.pop()
 
@@ -813,7 +818,7 @@ def add_cpp_candidates(tree_root: Path, report: dict, changed_paths: list[str], 
 
 def finalize_plan(tree_root: Path, report: dict, limit: int, timeout: int, pr_text: str = "",
                   interpreter: str | None = None, discovery_env: dict[str, str] | None = None,
-                  discovery_cwd: Path | None = None) -> None:
+                  discovery_cwd: Path | None = None, *, defer_runtime_discovery: bool = False) -> None:
     """展开 Python 家族为具体用例，再应用一个全局预算。
 
     发现进程失败时保留静态源码身份并降低优先级；它不是可直接执行的 nodeid。
@@ -837,13 +842,16 @@ def finalize_plan(tree_root: Path, report: dict, limit: int, timeout: int, pr_te
             else:
                 if path not in cache:
                     try:
+                        if defer_runtime_discovery:
+                            raise RuntimeError("runtime discovery deferred until this PR's wheels are installed")
                         if discovery_env is None and discovery_cwd is None:
                             cache[path] = discover_cases(tree_root, [python, path, "--discover-tests"], timeout, cpp=False)
                         else:
                             cache[path] = discover_cases(tree_root, [python, path, "--discover-tests"], timeout, cpp=False, env=discovery_env, cwd=discovery_cwd)
                     except RuntimeError as error:
                         cache[path] = str(error)
-                        report["analysis_gaps"].append({"path": path, "reason": str(error)})
+                        if not defer_runtime_discovery:
+                            report["analysis_gaps"].append({"path": path, "reason": str(error)})
                 discovered = cache[path]
                 # setdefault(path, parse(...)) evaluates parse for EVERY case.
                 # Native path matching can emit thousands of entries per file.
@@ -870,8 +878,11 @@ def finalize_plan(tree_root: Path, report: dict, limit: int, timeout: int, pr_te
                 key = (path, node)
                 item = {**entry, "kind": entry.get("kind", "python"), "test_nodes": [node], "evidence": list(entry["evidence"])}
                 if is_static:
-                    item["score"] = max(item.get("score", 0) - 50, 0)
-                    item["evidence"].append({"type": "static_fallback_after_discovery_failure"})
+                    item["execution_mode"] = "resolve_family"
+                    if not defer_runtime_discovery:
+                        item["score"] = max(item.get("score", 0) - 50, 0)
+                    item["evidence"].append({"type": "source_family_pending_runtime_collection" if defer_runtime_discovery
+                                             else "static_fallback_after_discovery_failure"})
                 if mentioned(pr_text, node) or mentioned(pr_text, node.replace(".", "::")):
                     item["score"] = max(item.get("score", 0), 200)
                     item["evidence"].append({"type": "mentioned_in_pr", "match": node})
@@ -901,11 +912,14 @@ def finalize_plan(tree_root: Path, report: dict, limit: int, timeout: int, pr_te
         else:
             report["deferred_tests"].append({**item, "priority": priority.upper(), "reason": f"exceeds the global {limit}-case budget"})
     report["unresolved_tests"] = unresolved
-    report["selection_granularity"] = "case"
+    unresolved_families = any(item.get("execution_mode") == "resolve_family"
+                              for item in report["p0"] + report["p1"])
+    report["selection_granularity"] = "family" if unresolved_families else "case"
     report["max_tests"] = limit
     report["candidate_count"] = len(ranked)
     report["selected_count"] = min(len(ranked), limit)
-    report["notes"].append("The budget counts concrete cases; deferred and unresolved tests are not covered by this local run.")
+    report["notes"].append("Budget includes source families awaiting runtime collection; these are not verified cases."
+                           if unresolved_families else "The budget counts concrete cases; deferred and unresolved tests are not covered by this local run.")
     report["discovery_environment"] = {
         "interpreter": python,
         "cwd": str(discovery_cwd or tree_root),
@@ -913,6 +927,7 @@ def finalize_plan(tree_root: Path, report: dict, limit: int, timeout: int, pr_te
         "device_filter": (discovery_env or {}).get("PYTORCH_TESTING_DEVICE_ONLY_FOR", "none"),
         "verified_against_execution": False,
         "verification_note": "selection-time discovery is advisory; Executor re-discovers in the installed runtime",
+        "mode": "source_families" if defer_runtime_discovery else "advisory_collection",
     }
 
 
@@ -937,6 +952,7 @@ def select_for_commit(
     interpreter: str | None = None,
     discovery_env: dict[str, str] | None = None,
     discovery_cwd: Path | None = None,
+    defer_runtime_discovery: bool = False,
 ) -> dict[str, Any]:
     """镜像 diff + OBS 源码树 → finalize 后的完整计划（与原 plan JSON 兼容）。
 
@@ -964,7 +980,8 @@ def select_for_commit(
     if native:
         # PR 正文来自镜像 %B（调用方拼好）；缺失降级与原实现一致。
         add_cpp_candidates(tree_root, report, native, tests, text, max(collect_timeout, 1))
-    finalize_plan(tree_root, report, max(max_tests, 1), max(collect_timeout, 1), text, interpreter, discovery_env, discovery_cwd)
+    finalize_plan(tree_root, report, max(max_tests, 1), max(collect_timeout, 1), text, interpreter, discovery_env, discovery_cwd,
+                  defer_runtime_discovery=defer_runtime_discovery)
     return report
 
 
@@ -1018,6 +1035,8 @@ def plan_to_manifest(
                 if existing is None:
                     seen.add(key)
                     entry = {"test_function": tf, "device": dev}
+                    if item.get("execution_mode"):
+                        entry["execution_mode"] = item["execution_mode"]
                     if runtime_tf != tf:
                         entry.update({"source_test_function": tf, "runtime_nodeid": runtime_tf,
                                       "device_basis": "ast_or_collected_variant"})

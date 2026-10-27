@@ -305,6 +305,7 @@ def test_selection_body_source_reuse_isolation_and_progress(config,queue,monkeyp
     assert dl.calls.count(WHEELS_URL)==1
     assert captured['interpreter']==sys.executable
     assert captured['interpreter']!=config['executor']['test_python_env']
+    assert captured['defer_runtime_discovery'] is True
     progress=json.loads((task_staging.task_root(config,task)/'progress.json').read_text())
     assert progress['stage']=='complete' and 'test_selection' in progress['stage_seconds']
     assert queue.get_task(task.task_id).state=='pending_test'

@@ -183,10 +183,8 @@ def _run_selection_body(
         or (config.get("selector") or {}).get("python_env")
         or _sys.executable
     )
-    # P1-1：选端发现注入 boot（不设 ONLY_FOR，三通道变体都要）。
-    # Discovery may fall back to static identities; execution expands them using
-    # the task's installed environment. Never install into or collect in the
-    # active executor environment while it may be changing for another task.
+    # The control interpreter selects source families only. Real collection is
+    # deferred to the installed task environment; never race a wheel change.
     active_python = (config.get('executor') or {}).get('test_python_env')
     if active_python and os.path.abspath(interpreter) == os.path.abspath(active_python):
         raise ValueError('selector.python_env must be independent of executor.test_python_env')
@@ -199,6 +197,9 @@ def _run_selection_body(
         collect_timeout=collect_timeout,
         interpreter=interpreter,
         discovery_env=discovery_env,
+        # The control interpreter deliberately has no mutable PR installation.
+        # Resolve real nodes once, after Executor installs this task's wheels.
+        defer_runtime_discovery=True,
     )
     from .device_detect import make_device_resolver
     from .device_policy import ExecutionDeviceResolver, configured_devices

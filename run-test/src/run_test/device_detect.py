@@ -449,10 +449,17 @@ def _variant_identity(source: str, class_name: str, method: str, declared=None) 
         return None
     base_class, token = class_name, None
     if class_name not in declared:
-        match = re.match(r"^(.*?)(?:DeviceType)?(CUDA|CPU|PRIVATEUSE1|XPU|NPU)$", class_name, re.I)
-        if not match:
+        from .identifiers import class_variant_match
+        owners = [name for name in declared if name and class_variant_match(name, class_name)]
+        if not owners:
             return None
-        base_class, token = match.group(1), match.group(2).upper()
+        # TestNNDeviceTypeCPU derives from TestNNDeviceType, not TestNN.
+        # Resolve the longest real declaration before interpreting its suffix.
+        base_class = max(owners, key=len)
+        suffix = class_name[len(base_class):]
+        if suffix.lower().startswith('devicetype'):
+            suffix = suffix[10:]
+        token = suffix.upper()
     methods = declared.get(base_class, set())
     if class_name == base_class and method in methods:
         return None
@@ -505,7 +512,7 @@ class DeviceResolver:
                 variant_device = {"CUDA": DEVICE_CUDA, "CPU": DEVICE_CPU,
                                   "PRIVATEUSE1": DEVICE_ACCELERATOR,
                                   "NPU": DEVICE_ACCELERATOR,
-                                  "XPU": "xpu"}[variant_token]
+                                  "XPU": "xpu"}.get(variant_token, variant_token.lower())
             cls, method = base_cls, base_method
             result = classify_function(source, cls or None, method)
             if variant_device is not None:

@@ -255,7 +255,7 @@ target = pathlib.Path(sys.argv[1]).resolve()
 rc = pytest.main(sys.argv[1:])
 origins = {}
 source_info = {}
-def remember(key, value):
+def remember(key, value, owner=None):
     try:
         if isinstance(value, (classmethod, staticmethod)):
             value = value.__func__
@@ -282,6 +282,9 @@ def remember(key, value):
             required = None
         origins[key] = {"name": getattr(original, "__name__", ""),
                         "qualname": getattr(original, "__qualname__", ""),
+                        "source_file": getattr(getattr(original, "__code__", None), "co_filename", None),
+                        "declared_device": getattr(owner, "device_type", getattr(owner, "device", None))
+                            if isinstance(getattr(owner, "device_type", getattr(owner, "device", None)), str) else None,
                         "required_npu_cards": required}
     except (AttributeError, TypeError, ValueError, OSError):
         origins[key] = {"name": "", "qualname": ""}
@@ -293,7 +296,7 @@ for module in tuple(sys.modules.values()):
         if inspect.isclass(value):
             for method in dir(value):
                 if method.startswith("test"):
-                    remember(name + "::" + method, inspect.getattr_static(value, method))
+                    remember(name + "::" + method, inspect.getattr_static(value, method), value)
         elif name.startswith("test") and callable(value):
             remember(name, value)
 print("\nRUN_TEST_ORIGINS=" + json.dumps(origins, sort_keys=True))
@@ -433,15 +436,28 @@ class PytestRunner:
             method = parts[-1].split("[", 1)[0]
             if len(parts) not in (2, 3):
                 continue
-            if source_class != cls:
+            key = "::".join([cls, method]) if cls else method
+            origin = (origins or {}).get(key, {})
+            # Copied template methods can have entirely different runtime class
+            # names. Trust exact unwrapped ownership in this source file, not a
+            # shared method name or an unrelated class prefix.
+            source_qualname = f"{source_class}.{source_method}" if source_class else source_method
+            origin_file = origin.get("source_file")
+            template_origin = (bool(source_class) and source_method in declared.get(source_class, set())
+                               and origin.get("qualname") == source_qualname
+                               and bool(origin_file)
+                               and Path(origin_file).resolve() == (root / 'test' / rel_file).resolve())
+            backend = origin.get('declared_device')
+            if template_origin and backend in {'cpu', 'cuda', 'mps', 'npu', 'privateuse1', 'xpu'}:
+                if backend not in ({'cpu'} if dev == 'cpu' else {'npu', 'privateuse1'}):
+                    continue
+            if source_class != cls and not template_origin:
                 if not source_class or not class_variant_match(source_class, cls) or cls in declared:
                     continue
             if origins is None:
                 # Supports collection adapters without reflection metadata.
                 matches = declared_node_match(declared, source_class, source_method, cls, method)
             else:
-                key = "::".join([cls, method]) if cls else method
-                origin = origins.get(key, {})
                 # Exact runtime identities are valid too (explicit selected samples).
                 matches = method == source_method or origin.get("name") == source_method
             if matches:

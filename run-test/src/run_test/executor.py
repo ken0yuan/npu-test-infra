@@ -775,6 +775,20 @@ class Executor:
                 runtime_nodes = [tf]
             families.append((item, runtime_nodes, family_complete))
 
+        # Keep canonical source identities for baseline compatibility. Actual
+        # execution identities are explicit and separately named per channel.
+        resolved_manifest = [
+            {"test_function": item["test_function"], "device": item["device"],
+             "execution_name": item["device"] + "::" + node,
+             "runtime_nodeid": node, "family_complete": complete}
+            for item, nodes, complete in families for node in nodes
+        ]
+        from .task_staging import atomic_json
+        atomic_json(self.paths.diagnostics_root / task.task_id / 'execution-manifest.json',
+                    {"task_id": task.task_id, "pytorch_commit": task.pytorch_commit,
+                     "interpreter": getattr(self.runner, 'python_env', None),
+                     "verified_against_execution": hasattr(self.runner, 'discover_runtime_nodes'),
+                     "items": resolved_manifest})
         family_outcomes = self._execute_families(task, source_root, families, extra_env)
         for (item, runtime_nodes, family_complete), outcomes in zip(families, family_outcomes):
             tf, dev = item["test_function"], item["device"]
