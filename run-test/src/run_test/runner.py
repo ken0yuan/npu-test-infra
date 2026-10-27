@@ -333,6 +333,8 @@ class PytestRunner:
         self.artifact_root = Path(artifact_root) if artifact_root else None
         self._collection_lock = threading.RLock()
         self._collection_cache = {}
+        self._collection_locks = {}
+        self._family_cache = {}
         self._runtime_requirements = {}
         self._file_receipts = {}
         self._task_collection_enabled = False
@@ -345,6 +347,8 @@ class PytestRunner:
         """Receipts never survive a PR/wheel installation boundary."""
         with self._collection_lock:
             self._collection_cache.clear()
+            self._collection_locks.clear()
+            self._family_cache.clear()
             self._runtime_requirements.clear()
             self._file_receipts.clear()
             self._task_collection_enabled = True
@@ -363,9 +367,11 @@ class PytestRunner:
         source = root / "test" / rel_file
         digest = hashlib.sha256(source.read_bytes()).hexdigest() if source.is_file() else "missing"
         key = (str(root.resolve()), rel_file, digest, tuple(cmd), tuple(sorted(env.items())))
-        # Single-flight: threads targeting the same file/mask share one actual
-        # collection. Bound to this runner's task, interpreter, args and full env.
+        # Single-flight per file/mask. Different leased devices can collect
+        # concurrently instead of holding one global lock across subprocesses.
         with self._collection_lock:
+            flight = self._collection_locks.setdefault(key, threading.RLock())
+        with flight:
             if self._task_collection_enabled and key in self._collection_cache:
                 return self._collection_cache[key]
             try:
@@ -412,6 +418,24 @@ class PytestRunner:
 
         proc = self._collect_file(tf, dev, root, rel_file, extra_env)
         self._file_receipts[(tf, dev, tuple(sorted((extra_env or {}).items())))] = getattr(proc, "receipt_path", None)
+        with self._collection_lock:
+            if not hasattr(proc, 'family_lock'):
+                proc.family_lock = threading.RLock()
+        # A receipt is already bound to source hash, interpreter, full env and
+        # task. Resolve each family once, rather than reparsing a huge receipt
+        # and source AST for every selected runtime instance.
+        with proc.family_lock:
+            key = (tf, dev, id(proc))
+            if self._task_collection_enabled and key in self._family_cache:
+                return list(self._family_cache[key])
+            nodes = self._resolve_runtime_family(tf, dev, root, rel_file, orig_file,
+                                                 source_class, source_method, proc)
+            if self._task_collection_enabled:
+                self._family_cache[key] = tuple(nodes)
+            return nodes
+
+    def _resolve_runtime_family(self, tf, dev, root, rel_file, orig_file,
+                                source_class, source_method, proc):
         collected = []
         origins = None
         for line in (proc.stdout or "").splitlines():

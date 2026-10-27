@@ -1,8 +1,54 @@
 import json
 import sys
 from pathlib import Path
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 from run_test.runner import PytestRunner
+
+
+def test_concurrent_instances_resolve_family_once(tmp_path, monkeypatch):
+    root=tree(tmp_path)
+    runner=PytestRunner(sys.executable,timeout_seconds=30)
+    runner.begin_task()
+    actual=runner._resolve_runtime_family
+    calls=[]
+    def resolve(*args):
+        calls.append(args[0])
+        return actual(*args)
+    monkeypatch.setattr(runner,'_resolve_runtime_family',resolve)
+    def discover(_):
+        return runner.discover_runtime_nodes('test/test_dynamic.py::test_values','cpu',source_root=root)
+    with ThreadPoolExecutor(8) as executor:
+        results=list(executor.map(discover,range(16)))
+    assert all(nodes==results[0] and len(nodes)==2 for nodes in results)
+    assert len(calls)==1
+    runner.begin_task()
+    discover(None)
+    assert len(calls)==2
+    source=root/'test/test_dynamic.py'
+    source.write_text(source.read_text().replace('["a", "b"]','["a"]'))
+    assert len(discover(None))==1
+    assert len(calls)==3
+
+
+def test_different_execution_environments_collect_concurrently(tmp_path,monkeypatch):
+    root=tree(tmp_path)
+    runner=PytestRunner(sys.executable,timeout_seconds=30)
+    runner.begin_task()
+    import run_test.runner as module
+    actual=module.subprocess.run
+    barrier=threading.Barrier(2)
+    def run(*args,**kwargs):
+        barrier.wait(timeout=5)
+        return actual(*args,**kwargs)
+    monkeypatch.setattr(module.subprocess,'run',run)
+    def discover(value):
+        return runner.discover_runtime_nodes('test/test_dynamic.py::test_values','cpu',source_root=root,
+                                             extra_env={'RECEIPT_ENV':value})
+    with ThreadPoolExecutor(2) as executor:
+        results=list(executor.map(discover,['first','second']))
+    assert all(len(nodes)==2 for nodes in results)
 
 
 def tree(tmp_path):

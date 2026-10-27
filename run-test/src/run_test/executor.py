@@ -761,6 +761,10 @@ class Executor:
             self.runner.process_lease_fds = () if fd is None else (fd,)
         families = []
         expansion_limits = []
+        parallel = self._parallel_enabled()
+        if parallel:
+            from .cpu_capacity import test_thread_env
+            extra_env = test_thread_env(extra_env)
         for item in task.test_manifest:
             tf, dev = item["test_function"], item["device"]
             explicit_nodes = list(item.get("runtime_nodeids") or [])
@@ -770,7 +774,11 @@ class Executor:
             family_complete = None
             if hasattr(self.runner, "discover_runtime_nodes"):
                 try:
-                    discovered = list(dict.fromkeys(self.runner.discover_runtime_nodes(tf, dev, source_root=source_root)))
+                    discovery_env = dict(extra_env or {})
+                    if parallel and dev == "cpu":
+                        discovery_env["ASCEND_RT_VISIBLE_DEVICES"] = ""
+                    discovered = list(dict.fromkeys(self.runner.discover_runtime_nodes(
+                        tf, dev, source_root=source_root, extra_env=discovery_env or None)))
                     if not discovered:
                         raise RuntimeError("runtime discovery returned no nodes")
                     if runtime_nodes and tf not in runtime_nodes:
