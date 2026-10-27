@@ -337,6 +337,11 @@ def validate_manifest(manifest: Any) -> list[dict]:
     normalized = []
     for item in manifest:
         row = {"test_function": item["test_function"], "device": item["device"]}
+        if "required_npu_cards" in item:
+            count = item["required_npu_cards"]
+            if type(count) is not int or count < 1 or item["device"] != "accelerator":
+                raise QueueError("required_npu_cards 必须是 accelerator 测试的正整数卡数")
+            row["required_npu_cards"] = count
         for key in ("source_test_function", "runtime_nodeid", "runtime_nodeids", "execution_mode", "device_basis"):
             if key in item:
                 if key == "runtime_nodeids":

@@ -6,7 +6,7 @@ from pathlib import Path
 
 
 @contextmanager
-def executor_lease(path):
+def lease_handle(path):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a+b") as handle:
@@ -27,11 +27,18 @@ def executor_lease(path):
             if error.errno not in (errno.EACCES, errno.EAGAIN, errno.EDEADLK):
                 raise
         try:
-            yield acquired
+            yield handle.fileno() if acquired else None
         finally:
             if acquired:
                 handle.seek(0)
                 if os.name == "nt":
                     msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
-                else:
-                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                # On POSIX close releases the open-file-description lock. Do
+                # not LOCK_UN: a pytest child may still hold an inherited fd
+                # after its executor died, protecting its wheel environment.
+
+
+@contextmanager
+def executor_lease(path):
+    with lease_handle(path) as fd:
+        yield fd is not None

@@ -127,6 +127,7 @@ class Executor:
         )
         self.runner = runner
         self._persist = persist or submit_complete_result
+        self.card_pool = None  # Injectable resource pool for deterministic acceptance tests.
 
     # ------------------------------------------------------------------
     # 主循环
@@ -134,13 +135,17 @@ class Executor:
 
     def run_once(self) -> RunOutcome:
         """执行一个任务（或完成一次续清理）。返回执行结果摘要。"""
-        from .process_lock import executor_lease
+        from .process_lock import lease_handle
         # Recovery must not erase another live executor's database lock.
         # Hold the OS lease across recovery, installation, execution and cleanup.
-        with executor_lease(self.paths.queue_db.with_suffix(".executor.lock")) as acquired:
-            if not acquired:
+        with lease_handle(self.paths.queue_db.with_suffix(".executor.lock")) as fd:
+            if fd is None:
                 return RunOutcome(None, "idle", "另一个执行进程仍持有执行位")
-            return self._run_once_owned()
+            self._executor_fd = fd
+            try:
+                return self._run_once_owned()
+            finally:
+                self._executor_fd = None
 
     def _run_once_owned(self) -> RunOutcome:
         # 进程重启恢复：先核实残留状态（文档第 8 节）。
@@ -211,14 +216,12 @@ class Executor:
         if not ok:
             self.queue.mark_blocked(task.task_id, reason)
             return RunOutcome(task.task_id, "blocked", reason)
-        # 等卡门禁（用户 2026-10-26 要求）：下载安装照常完成，仅在执行
-        # 测试前确认空闲 NPU 卡，不够就等待。本轮仅串行等待、不钉卡
-        # （按测试真实需求申请与设备租约是遗留项，见修复日志）。
-        ok, reason, free_cards = self._timed(task, 'device_wait', self._wait_for_free_npu, task)
-        if not ok:
-            self.queue.mark_blocked(task.task_id, reason or "等待空闲 NPU 卡未成功")
-            return RunOutcome(task.task_id, "blocked", reason)
-        print(f"[等卡] 通过：空闲 NPU {len(free_cards)} 张，开始执行", flush=True)
+        # Parallel mode waits at the head job, not once for the whole PR.
+        if not self._parallel_enabled():
+            ok, reason, free_cards = self._timed(task, 'device_wait', self._wait_for_free_npu, task)
+            if not ok:
+                self.queue.mark_blocked(task.task_id, reason or "等待空闲 NPU 卡未成功")
+                return RunOutcome(task.task_id, "blocked", reason)
         self.queue.transition(task.task_id, q.STATE_TESTING, "开始按清单执行")
         submission = self._timed(task, 'testing', self._run, task, source_root)
         if submission is None:
@@ -648,6 +651,71 @@ class Executor:
             return False, why, []
         return True, "", cards
 
+    def _parallel_enabled(self):
+        return int((self.config.get("executor") or {}).get("test_max_workers", 1)) > 1
+
+    def _execute_families(self, task, source_root, families, extra_env):
+        from .runner import PytestRunner, FunctionRunOutcome
+        from .test_scheduler import CardPool, CardLease, TestJob, run_ordered
+        cfg = self.config.get("executor") or {}
+        parallel = self._parallel_enabled()
+        pool = None
+        if parallel:
+            has_npu = any(item["device"] == "accelerator" for item, _, _ in families)
+            pool = self.card_pool or CardPool(self.paths.queue_dir / "npu-leases",
+                                             ids=None if has_npu else [])
+        jobs = []
+        sizes = []
+        for item, nodes, _ in families:
+            tf, dev = item["test_function"], item["device"]
+            sizes.append(len(nodes))
+            for node in nodes:
+                need = 0
+                if parallel and dev == "accelerator":
+                    need = item.get("required_npu_cards")
+                    if need is None and hasattr(self.runner, "required_npu_cards"):
+                        need = self.runner.required_npu_cards(node, dev, len(pool.ids))
+                    elif need is not None and hasattr(self.runner, "required_npu_cards"):
+                        need = max(need, self.runner.required_npu_cards(node, dev, 0))
+                    if need is None:
+                        need = len(pool.ids)
+                    if need < 1 or need > len(pool.ids):
+                        raise ExecutorError(f"{node}: needs {need} NPU cards; pool has {len(pool.ids)}")
+
+                def execute(lease, node=node, dev=dev, tf=tf):
+                    cards = lease.cards
+                    env = dict(extra_env or {})
+                    if parallel:
+                        env["ASCEND_RT_VISIBLE_DEVICES"] = ",".join(map(str, cards)) if dev == "accelerator" else ""
+                    kwargs = dict(source_root=source_root, extra_env=env or None)
+                    if isinstance(self.runner, PytestRunner):
+                        kwargs["source_test_function"] = tf
+                        kwargs["lease_fds"] = lease.fds
+                    try:
+                        return self.runner.run_function(node, dev, **kwargs)
+                    except Exception as error:
+                        return FunctionRunOutcome.incomplete(tf, dev, f"runner exception for {node}: {error}")
+
+                jobs.append(TestJob(f"{dev}:{node}", need, execute))
+        if parallel:
+            log = self.paths.diagnostics_root / task.task_id / "scheduler.jsonl"
+            log.parent.mkdir(parents=True, exist_ok=True)
+            def event(**data):
+                data["time"] = datetime.now(timezone.utc).isoformat()
+                with log.open("a", encoding="utf-8") as stream:
+                    stream.write(json.dumps(data, ensure_ascii=False) + "\n")
+                if data["state"] == "resource_wait":
+                    print(f"[resource_wait] {data['key']} needs {data['required_cards']} cards; admission paused", flush=True)
+            flat = run_ordered(jobs, pool, max_workers=int(cfg["test_max_workers"]),
+                               interval=max(0.1, float(cfg.get("test_resource_poll_seconds", 1))), event=event)
+        else:
+            flat = [job.run(CardLease(())) for job in jobs]
+        result, offset = [], 0
+        for size in sizes:
+            result.append(flat[offset:offset + size])
+            offset += size
+        return result
+
     def _run(self, task: q.Task, source_root: Path, extra_env: dict | None = None) -> Submission | None:
         """按清单执行测试，构造一份完整提交。中断时自行处理状态并返回 None。"""
         # 以 DB 最新绑定刷新快照：set_task_torch_npu 只写库不改调用方的
@@ -668,6 +736,11 @@ class Executor:
         no_result: list[str] = []
         if hasattr(self.runner, "artifact_root"):
             self.runner.artifact_root = self.paths.diagnostics_root / task.task_id / "artifacts"
+        if hasattr(self.runner, "begin_task"):
+            self.runner.begin_task()
+            fd = getattr(self, "_executor_fd", None)
+            self.runner.process_lease_fds = () if fd is None else (fd,)
+        families = []
         for item in task.test_manifest:
             tf, dev = item["test_function"], item["device"]
             explicit_nodes = list(item.get("runtime_nodeids") or [])
@@ -700,11 +773,11 @@ class Executor:
                     continue
             elif not runtime_nodes:
                 runtime_nodes = [tf]
-            outcomes = [
-                self.runner.run_function(node, dev, source_root=source_root,
-                                         extra_env=extra_env)
-                for node in runtime_nodes
-            ]
+            families.append((item, runtime_nodes, family_complete))
+
+        family_outcomes = self._execute_families(task, source_root, families, extra_env)
+        for (item, runtime_nodes, family_complete), outcomes in zip(families, family_outcomes):
+            tf, dev = item["test_function"], item["device"]
             complete = all(outcome.completed for outcome in outcomes)
             logs = "\n\n".join(outcome.log_text for outcome in outcomes if outcome.log_text)
             observed = [outcome.observed_counts or outcome.counts for outcome in outcomes if (outcome.observed_counts or outcome.counts) is not None]

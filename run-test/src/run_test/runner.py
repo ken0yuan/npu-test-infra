@@ -11,6 +11,7 @@ import subprocess
 import tempfile
 import signal
 import re
+import threading
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
@@ -253,14 +254,36 @@ if sys.argv.pop(1) == "accelerator":
 target = pathlib.Path(sys.argv[1]).resolve()
 rc = pytest.main(sys.argv[1:])
 origins = {}
+source_info = {}
 def remember(key, value):
     try:
         if isinstance(value, (classmethod, staticmethod)):
             value = value.__func__
         original = inspect.unwrap(value)
+        required = getattr(value, "num_required_devices", None)
+        if required is None:
+            required = getattr(original, "num_required_devices", None)
+        # Thousands of generated nodes often unwrap to the same function.
+        # Reflect its source once; missing source never erases its identity.
+        if required is None:
+            try:
+                if original not in source_info:
+                    parameters = inspect.signature(original).parameters
+                    source = inspect.getsource(original)
+                    sensitive = any(token in source for token in (
+                        "device_count", "world_size", "init_process_group", "spawn(",
+                        "get_all_devices", "set_device", "npu:1", "cuda:1"))
+                    source_info[original] = "device" in parameters and not sensitive and "distributed" not in str(target)
+                if source_info[original]:
+                    required = 1
+            except (AttributeError, TypeError, ValueError, OSError):
+                pass
+        if type(required) is not int or required < 1:
+            required = None
         origins[key] = {"name": getattr(original, "__name__", ""),
-                        "qualname": getattr(original, "__qualname__", "")}
-    except (AttributeError, TypeError, ValueError):
+                        "qualname": getattr(original, "__qualname__", ""),
+                        "required_npu_cards": required}
+    except (AttributeError, TypeError, ValueError, OSError):
         origins[key] = {"name": "", "qualname": ""}
 for module in tuple(sys.modules.values()):
     filename = vars(module).get("__file__") if module is not None else None
@@ -305,6 +328,60 @@ class PytestRunner:
         # cpu / accelerator 直接跑 test 源码，不注入（用户 2026-09-17 决策）。
         self.transfer_boot_dir = None  # historical argument accepted but never injected
         self.artifact_root = Path(artifact_root) if artifact_root else None
+        self._collection_lock = threading.RLock()
+        self._collection_cache = {}
+        self._runtime_requirements = {}
+        self._file_receipts = {}
+        self._task_collection_enabled = False
+        self.process_lease_fds = ()
+
+    def _lease_options(self, fds=()):
+        return {"pass_fds": tuple(set(self.process_lease_fds + tuple(fds)))} if os.name != "nt" else {}
+
+    def begin_task(self):
+        """Receipts never survive a PR/wheel installation boundary."""
+        with self._collection_lock:
+            self._collection_cache.clear()
+            self._runtime_requirements.clear()
+            self._file_receipts.clear()
+            self._task_collection_enabled = True
+
+    def required_npu_cards(self, nodeid, device, total_cards):
+        if device == "cpu":
+            return 0
+        return self._runtime_requirements.get((device, nodeid)) or total_cards
+
+    def _collect_file(self, tf, dev, root, rel_file, extra_env):
+        env = test_execution_env(dev, root, tf)
+        env.update(extra_env or {})
+        cmd = [self.python_env, "-c", _COLLECT_WITH_ORIGINS, dev, rel_file, "--collect-only",
+               "-q", "-o", "addopts=", "-p", "no:cacheprovider",
+               *self.device_args.get(dev, []), *self.extra_args]
+        source = root / "test" / rel_file
+        digest = hashlib.sha256(source.read_bytes()).hexdigest() if source.is_file() else "missing"
+        key = (str(root.resolve()), rel_file, digest, tuple(cmd), tuple(sorted(env.items())))
+        # Single-flight: threads targeting the same file/mask share one actual
+        # collection. Bound to this runner's task, interpreter, args and full env.
+        with self._collection_lock:
+            if self._task_collection_enabled and key in self._collection_cache:
+                return self._collection_cache[key]
+            try:
+                proc = subprocess.run(cmd, cwd=str(root / "test"), env=env,
+                                      capture_output=True, text=True,
+                                      timeout=self.timeout_seconds, check=False,
+                                      **self._lease_options())
+            except subprocess.TimeoutExpired as error:
+                raise RuntimeError(f"runtime discovery timeout ({self.timeout_seconds}s): {rel_file}") from error
+            if proc.returncode in (0, 5) and self._task_collection_enabled:
+                if self.artifact_root:
+                    receipt = self.artifact_root / "collections" / (hashlib.sha256(repr(key).encode()).hexdigest() + ".json")
+                    receipt.parent.mkdir(parents=True, exist_ok=True)
+                    receipt.write_text(json.dumps({"argv":cmd,"cwd":str(root/'test'),
+                        "source_sha256":digest,"device":dev,"visible_devices":env.get("ASCEND_RT_VISIBLE_DEVICES"),
+                        "returncode":proc.returncode,"stdout":proc.stdout,"stderr":proc.stderr},ensure_ascii=False,indent=2),encoding="utf-8")
+                    proc.receipt_path = str(receipt)
+                self._collection_cache[key] = proc
+            return proc
 
     def _source_function_key(self, runtime_nodeid: str) -> str:
         """Validate the source function while allowing pytest ``[param]`` nodes."""
@@ -316,6 +393,7 @@ class PytestRunner:
 
     def discover_runtime_nodes(
         self, test_function: str, device: str, *, source_root: str | Path,
+        extra_env: dict | None = None,
     ) -> list[str]:
         """Collect native CPU/NPU variants using standard pytest stdout."""
         tf = self._source_function_key(test_function)
@@ -329,15 +407,8 @@ class PytestRunner:
         source_class = tf.split("::")[1] if len(tf.split("::")) == 3 else ""
         source_method = tf.rsplit("::", 1)[-1]
 
-        env = test_execution_env(dev, root, tf)
-        cmd = [self.python_env, "-c", _COLLECT_WITH_ORIGINS, dev, rel_file, "--collect-only",
-               "-q", "-o", "addopts=", "-p", "no:cacheprovider"]
-        try:
-            proc = subprocess.run(cmd, cwd=str(root / "test"), env=env,
-                                  capture_output=True, text=True,
-                                  timeout=self.timeout_seconds, check=False)
-        except subprocess.TimeoutExpired as error:
-            raise RuntimeError(f"runtime discovery timeout ({self.timeout_seconds}s): {rel_file}") from error
+        proc = self._collect_file(tf, dev, root, rel_file, extra_env)
+        self._file_receipts[(tf, dev, tuple(sorted((extra_env or {}).items())))] = getattr(proc, "receipt_path", None)
         collected = []
         origins = None
         for line in (proc.stdout or "").splitlines():
@@ -374,7 +445,10 @@ class PytestRunner:
                 # Exact runtime identities are valid too (explicit selected samples).
                 matches = method == source_method or origin.get("name") == source_method
             if matches:
-                nodes.append("::".join([orig_file, *parts[1:]]))
+                full_node = "::".join([orig_file, *parts[1:]])
+                nodes.append(full_node)
+                origin_key = "::".join([cls, method]) if cls else method
+                self._runtime_requirements[(dev, full_node)] = (origins or {}).get(origin_key, {}).get("required_npu_cards")
         if not nodes:
             raise RuntimeError(
                 f"runtime discovery found no node for {tf} [{dev}]: "
@@ -386,14 +460,16 @@ class PytestRunner:
     def run_function(self, test_function: str, device: str, *,
                      source_root: str | Path | None = None,
                      artifact_dir: str | Path | None = None,
-                     extra_env: dict | None = None) -> FunctionRunOutcome:
+                     extra_env: dict | None = None,
+                     source_test_function: str | None = None,
+                     lease_fds=()) -> FunctionRunOutcome:
         """Run ordinary pytest with built-in collection and JUnit; no capture extension.
 
         extra_env：调用方注入的额外环境变量（如等卡门禁钉定的
         ASCEND_RT_VISIBLE_DEVICES），覆盖同名默认变量。
         """
         runtime_nodeid = str(test_function).strip()
-        tf = self._source_function_key(runtime_nodeid)
+        tf = self._source_function_key(source_test_function or runtime_nodeid)
         dev = require_execution_device(validate_device(device))
         fingerprint = _environment_fingerprint(dev, self.transfer_boot_dir if dev == "cuda" else None)
         cwd = str(Path(source_root) / "test") if source_root else None
@@ -403,7 +479,8 @@ class PytestRunner:
             env = {**env, **extra_env}
         artifact = Path(artifact_dir) if artifact_dir else None
         if artifact is None and self.artifact_root:
-            artifact = self.artifact_root / f"{dev}-{tf.replace('/', '_').replace(':', '_')}"
+            suffix = hashlib.sha256(runtime_nodeid.encode()).hexdigest()[:16]
+            artifact = self.artifact_root / f"{dev}-{tf.replace('/', '_').replace(':', '_')[:150]}-{suffix}"
         if artifact:
             artifact.mkdir(parents=True, exist_ok=True)
         real_subprocess = getattr(subprocess.run, "__module__", "subprocess") == "subprocess"
@@ -421,21 +498,35 @@ class PytestRunner:
                 if real_subprocess:
                     collect = pytest_command(self.python_env, dev) + [nodeid, "--collect-only", "-q",
                                "-o", "addopts=", "-p", "no:cacheprovider", *self.device_args.get(dev, [])]
-                    result = subprocess.run(collect, cwd=cwd, env=env, capture_output=True,
-                                            text=True, timeout=self.timeout_seconds)
+                    if source_test_function and source_root and self._task_collection_enabled:
+                        try:
+                            valid = self.discover_runtime_nodes(tf, dev, source_root=source_root, extra_env=extra_env)
+                            if runtime_nodeid not in valid:
+                                raise RuntimeError(f"node absent from execution-environment collection: {runtime_nodeid}")
+                            result = subprocess.CompletedProcess(collect, 0, nodeid + "\n", "")
+                        except Exception as error:
+                            result = subprocess.CompletedProcess(collect, 5, "", str(error))
+                    else:
+                        result = subprocess.run(collect, cwd=cwd, env=env, capture_output=True,
+                                                text=True, timeout=self.timeout_seconds, **self._lease_options(lease_fds))
                     file_part = nodeid.split("::", 1)[0]
                     expected = [ln.strip() for ln in result.stdout.splitlines() if "::" in ln and
                                 (ln.strip().split("::", 1)[0] == file_part or
                                  ln.strip().split("::", 1)[0].endswith("/" + file_part))]
                     if artifact:
                         (artifact / "collection.json").write_text(json.dumps({"argv":collect,"nodeids":expected,
-                            "returncode":result.returncode,"stdout":result.stdout,"stderr":result.stderr},ensure_ascii=False,indent=2),encoding="utf-8")
+                            "returncode":result.returncode,"stdout":result.stdout,"stderr":result.stderr,
+                            "source_test_function":source_test_function,
+                            "receipt":"task_file_collection" if source_test_function and self._task_collection_enabled else "node_collection",
+                            "file_receipt":self._file_receipts.get((tf,dev,tuple(sorted((extra_env or {}).items())))),
+                            "visible_devices":env.get("ASCEND_RT_VISIBLE_DEVICES")},ensure_ascii=False,indent=2),encoding="utf-8")
                     if result.returncode or not expected:
                         rc = result.returncode;out = result.stdout;err = result.stderr
                         status = "collection_error"
                     else:
                         child = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                                 text=True, env=env, cwd=cwd, start_new_session=True)
+                                                 text=True, env=env, cwd=cwd, start_new_session=True,
+                                                 **self._lease_options(lease_fds))
                         try:
                             out, err = child.communicate(timeout=self.timeout_seconds)
                         except subprocess.TimeoutExpired:

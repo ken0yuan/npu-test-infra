@@ -172,6 +172,24 @@ def test_full_pytest_bracket_family_has_full_coverage(identity_tree,config,queue
     assert sub.function_results[0].coverage_status=='full'
 
 
+def test_parallel_executor_preserves_real_instances_counts_and_baseline(identity_tree,config,queue,paths):
+    config['executor']['test_max_workers']=4
+    tf=REL+'::TestMixed::test_mix'
+    task=verified_task(queue,manifest=[{'test_function':tf,'device':'cpu'}])
+    task=queue.claim_next()
+    Path(task.work_dir).mkdir(parents=True,exist_ok=True)
+    sub=Executor(config,queue_store=queue,runner=runner())._run(task,identity_tree)
+    result=sub.function_results[0]
+    assert result.counts==Counts(1,1,0,0) and result.coverage_status=='full'
+    assert len(result.instance_ids)==2 and len(set(result.artifact_refs))==2
+    submit_complete_result(config,sub)
+    with connect(paths.pr_db) as connection:
+        assert get_pr_result(connection,123456).counts==Counts(1,1,0,0)
+    import json
+    events=[json.loads(line) for line in (paths.diagnostics_root/task.task_id/'scheduler.jsonl').read_text().splitlines()]
+    assert [e['state'] for e in events[:2]]==['started','started']
+
+
 @pytest.mark.parametrize('explicit', [False,True])
 def test_discovery_failure_never_executes_static_or_stale_name(config,queue,paths,explicit):
     tf=REL+'::TestMixed::test_mix'
