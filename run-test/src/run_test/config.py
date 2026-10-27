@@ -72,7 +72,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # 单函数执行超时（秒），None 表示不限制。
         "function_timeout_seconds": None,
         # PRs still share one installed environment. Inside a PR use bounded,
-        # ordered test admission; the first NPU waiter stops later admissions.
+        # ordered NPU admission with CPU work filling unused slots. "auto" uses
+        # CPU affinity and container quotas; numeric limits are also CPU-capped.
         "test_max_workers": 1,
         "test_resource_poll_seconds": 1.0,
         # transfer boot（sitecustomize）目录：device=cuda 的函数经它注入

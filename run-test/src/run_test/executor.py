@@ -56,6 +56,11 @@ class ExecutorError(RuntimeError):
     pass
 
 
+# One source function on one execution device may select at most 100
+# concrete runtime instances. The full discovered set remains auditable.
+MAX_INSTANCES_PER_FUNCTION = 100
+
+
 def read_torch_npu_git_version(whl_path: Path) -> str | None:
     """从 torch_npu wheel 内 torch_npu/version.py 读取完整 git commit。
 
@@ -652,13 +657,24 @@ class Executor:
         return True, "", cards
 
     def _parallel_enabled(self):
-        return int((self.config.get("executor") or {}).get("test_max_workers", 1)) > 1
+        from .cpu_capacity import worker_capacity
+        configured = (self.config.get("executor") or {}).get("test_max_workers", 1)
+        return configured == "auto" or worker_capacity(configured)["max_workers"] > 1
 
     def _execute_families(self, task, source_root, families, extra_env):
         from .runner import PytestRunner, FunctionRunOutcome
         from .test_scheduler import CardPool, CardLease, TestJob, run_ordered
+        from .cpu_capacity import worker_capacity, test_thread_env, thread_budget
         cfg = self.config.get("executor") or {}
-        parallel = self._parallel_enabled()
+        capacity = worker_capacity(cfg.get("test_max_workers", 1))
+        parallel = cfg.get("test_max_workers") == "auto" or capacity["max_workers"] > 1
+        execution_env = test_thread_env(extra_env) if parallel else dict(extra_env or {})
+        threads = thread_budget(execution_env)
+        capacity_log = self.paths.diagnostics_root / task.task_id / "execution-capacity.json"
+        capacity_log.parent.mkdir(parents=True, exist_ok=True)
+        capacity_log.write_text(json.dumps({**capacity, "threads_per_test": threads,
+                                            "thread_env": {k: v for k, v in execution_env.items()
+                                                           if k.endswith("NUM_THREADS")}}, indent=2), encoding="utf-8")
         pool = None
         if parallel:
             has_npu = any(item["device"] == "accelerator" for item, _, _ in families)
@@ -684,7 +700,7 @@ class Executor:
 
                 def execute(lease, node=node, dev=dev, tf=tf):
                     cards = lease.cards
-                    env = dict(extra_env or {})
+                    env = dict(execution_env)
                     if parallel:
                         env["ASCEND_RT_VISIBLE_DEVICES"] = ",".join(map(str, cards)) if dev == "accelerator" else ""
                     kwargs = dict(source_root=source_root, extra_env=env or None)
@@ -696,7 +712,7 @@ class Executor:
                     except Exception as error:
                         return FunctionRunOutcome.incomplete(tf, dev, f"runner exception for {node}: {error}")
 
-                jobs.append(TestJob(f"{dev}:{node}", need, execute))
+                jobs.append(TestJob(f"{dev}:{node}", need, execute, cpu_threads=threads))
         if parallel:
             log = self.paths.diagnostics_root / task.task_id / "scheduler.jsonl"
             log.parent.mkdir(parents=True, exist_ok=True)
@@ -706,7 +722,10 @@ class Executor:
                     stream.write(json.dumps(data, ensure_ascii=False) + "\n")
                 if data["state"] == "resource_wait":
                     print(f"[resource_wait] {data['key']} needs {data['required_cards']} cards; admission paused", flush=True)
-            flat = run_ordered(jobs, pool, max_workers=int(cfg["test_max_workers"]),
+            ceiling = (capacity["limits"]["online"] if cfg.get("test_max_workers") == "auto"
+                       else capacity["max_workers"])
+            flat = run_ordered(jobs, pool, max_workers=ceiling,
+                               cpu_budget=lambda: worker_capacity(cfg.get("test_max_workers", 1))["available_cpus"],
                                interval=max(0.1, float(cfg.get("test_resource_poll_seconds", 1))), event=event)
         else:
             flat = [job.run(CardLease(())) for job in jobs]
@@ -741,6 +760,7 @@ class Executor:
             fd = getattr(self, "_executor_fd", None)
             self.runner.process_lease_fds = () if fd is None else (fd,)
         families = []
+        expansion_limits = []
         for item in task.test_manifest:
             tf, dev = item["test_function"], item["device"]
             explicit_nodes = list(item.get("runtime_nodeids") or [])
@@ -773,6 +793,17 @@ class Executor:
                     continue
             elif not runtime_nodes:
                 runtime_nodes = [tf]
+            if len(runtime_nodes) > MAX_INSTANCES_PER_FUNCTION:
+                expansion_limits.append({
+                    "test_function": tf, "device": dev,
+                    "selected_count": MAX_INSTANCES_PER_FUNCTION,
+                    "requested_count": len(runtime_nodes),
+                    "deferred_count": len(runtime_nodes) - MAX_INSTANCES_PER_FUNCTION,
+                    "deferred_nodeids": runtime_nodes[MAX_INSTANCES_PER_FUNCTION:],
+                })
+                runtime_nodes = runtime_nodes[:MAX_INSTANCES_PER_FUNCTION]
+                # A bounded sample is not complete source-function coverage.
+                family_complete = False
             families.append((item, runtime_nodes, family_complete))
 
         # Keep canonical source identities for baseline compatibility. Actual
@@ -788,6 +819,8 @@ class Executor:
                     {"task_id": task.task_id, "pytorch_commit": task.pytorch_commit,
                      "interpreter": getattr(self.runner, 'python_env', None),
                      "verified_against_execution": hasattr(self.runner, 'discover_runtime_nodes'),
+                     "max_instances_per_function_device": MAX_INSTANCES_PER_FUNCTION,
+                     "bounded_families": expansion_limits,
                      "items": resolved_manifest})
         family_outcomes = self._execute_families(task, source_root, families, extra_env)
         for (item, runtime_nodes, family_complete), outcomes in zip(families, family_outcomes):

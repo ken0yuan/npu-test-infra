@@ -1,4 +1,4 @@
-"""Ordered admission: the first resource waiter stops all later admissions.
+"""Ordered NPU admission with CPU work filling unused execution slots.
 
 Running jobs are never stopped to make room. Unknown NPU requirements take the
 whole device pool; a guess of one card can silently turn multi-device tests into
@@ -7,6 +7,7 @@ skips. The executor still owns the shared Python environment for the entire PR.
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
+from collections import deque
 from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
@@ -22,6 +23,7 @@ class TestJob:
     key: str
     cards: int
     run: object
+    cpu_threads: int = 1
 
 
 class CardLease:
@@ -80,20 +82,23 @@ class CardPool:
         lease.close()
 
 
-def run_ordered(jobs, pool, *, max_workers=8, interval=1.0, event=None):
+def run_ordered(jobs, pool, *, max_workers=8, interval=1.0, event=None, cpu_budget=None):
     """Return results in input order. No timeout turns resource wait into failure."""
     if max_workers < 1:
         raise ValueError("max_workers must be positive")
     event = event or (lambda **data: None)
     jobs = list(jobs)
+    if any(job.cpu_threads < 1 for job in jobs):
+        raise ValueError("job cpu_threads must be positive")
     results = [None] * len(jobs)
-    pending = 0
+    pending = deque(enumerate(jobs))
     running = {}
     waiting_key = None
+    previous_budget = None
     # A bounded pool limits CPU/memory use as well as NPU occupancy.
     with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="pytest") as executor:
         try:
-            while pending < len(jobs) or running:
+            while pending or running:
                 for future in list(running):
                     if not future.done():
                         continue
@@ -101,28 +106,49 @@ def run_ordered(jobs, pool, *, max_workers=8, interval=1.0, event=None):
                     pool.release(lease)
                     results[index] = future.result()
                     event(state="completed", key=jobs[index].key, cards=list(lease.cards))
-                while pending < len(jobs) and len(running) < max_workers:
-                    job = jobs[pending]
-                    lease = pool.acquire(job.cards)
+                blocked_npu = False
+                budget = max(1, int(cpu_budget())) if cpu_budget else max_workers
+                if previous_budget is not None and previous_budget != budget:
+                    event(state="capacity_changed", cpu_threads=budget, running=len(running))
+                previous_budget = budget
+                while pending and len(running) < max_workers:
+                    index, job = pending[0]
+                    used = sum(jobs[i].cpu_threads for i, _ in running.values())
+                    # A test with an explicit larger thread budget may run alone.
+                    # Shrinking quotas stop admissions; running tests are drained.
+                    if running and used + job.cpu_threads > budget:
+                        break
+                    # CPU jobs need no device probe or card lease. Waiting for
+                    # the first NPU job blocks later NPU jobs, but not CPUs.
+                    lease = (None if blocked_npu else pool.acquire(job.cards)) if job.cards else CardLease(())
+                    offset = 0
                     if lease is None:
+                        blocked_npu = True
                         if waiting_key != job.key:
                             event(state="resource_wait", key=job.key, required_cards=job.cards,
                                   running=len(running))
                             waiting_key = job.key
-                        # In particular, do NOT look for a later CPU/smaller job.
-                        break
-                    waiting_key = None
+                        offset = next((i for i, (_, candidate) in enumerate(pending)
+                                       if candidate.cards == 0), None)
+                        if offset is None:
+                            break
+                        index, job = pending[offset]
+                        if running and used + job.cpu_threads > budget:
+                            break
+                        lease = CardLease(())
+                    else:
+                        waiting_key = None
                     event(state="started", key=job.key, cards=list(lease.cards))
                     try:
                         future = executor.submit(job.run, lease)
                     except BaseException:
                         pool.release(lease)
                         raise
-                    running[future] = (pending, lease)
-                    pending += 1
+                    running[future] = (index, lease)
+                    del pending[offset]
                 if running:
                     wait(running, timeout=interval, return_when=FIRST_COMPLETED)
-                elif pending < len(jobs):
+                elif pending:
                     time.sleep(interval)
         finally:
             # Drain workers before releasing cards, even when another job failed.

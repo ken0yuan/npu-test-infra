@@ -16,6 +16,7 @@
       "cpu"
     ],
     "function_timeout_seconds": 600,
+    "test_max_workers": "auto",
     "wait_free_npu_cards": 1,
     "wait_free_npu_interval_seconds": 30,
     "wait_free_npu_timeout_seconds": 21600
