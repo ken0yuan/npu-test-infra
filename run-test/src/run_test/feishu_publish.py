@@ -6,6 +6,8 @@ reading the remote state; a write is never blindly retried after a timeout.
 from __future__ import annotations
 
 import json
+from datetime import timedelta, timezone
+from email.utils import parsedate_to_datetime
 import os
 from pathlib import Path
 import sqlite3
@@ -62,7 +64,16 @@ class Feishu:
         self.token = None
         self.expires = 0
         self.last_request = 0
+        self.response_time_utc = None
+        self.response_time_monotonic = None
         self.opener = urllib.request.build_opener(NoRedirect)
+
+    def trusted_utc_now(self):
+        """Use Feishu's HTTPS clock; a mis-set host clock must not choose a date."""
+        if self.response_time_utc is None:
+            raise PublishError('飞书 HTTPS 响应缺少有效 Date，无法确定北京时间上传日期；未使用服务器时间')
+        elapsed = max(0, time.monotonic() - self.response_time_monotonic)
+        return self.response_time_utc + timedelta(seconds=elapsed)
 
     def call(self, method, path, body=None, *, auth=True):
         if auth and time.monotonic() >= self.expires:
@@ -81,6 +92,14 @@ class Feishu:
                 method=method, headers=headers)
             try:
                 with self.opener.open(req, timeout=40) as response:
+                    self.response_time_utc = None
+                    self.response_time_monotonic = time.monotonic()
+                    try:
+                        stamp = parsedate_to_datetime(response.headers.get('Date', ''))
+                        if stamp.tzinfo is not None and stamp.utcoffset() is not None:
+                            self.response_time_utc = stamp.astimezone(timezone.utc)
+                    except (TypeError, ValueError, OverflowError):
+                        pass
                     result = json.load(response)
             except urllib.error.HTTPError as error:
                 if error.code == 429 and attempt < 3:
@@ -154,6 +173,27 @@ class Publisher:
 
     def save(self):
         result_docs._atomic(self.path, result_docs.encoded(self.state))
+
+    def destination(self, pr):
+        """Pin upload date before writes, including retries across Beijing midnight."""
+        if not self.state.get('publication_started_at_utc'):
+            # A read of the configured root obtains a fresh, trusted HTTP Date.
+            self.api.files(self.folder)
+            stamp = self.api.trusted_utc_now()
+            if stamp.tzinfo is None or stamp.utcoffset() is None:
+                raise PublishError('飞书上传时间缺少 UTC 时区，未使用服务器时间')
+            stamp = stamp.astimezone(timezone.utc)
+            self.state.update(publication_started_at_utc=stamp.isoformat(),
+                              upload_date=stamp.astimezone(timezone(timedelta(hours=8))).date().isoformat(),
+                              timezone='Asia/Shanghai')
+            self.save()
+        date_folder = self.unique_object('date_folder_token', self.folder,
+                                         self.state['upload_date'], 'folder')
+        return self.unique_object('destination_folder_token', date_folder, f'PR#{pr}', 'folder')
+
+    def publication_metadata(self):
+        return {key: self.state[key] for key in ('publication_started_at_utc', 'upload_date',
+                'timezone', 'date_folder_token', 'destination_folder_token')}
 
     def unique_object(self, key, parent, name, kind):
         """A dedicated, deterministic folder enables recovery without duplicate creation."""
@@ -242,12 +282,24 @@ class Publisher:
 
     def move(self, key, doc, destination):
         # Moving is idempotent after checking membership, including ambiguous HTTP outcomes.
+        previous_destination = self.state.get(key + '_destination')
+        if self.state.get(key + '_pending') and previous_destination != destination:
+            # A dated-layout upgrade must settle an old in-flight move first.
+            previous_destination = previous_destination or (self.folder if key.startswith('promoted') else None)
+            if previous_destination is None or not any(
+                    f['token'] == doc for f in self.api.files(previous_destination)):
+                raise UncertainWrite('先前移动的目标与当前目录不同且结果未确认，须先核对原移动结果')
+            self.state.pop(key + '_pending', None)
+            self.save()
         if any(f['token'] == doc for f in self.api.files(destination)):
             self.state[key] = True
+            self.state.pop(key + '_pending', None)
+            self.state[key + '_destination'] = destination
             self.save()
             return
         if self.state.get(key + '_pending'):
             raise UncertainWrite('先前移动仍未确认，保留两个目录现场')
+        self.state[key + '_destination'] = destination
         self.state[key + '_pending'] = True
         self.save()
         try:
@@ -277,7 +329,7 @@ class Publisher:
         """多文档发布（用户 2026-10-26：完整版本集）——先建全部篇并逐篇
         回读校验（shape 含全文与链接，零丢失），全部通过才晋升主篇、归档
         旧版本（含旧续篇）并记 published；失败/中断留在暂存可续传，
-        绝不半套发布。"""
+        未完成全篇对账的版本不记 published。"""
         pr, fingerprint = pointer['pr_number'], pointer['fingerprint']
         self.path = self.root / self.folder / f'PR_{pr}' / (fingerprint + '.json')
         if self.path.exists():
@@ -290,14 +342,19 @@ class Publisher:
             return {**self.state['receipt'], 'changed': False}
         plan_hash = result_docs.digest(result_docs.encoded(plan).encode())
         if self.state.get('plan_hash') != plan_hash:
+            publication = {key: value for key, value in self.state.items()
+                           if key in ('publication_started_at_utc', 'upload_date', 'timezone',
+                                      'date_folder_token', 'date_folder_token_pending',
+                                      'destination_folder_token', 'destination_folder_token_pending')}
             if self.path.exists():
                 previous = result_docs.digest(self.path.read_bytes())
                 result_docs._atomic(self.path.with_name(self.path.stem + '.superseded-' + previous + '.json'),
                                     result_docs.encoded(self.state))
             self.state = {'pr_number': pr, 'fingerprint': fingerprint,
                           'folder': self.folder, 'status': 'staging',
-                          'plan_schema': plan.get('schema'), 'plan_hash': plan_hash}
+                          'plan_schema': plan.get('schema'), 'plan_hash': plan_hash, **publication}
             self.save()
+        destination = self.destination(pr)
         staging = self.unique_object('staging', self.folder, '报告上传暂存', 'folder')
         # Isolate changed schemas/settings from old remote content as well as receipts.
         version = self.unique_object('version_folder', staging,
@@ -370,7 +427,7 @@ class Publisher:
         # 完整版本集：全部篇（主篇+续篇）进入目标目录——与历史
         # PR#194758/-1/-2 同层布局一致；逐一晋升后再归档旧版本。
         for pi, doc in enumerate(docs):
-            self.move(f'promoted-{pi}', doc, self.folder)
+            self.move(f'promoted-{pi}', doc, destination)
         # 旧版本集 = 主篇名 + 主篇名-数字（历史续篇命名）——篇数变化
         # （多篇变单篇/续篇增减）时旧续篇一并归档。
         def _is_old_version(name):
@@ -380,15 +437,15 @@ class Publisher:
                 return name[len(plan['title']) + 1:].isdigit()
             return False
 
-        old_docs = [f for f in self.api.files(self.folder)
+        old_docs = [f for f in self.api.files(destination)
                     if f['type'] == 'docx' and _is_old_version(f['name'])
                     and f['token'] not in set(docs)]
         if old_docs:
-            history = self.unique_object('history', self.folder, '历史测试报告', 'folder')
+            history = self.unique_object('history-' + destination, destination, '历史测试报告', 'folder')
             for old in old_docs:
                 self.move('archived-' + old['token'], old['token'], history)
         for suffix in [p['title_suffix'] for p in parts]:
-            matches = [f for f in self.api.files(self.folder)
+            matches = [f for f in self.api.files(destination)
                        if f['type'] == 'docx' and f['name'] == plan['title'] + suffix]
             if len(matches) != 1 or matches[0]['token'] not in docs:
                 raise PublishError('发布后目录对账未通过（篇级），未标记完成')
@@ -398,7 +455,8 @@ class Publisher:
                               'title': plan['title'] + p['title_suffix'],
                               'document_id': doc, 'verification': v}
                              for p, doc, v in zip(parts, docs, verifications)],
-                   'archived': [f['token'] for f in old_docs], 'changed': True}
+                   'archived': [f['token'] for f in old_docs], 'changed': True,
+                   **self.publication_metadata()}
         self.state.update(status='published', receipt=receipt)
         self.save()
         return receipt
@@ -413,6 +471,7 @@ class Publisher:
             self.save()
         if self.state['status'] == 'published':
             return {**self.state['receipt'], 'changed': False}
+        destination = self.destination(pr)
         staging = self.unique_object('staging', self.folder, '报告上传暂存', 'folder')
         version = self.unique_object('version_folder', staging, f'PR_{pr}_{fingerprint}', 'folder')
         doc = self.unique_object('document_id', version, plan['title'], 'docx')
@@ -433,18 +492,19 @@ class Publisher:
         verification = self.verify(doc, plan)
         if not still_current():
             raise PublishError('本地结果已更新；已验证的旧版本留在暂存，未替换当前文档')
-        old_docs = [f for f in self.api.files(self.folder) if f['type'] == 'docx' and f['name'] == plan['title'] and f['token'] != doc]
+        old_docs = [f for f in self.api.files(destination) if f['type'] == 'docx' and f['name'] == plan['title'] and f['token'] != doc]
         # Keep old content until the complete replacement has been verified and promoted.
-        self.move('promoted', doc, self.folder)
+        self.move('promoted', doc, destination)
         if old_docs:
-            history = self.unique_object('history', self.folder, '历史测试报告', 'folder')
+            history = self.unique_object('history-' + destination, destination, '历史测试报告', 'folder')
             for old in old_docs:
                 self.move('archived-' + old['token'], old['token'], history)
-        matches = [f for f in self.api.files(self.folder) if f['type'] == 'docx' and f['name'] == plan['title']]
+        matches = [f for f in self.api.files(destination) if f['type'] == 'docx' and f['name'] == plan['title']]
         if len(matches) != 1 or matches[0]['token'] != doc:
             raise PublishError('发布后目录对账未通过，未标记完成')
         receipt = {'pr_number': pr, 'document_id': doc, 'fingerprint': fingerprint,
-                   'verification': verification, 'archived': [f['token'] for f in old_docs], 'changed': True}
+                   'verification': verification, 'archived': [f['token'] for f in old_docs], 'changed': True,
+                   **self.publication_metadata()}
         self.state.update(status='published', receipt=receipt)
         self.save()
         return receipt

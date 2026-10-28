@@ -1,11 +1,14 @@
 from copy import deepcopy
+from datetime import datetime, timedelta, timezone
 import json
+import io
 from pathlib import Path
+from types import SimpleNamespace
 import urllib.parse
 
 import pytest
 
-from run_test.feishu_publish import Publisher, PublishError, UncertainWrite, credentials, block_text
+from run_test.feishu_publish import Feishu, Publisher, PublishError, UncertainWrite, credentials, block_text
 from run_test import result_docs
 from run_test.config import store_paths
 from run_test import result_docs as result_docs_module
@@ -27,6 +30,17 @@ class FakeFeishu:
         self.fail_before = False
         self.moves = []
         self.child_batches = []
+        self.server_time = datetime(2026, 10, 28, 4, tzinfo=timezone.utc)
+        self.capacity = None
+
+    def trusted_utc_now(self):
+        if self.server_time is None:
+            raise PublishError('飞书 HTTPS 响应缺少有效 Date，无法确定北京时间上传日期；未使用服务器时间')
+        return self.server_time
+
+    def check_capacity(self, folder):
+        if self.capacity is not None and len(self.entries[folder]) >= self.capacity:
+            raise PublishError('folder capacity reached')
 
     def ident(self):
         self.serial += 1
@@ -43,15 +57,18 @@ class FakeFeishu:
         self.mutations += 1
         path = urllib.parse.urlsplit(url).path
         if path.endswith('/create_folder'):
+            self.check_capacity(body['folder_token'])
             token = self.ident();self.entries[token] = []
             self.entries[body['folder_token']].append({'token': token, 'name': body['name'], 'type': 'folder'})
             return {'token': token}
         if path == '/docx/v1/documents':
+            self.check_capacity(body['folder_token'])
             doc = self.ident();self.documents[doc] = {doc: {'block_id': doc, 'block_type': 1, 'children': []}}
             self.entries[body['folder_token']].append({'token': doc, 'name': body['title'], 'type': 'docx'})
             return {'document': {'document_id': doc}}
         if path.endswith('/move'):
             doc = path.split('/')[-2]
+            self.check_capacity(body['folder_token'])
             for entries in self.entries.values():
                 found = next((x for x in entries if x['token'] == doc), None)
                 if found:
@@ -90,11 +107,11 @@ def inputs():
 
 
 def test_end_to_end_verify_promote_and_preserve_old_document(tmp_path):
-    api = FakeFeishu();api.entries['target'].append({'token': 'legacy', 'name': 'PR#77', 'type': 'docx'})
+    api = FakeFeishu();_prepare_destination(api).append({'token': 'legacy', 'name': 'PR#77', 'type': 'docx'})
     p, plan = inputs();worker = Publisher(api, 'target', tmp_path)
     receipt = worker.publish(p, plan)
     assert receipt['verification']['content_verified'] and receipt['archived'] == ['legacy']
-    assert {f['token'] for f in api.files('target') if f['type'] == 'docx'} == {p['document_id'] for p in receipt['parts']}
+    assert {f['token'] for f in api.files(receipt['destination_folder_token']) if f['type'] == 'docx'} == {p['document_id'] for p in receipt['parts']}
     assert any(f['token'] == 'legacy' for entries in api.entries.values() for f in entries)
     before = api.mutations
     again = Publisher(api, 'target', tmp_path).publish(p, plan)
@@ -203,13 +220,30 @@ def _doc_names(api, folder):
     return sorted(f['name'] for f in api.files(folder) if f['type'] == 'docx')
 
 
+def _destination(api, pr=77, date='2026-10-28'):
+    day = next(f['token'] for f in api.files('target') if f['name'] == date)
+    return next(f['token'] for f in api.files(day) if f['name'] == f'PR#{pr}')
+
+
+def _prepare_destination(api, pr=77, date='2026-10-28'):
+    """Existing dated reports, independent of the publisher being tested."""
+    day, folder = 'day-' + date, f'pr-{date}-{pr}'
+    if day not in api.entries:
+        api.entries['target'].append({'token': day, 'name': date, 'type': 'folder'})
+        api.entries[day] = []
+    api.entries[day].append({'token': folder, 'name': f'PR#{pr}', 'type': 'folder'})
+    api.entries[folder] = []
+    return api.entries[folder]
+
+
 def test_multi_part_publish_verifies_links_and_archives_old_continuations(tmp_path):
     api = FakeFeishu()
-    api.entries['target'].append({'token': 'legacy-main', 'name': 'PR#77', 'type': 'docx'})
-    api.entries['target'].append({'token': 'legacy-cont', 'name': 'PR#77-1', 'type': 'docx'})
+    old = _prepare_destination(api)
+    old.append({'token': 'legacy-main', 'name': 'PR#77', 'type': 'docx'})
+    old.append({'token': 'legacy-cont', 'name': 'PR#77-1', 'type': 'docx'})
     p, plan = {'pr_number': 77, 'fingerprint': 'b' * 64}, _v2_plan(parts=2)
     receipt = Publisher(api, 'target', tmp_path, domain='https://x').publish(p, plan)
-    names = _doc_names(api, 'target')
+    names = _doc_names(api, receipt['destination_folder_token'])
     assert names == ['PR#77', 'PR#77-1']  # 新版本集完整替换（含旧续篇归档）
     assert receipt['changed'] and len(receipt['parts']) == 2
     assert all(v['content_verified'] for v in
@@ -240,7 +274,7 @@ def test_part_count_change_archives_old_continuation(tmp_path):
     Publisher(api, 'target', tmp_path).publish(p1, _v2_plan(parts=2))
     p2 = {'pr_number': 77, 'fingerprint': 'e' * 64}
     Publisher(api, 'target', tmp_path).publish(p2, _v2_plan(parts=1))
-    assert _doc_names(api, 'target') == ['PR#77']  # 多篇变单篇：旧续篇一并归档
+    assert _doc_names(api, _destination(api)) == ['PR#77']  # 多篇变单篇：旧续篇一并归档
 
 
 def test_incomplete_publish_stays_staging_then_completes(tmp_path):
@@ -253,7 +287,7 @@ def test_incomplete_publish_stays_staging_then_completes(tmp_path):
     assert state['status'] == 'staging'  # 未完整发布绝不记 published
     receipt = Publisher(api, 'target', tmp_path).publish(p, plan)  # 断点续传
     assert receipt['changed'] and len(receipt['parts']) == 2
-    assert _doc_names(api, 'target') == ['PR#77', 'PR#77-1']
+    assert _doc_names(api, _destination(api)) == ['PR#77', 'PR#77-1']
 
 
 def test_big_log_planner_to_publisher_split_without_loss(tmp_path):
@@ -399,7 +433,7 @@ def test_changed_staging_budget_does_not_reuse_partial_documents(tmp_path):
 
 
 def test_partial_promotion_keeps_old_set_until_all_parts_are_promoted(tmp_path):
-    api = FakeFeishu(); api.entries['target'].append({'token': 'old', 'name': 'PR#77', 'type': 'docx'})
+    api = FakeFeishu(); _prepare_destination(api).append({'token': 'old', 'name': 'PR#77', 'type': 'docx'})
     pointer, plan = {'pr_number': 77, 'fingerprint': '2' * 64}, _v2_plan(parts=3)
     original = api.call
     def reject_second_move(method, url, body=None):
@@ -409,7 +443,7 @@ def test_partial_promotion_keeps_old_set_until_all_parts_are_promoted(tmp_path):
     api.call = reject_second_move
     with pytest.raises(PublishError, match='second move'):
         Publisher(api, 'target', tmp_path).publish(pointer, plan)
-    assert any(f['token'] == 'old' for f in api.files('target'))
+    assert any(f['token'] == 'old' for f in api.files(_destination(api)))
     state = json.loads((tmp_path/'target/PR_77'/ (pointer['fingerprint']+'.json')).read_text(encoding='utf-8'))
     assert state['status'] == 'staging'
     api.call = original
@@ -439,3 +473,157 @@ def test_actual_complete_documents_respect_budgets(tmp_path, count, budget):
 def test_invalid_document_capacity_fails_before_any_publish(budget):
     with pytest.raises(result_docs.ReportError):
         feishu_plan(_model_with_logs(), budget)
+
+
+@pytest.mark.parametrize('stamp,day', [
+    ('2026-10-28T15:59:59+00:00', '2026-10-28'),
+    ('2026-10-28T16:00:00+00:00', '2026-10-29'),
+    ('2026-12-31T16:00:00+00:00', '2027-01-01'),
+])
+def test_upload_date_uses_trusted_utc_plus_eight(tmp_path, stamp, day):
+    api = FakeFeishu(); api.server_time = datetime.fromisoformat(stamp)
+    receipt = Publisher(api, 'target', tmp_path).publish(
+        {'pr_number': 77, 'fingerprint': '4' * 64}, _v2_plan(parts=1))
+    assert receipt['upload_date'] == day and receipt['timezone'] == 'Asia/Shanghai'
+    assert receipt['publication_started_at_utc'] == stamp
+    assert _destination(api, date=day) == receipt['destination_folder_token']
+    assert _doc_names(api, receipt['destination_folder_token']) == ['PR#77']
+
+
+def test_upload_date_survives_midnight_and_missing_clock_on_retry(tmp_path):
+    api = FakeFeishu(); api.server_time = datetime(2026, 10, 28, 15, 59, 59, tzinfo=timezone.utc)
+    api.lose_response = True
+    pointer, plan = {'pr_number': 77, 'fingerprint': '5' * 64}, _v2_plan(parts=2)
+    with pytest.raises(UncertainWrite):
+        Publisher(api, 'target', tmp_path).publish(pointer, plan)
+    # No wall-clock fallback is needed: the journal has pinned the original date.
+    api.server_time = None
+    receipt = Publisher(api, 'target', tmp_path).publish(pointer, plan)
+    assert receipt['upload_date'] == '2026-10-28'
+    assert len(receipt['parts']) == 2
+    assert [f['name'] for f in api.files('target') if f['type'] == 'folder'] == [
+        '2026-10-28', '报告上传暂存']
+
+
+def test_missing_platform_time_stops_before_cloud_writes(tmp_path):
+    api = FakeFeishu(); api.server_time = None
+    with pytest.raises(PublishError, match='未使用服务器时间'):
+        Publisher(api, 'target', tmp_path).publish(
+            {'pr_number': 77, 'fingerprint': '6' * 64}, _v2_plan(parts=1))
+    assert api.mutations == 0 and api.files('target') == []
+
+
+@pytest.mark.parametrize('date_header', [None, 'invalid', 'Wed, 28 Oct 2026 16:00:00'])
+def test_http_clock_rejects_missing_invalid_or_naive_date(monkeypatch, date_header):
+    response = io.BytesIO(b'{"data": {}}')
+    response.headers = {} if date_header is None else {'Date': date_header}
+    api = Feishu({}); api.opener = SimpleNamespace(open=lambda *args, **kwargs: response)
+    monkeypatch.setattr('run_test.feishu_publish.time.sleep', lambda _: None)
+    api.call('GET', '/drive/v1/files', auth=False)
+    with pytest.raises(PublishError, match='未使用服务器时间'):
+        api.trusted_utc_now()
+
+
+def test_http_clock_advances_only_by_monotonic_time(monkeypatch):
+    elapsed = [10.0]
+    monkeypatch.setattr('run_test.feishu_publish.time.monotonic', lambda: elapsed[0])
+    monkeypatch.setattr('run_test.feishu_publish.time.sleep', lambda _: None)
+    response = io.BytesIO(b'{"data": {}}')
+    response.headers = {'Date': 'Wed, 28 Oct 2026 15:59:59 GMT'}
+    api = Feishu({}); api.opener = SimpleNamespace(open=lambda *args, **kwargs: response)
+    api.call('GET', '/drive/v1/files', auth=False)
+    elapsed[0] += 2
+    assert api.trusted_utc_now() == datetime(2026, 10, 28, 16, 0, 1, tzinfo=timezone.utc)
+
+
+def test_reports_share_date_but_keep_pr_versions_isolated(tmp_path):
+    api = FakeFeishu()
+    first = Publisher(api, 'target', tmp_path).publish(
+        {'pr_number': 77, 'fingerprint': '7' * 64}, _v2_plan(parts=2))
+    other = Publisher(api, 'target', tmp_path).publish(
+        {'pr_number': 78, 'fingerprint': '8' * 64}, _v2_plan(pr=78, title='PR#78', parts=1))
+    updated = Publisher(api, 'target', tmp_path).publish(
+        {'pr_number': 77, 'fingerprint': '9' * 64}, _v2_plan(parts=1))
+    assert first['date_folder_token'] == other['date_folder_token']
+    assert first['destination_folder_token'] != other['destination_folder_token']
+    assert set(updated['archived']) == {p['document_id'] for p in first['parts']}
+    assert _doc_names(api, other['destination_folder_token']) == ['PR#78']
+    assert _doc_names(api, updated['destination_folder_token']) == ['PR#77']
+
+
+def test_next_day_keeps_previous_day_complete_version(tmp_path):
+    api = FakeFeishu()
+    old = Publisher(api, 'target', tmp_path).publish(
+        {'pr_number': 77, 'fingerprint': 'a1' * 32}, _v2_plan(parts=2))
+    api.server_time += timedelta(days=1)
+    new = Publisher(api, 'target', tmp_path).publish(
+        {'pr_number': 77, 'fingerprint': 'b1' * 32}, _v2_plan(parts=1))
+    assert new['archived'] == []
+    assert old['date_folder_token'] != new['date_folder_token']
+    assert _doc_names(api, old['destination_folder_token']) == ['PR#77', 'PR#77-1']
+
+
+def test_legacy_published_receipt_needs_no_clock_or_cloud_access(tmp_path):
+    pointer, plan = {'pr_number': 77, 'fingerprint': 'c1' * 32}, _v2_plan(parts=1)
+    path = tmp_path / 'target' / 'PR_77' / (pointer['fingerprint'] + '.json')
+    result_docs._atomic(path, json.dumps({'status': 'published', 'receipt': {
+        'document_id': 'legacy-doc', 'pr_number': 77, 'fingerprint': pointer['fingerprint']}}))
+    class NoCloud:
+        def __getattr__(self, name):
+            raise AssertionError('old published receipt must not access cloud')
+    receipt = Publisher(NoCloud(), 'target', tmp_path).publish(pointer, plan)
+    assert not receipt['changed'] and receipt['document_id'] == 'legacy-doc'
+
+
+def test_old_partial_promoted_set_resumes_into_dated_folder_without_reupload(tmp_path):
+    api = FakeFeishu()
+    pointer, plan = {'pr_number': 77, 'fingerprint': 'd1' * 32}, _v2_plan(parts=3)
+    first = Publisher(api, 'target', tmp_path).publish(pointer, plan)
+    path = tmp_path / 'target' / 'PR_77' / (pointer['fingerprint'] + '.json')
+    state = json.loads(path.read_text(encoding='utf-8'))
+    docs = [p['document_id'] for p in first['parts']]
+    original_doc_content = deepcopy(api.documents)
+    for doc in docs[:2]:
+        api.call('POST', f'/drive/v1/files/{doc}/move', {'folder_token': 'target'})
+    api.call('POST', f'/drive/v1/files/{docs[2]}/move', {'folder_token': state['version_folder']})
+    for key in list(state):
+        if key.startswith(('publication_', 'upload_', 'date_folder_', 'destination_folder_')) or key == 'timezone':
+            state.pop(key)
+    state.update(status='staging', **{'promoted-0': True, 'promoted-1': True})
+    state.pop('receipt', None)
+    # Legacy journals did not bind the promotion receipt to a destination.
+    for key in list(state):
+        if key.startswith('promoted-') and key.endswith('_destination'):
+            state.pop(key)
+    state['promoted-1_pending'] = True
+    result_docs._atomic(path, json.dumps(state))
+    receipt = Publisher(api, 'target', tmp_path).publish(pointer, plan)
+    assert {p['document_id'] for p in receipt['parts']} == set(docs)
+    assert api.documents == original_doc_content
+    assert _doc_names(api, 'target') == []
+    assert _doc_names(api, receipt['destination_folder_token']) == ['PR#77', 'PR#77-1', 'PR#77-2']
+    final = json.loads(path.read_text(encoding='utf-8'))
+    assert not any(key.endswith('_pending') for key in final)
+
+
+def test_pending_move_to_different_unknown_destination_is_not_retried(tmp_path):
+    api = FakeFeishu(); api.entries['old-destination'] = []
+    worker = Publisher(api, 'target', tmp_path)
+    worker.path = tmp_path / 'journal.json'
+    worker.state = {'promoted-0_pending': True, 'promoted-0_destination': 'old-destination'}
+    with pytest.raises(UncertainWrite, match='原移动结果'):
+        worker.move('promoted-0', 'unknown-doc', 'target')
+    assert api.mutations == 0
+
+
+def test_many_parts_do_not_consume_the_date_folders_capacity(tmp_path):
+    api = FakeFeishu(); _prepare_destination(api, pr=78)
+    day = next(f['token'] for f in api.files('target') if f['name'] == '2026-10-28')
+    api.entries[day].extend({'token': f'other-{n}', 'name': f'PR#{1000+n}', 'type': 'folder'}
+                           for n in range(1498))
+    api.capacity = 1500
+    receipt = Publisher(api, 'target', tmp_path).publish(
+        {'pr_number': 77, 'fingerprint': 'e1' * 32}, _v2_plan(parts=3))
+    assert len(api.files(day)) == 1500
+    assert len(receipt['parts']) == 3
+    assert _doc_names(api, receipt['destination_folder_token']) == ['PR#77', 'PR#77-1', 'PR#77-2']
