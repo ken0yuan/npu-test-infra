@@ -187,7 +187,7 @@ def test_parallel_executor_preserves_real_instances_counts_and_baseline(identity
         assert get_pr_result(connection,123456).counts==Counts(1,1,0,0)
     import json
     events=[json.loads(line) for line in (paths.diagnostics_root/task.task_id/'scheduler.jsonl').read_text().splitlines()]
-    assert [e['state'] for e in events[:2]]==['started','started']
+    assert len([e for e in events if e['state']=='started' and e.get('phase')=='execute']) == 2
 
 
 @pytest.mark.parametrize('explicit', [False,True])

@@ -26,6 +26,9 @@ def execution_env(device=None):
                 "PYTORCH_TESTING_DEVICE_EXCEPT_FOR", "PYTORCH_TESTING_DEVICE_ONLY_FOR"):
         env.pop(key, None)
     env["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
+    # Backend registration belongs to the explicitly selected execution channel.
+    # accelerator registers torch_npu in pytest_command, inside its card lease.
+    env["TORCH_DEVICE_BACKEND_AUTOLOAD"] = "0"
     env["CUDA_VISIBLE_DEVICES"] = ""
     env["PYTORCH_TESTING_DEVICE_ONLY_FOR"] = {"cpu":"cpu", "accelerator":"npu"}.get(device, "cpu,npu")
     env["PYTHONPATH"] = os.pathsep.join(x for x in env.get("PYTHONPATH", "").split(os.pathsep) if x)

@@ -8,7 +8,7 @@ from run_test.record import submit_complete_result
 from run_test.db import connect
 from run_test.baseline_store import baseline_db_path, get_baseline
 from conftest import TF_A
-from test_executor import FakeRunner, verified_task
+from test_executor import FakeRunner, verified_task, fake_pip
 
 
 class ExpandedRunner(FakeRunner):
@@ -23,7 +23,7 @@ class ExpandedRunner(FakeRunner):
         return super().run_function(tf, dev, **kwargs)
 
 
-def test_each_function_device_executes_at_most_100_and_keeps_partial_coverage(config, queue, paths, tmp_path):
+def test_each_function_device_executes_at_most_100_and_keeps_partial_coverage(config, queue, paths, tmp_path, fake_pip):
     manifest = [{'test_function':TF_A,'device':d} for d in ['cpu','accelerator']]
     task = verified_task(queue, manifest=manifest); task = queue.claim_next()
     Path(task.work_dir).mkdir(parents=True,exist_ok=True)

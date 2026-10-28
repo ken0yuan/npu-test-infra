@@ -341,7 +341,7 @@ class PytestRunner:
         self.process_lease_fds = ()
 
     def _lease_options(self, fds=()):
-        return {"pass_fds": tuple(set(self.process_lease_fds + tuple(fds)))} if os.name != "nt" else {}
+        return {"pass_fds": tuple(dict.fromkeys((*self.process_lease_fds, *fds)))} if os.name != "nt" else {}
 
     def begin_task(self):
         """Receipts never survive a PR/wheel installation boundary."""
@@ -358,7 +358,7 @@ class PytestRunner:
             return 0
         return self._runtime_requirements.get((device, nodeid)) or total_cards
 
-    def _collect_file(self, tf, dev, root, rel_file, extra_env):
+    def _collect_file(self, tf, dev, root, rel_file, extra_env, lease_fds=()):
         env = test_execution_env(dev, root, tf)
         env.update(extra_env or {})
         cmd = [self.python_env, "-c", _COLLECT_WITH_ORIGINS, dev, rel_file, "--collect-only",
@@ -378,7 +378,7 @@ class PytestRunner:
                 proc = subprocess.run(cmd, cwd=str(root / "test"), env=env,
                                       capture_output=True, text=True,
                                       timeout=self.timeout_seconds, check=False,
-                                      **self._lease_options())
+                                      **self._lease_options(lease_fds))
             except subprocess.TimeoutExpired as error:
                 raise RuntimeError(f"runtime discovery timeout ({self.timeout_seconds}s): {rel_file}") from error
             if proc.returncode in (0, 5) and self._task_collection_enabled:
@@ -402,7 +402,7 @@ class PytestRunner:
 
     def discover_runtime_nodes(
         self, test_function: str, device: str, *, source_root: str | Path,
-        extra_env: dict | None = None,
+        extra_env: dict | None = None, lease_fds=(),
     ) -> list[str]:
         """Collect native CPU/NPU variants using standard pytest stdout."""
         tf = self._source_function_key(test_function)
@@ -416,7 +416,7 @@ class PytestRunner:
         source_class = tf.split("::")[1] if len(tf.split("::")) == 3 else ""
         source_method = tf.rsplit("::", 1)[-1]
 
-        proc = self._collect_file(tf, dev, root, rel_file, extra_env)
+        proc = self._collect_file(tf, dev, root, rel_file, extra_env, lease_fds=lease_fds)
         self._file_receipts[(tf, dev, tuple(sorted((extra_env or {}).items())))] = getattr(proc, "receipt_path", None)
         with self._collection_lock:
             if not hasattr(proc, 'family_lock'):
@@ -540,7 +540,8 @@ class PytestRunner:
                                "-o", "addopts=", "-p", "no:cacheprovider", *self.device_args.get(dev, [])]
                     if source_test_function and source_root and self._task_collection_enabled:
                         try:
-                            valid = self.discover_runtime_nodes(tf, dev, source_root=source_root, extra_env=extra_env)
+                            valid = self.discover_runtime_nodes(tf, dev, source_root=source_root,
+                                                                extra_env=extra_env, lease_fds=lease_fds)
                             if runtime_nodeid not in valid:
                                 raise RuntimeError(f"node absent from execution-environment collection: {runtime_nodeid}")
                             result = subprocess.CompletedProcess(collect, 0, nodeid + "\n", "")

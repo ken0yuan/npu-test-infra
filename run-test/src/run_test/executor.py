@@ -22,6 +22,7 @@
 from __future__ import annotations
 
 import re
+import os
 import json
 import shutil
 import tarfile
@@ -133,6 +134,7 @@ class Executor:
         self.runner = runner
         self._persist = persist or submit_complete_result
         self.card_pool = None  # Injectable resource pool for deterministic acceptance tests.
+        self.npu_readiness = None  # Fresh task/wheel-scoped readiness unless explicitly injected.
 
     # ------------------------------------------------------------------
     # 主循环
@@ -215,18 +217,8 @@ class Executor:
             )
             self.queue.mark_blocked(task.task_id, reason)
             return RunOutcome(task.task_id, "blocked", reason)
-        # 环境预检：环境级故障（CANN/driver/boot/测试依赖）在此分界为
-        # blocked(env)，不进 testing——不与代码嫌疑的 failed 混淆。
-        ok, reason = self._timed(task, 'preflight', self._preflight, task, source_root)
-        if not ok:
-            self.queue.mark_blocked(task.task_id, reason)
-            return RunOutcome(task.task_id, "blocked", reason)
-        # Parallel mode waits at the head job, not once for the whole PR.
-        if not self._parallel_enabled():
-            ok, reason, free_cards = self._timed(task, 'device_wait', self._wait_for_free_npu, task)
-            if not ok:
-                self.queue.mark_blocked(task.task_id, reason or "等待空闲 NPU 卡未成功")
-                return RunOutcome(task.task_id, "blocked", reason)
+        # Hardware readiness and collection run inside per-job card leases.
+        # A failed NPU channel must not prevent CPU evidence from being saved.
         self.queue.transition(task.task_id, q.STATE_TESTING, "开始按清单执行")
         submission = self._timed(task, 'testing', self._run, task, source_root)
         if submission is None:
@@ -514,6 +506,7 @@ class Executor:
                 [python_env, "-c",
                  "import torch; print(torch.version.git_version)"],
                 capture_output=True, text=True, timeout=300, check=False,
+                env={**os.environ, "TORCH_DEVICE_BACKEND_AUTOLOAD": "0"},
             )
         except subprocess.TimeoutExpired:
             return "failed", "安装核验（import torch）超时"
@@ -562,187 +555,187 @@ class Executor:
                 return candidate
         return None
 
-    # ------------------------------------------------------------------
-    # 环境预检（安装后、测试前）：环境级故障 blocked(env) 的分界线
-    # ------------------------------------------------------------------
-
-    def _preflight_cmd(
-        self, task: q.Task, tag: str, cmd: list[str], *, timeout: int,
-        cwd: Path | None = None, env: dict | None = None,
-        fail_marker: str | None = None,
-    ) -> tuple[bool, str]:
-        """跑一条预检命令：诊断落盘，返回 (ok, 摘要)。
-
-        fail_marker：输出中命中即视为失败（boot 自检的 "  FAIL  " 行）。
-        """
-        import subprocess
-
-        shown = " ".join(str(c) for c in cmd)
-        try:
-            proc = subprocess.run(
-                list(cmd), capture_output=True, text=True,
-                timeout=timeout, check=False, env=env,
-                cwd=str(cwd) if cwd else None,
-            )
-        except subprocess.TimeoutExpired as e:
-            self._save_diagnostics(task, f"$ {shown}\n[预检超时 {timeout}s]\n{e}", tag)
-            return False, f"[预检超时 {timeout}s]"
-        text = (
-            f"$ {shown}\nexit={proc.returncode}\n"
-            f"--- stdout ---\n{proc.stdout}\n--- stderr ---\n{proc.stderr}"
-        )
-        self._save_diagnostics(task, text, tag)
-        output = proc.stdout or ""
-        ok = proc.returncode == 0 and (fail_marker is None or fail_marker not in output)
-        if ok:
-            return True, ""
-        summary = (proc.stderr or output).strip()[-500:]
-        return False, f"exit={proc.returncode}: {summary}"
-
-    def _preflight(self, task: q.Task, source_root: Path) -> tuple[bool, str]:
-        """Run only the environment checks required by the manifest.
-
-        CPU-only work must remain runnable when NPU/CANN is unavailable. NPU
-        checks are required for accelerator and transfer-CUDA channels.
-        """
-        import os
-        from .runner import _merge_pythonpath
-        exec_cfg = self.config.get("executor") or {}
-        python_env = exec_cfg.get("test_python_env")
-        boot_dir = exec_cfg.get("transfer_boot_dir")
-        work_dir = Path(task.work_dir)
-        manifest = task.test_manifest or []
-        devices = {item.get("device") for item in manifest}
-        needs_npu = "accelerator" in devices
-
-        if needs_npu:
-            ok, out = self._preflight_cmd(
-                task, "preflight-1-npu",
-                [python_env, "-c", "import torch, torch_npu; assert torch_npu.npu.is_available(), 'npu unavailable'; print('npu devices:', torch_npu.npu.device_count())"],
-                timeout=300, cwd=work_dir,
-            )
-            if not ok:
-                return False, f"环境预检失败（torch_npu/NPU 不可用）: {out}"
-            ok, out = self._preflight_cmd(
-                task, "preflight-2-op",
-                [python_env, "-c", "import torch, torch_npu; x=torch.randn(64,64,device='npu'); print('matmul sum:', float((x@x).sum().item()))"],
-                timeout=300, cwd=work_dir,
-            )
-            if not ok:
-                return False, f"环境预检失败（NPU 算子执行失败）: {out}"
-
-        if manifest:
-            from .device_policy import test_execution_env, pytest_command
-            tf = manifest[0].get("runtime_nodeid") or manifest[0]["test_function"]
-            nodeid = tf.split("::", 1)[0]
-            nodeid = nodeid[len("test/"):] if nodeid.startswith("test/") else nodeid
-            env = test_execution_env(manifest[0]["device"], source_root, tf)
-            ok, out = self._preflight_cmd(task, "preflight-4-collect", pytest_command(python_env, manifest[0]["device"]) + [nodeid, "--collect-only", "-q", "-o", "addopts=", "-p", "no:cacheprovider"], timeout=600, cwd=source_root / "test", env=env)
-            if not ok:
-                # This is target-test evidence, not proof of an environment-wide failure.
-                self._save_diagnostics(task, out, "preflight-4-collect-target")
-        return True, ""
-
-    def _wait_for_free_npu(self, task: q.Task) -> tuple[bool, str, list[int]]:
-        """等卡门禁：accelerator 清单项执行前确认空闲 NPU 卡数量。
-
-        executor.wait_free_npu_cards 未配置（或 0）= 不启用门禁（不猜默认值）。
-        配置后：卡够 → 返回空闲卡列表；不够 → 每
-        wait_free_npu_interval_seconds 轮询一次，超过
-        wait_free_npu_timeout_seconds（0=一直等）→ 返回失败原因（blocked）。
-        返回 (ok, 原因, 空闲卡列表)。
-        """
-        cfg = (self.config.get("executor") or {})
-        need = int(cfg.get("wait_free_npu_cards") or 0)
-        if need <= 0 or not any(
-            x.get("device") == "accelerator" for x in (task.test_manifest or [])
-        ):
-            return True, "", []
-        timeout = float(cfg.get("wait_free_npu_timeout_seconds") or 0)
-        interval = max(float(cfg.get("wait_free_npu_interval_seconds") or 30), 1.0)
-        cards, why = self.npu_probe(need, timeout, interval)
-        if not cards:
-            return False, why, []
-        return True, "", cards
-
     def _parallel_enabled(self):
         from .cpu_capacity import worker_capacity
         configured = (self.config.get("executor") or {}).get("test_max_workers", 1)
         return configured == "auto" or worker_capacity(configured)["max_workers"] > 1
 
-    def _execute_families(self, task, source_root, families, extra_env):
+    def _execute_families(self, task, source_root, manifest, extra_env):
+        """Collect under leases, then release and expand into per-instance jobs."""
+        import threading
         from .runner import PytestRunner, FunctionRunOutcome
-        from .test_scheduler import CardPool, CardLease, TestJob, run_ordered
+        from .test_scheduler import CardPool, TestJob, JobExpansion, run_ordered
         from .cpu_capacity import worker_capacity, test_thread_env, thread_budget
+        from .device_policy import test_execution_env
+        from .npu_readiness import NpuReadiness
+        from .task_staging import atomic_json
         cfg = self.config.get("executor") or {}
         capacity = worker_capacity(cfg.get("test_max_workers", 1))
-        parallel = cfg.get("test_max_workers") == "auto" or capacity["max_workers"] > 1
+        parallel = self._parallel_enabled()
         execution_env = test_thread_env(extra_env) if parallel else dict(extra_env or {})
         threads = thread_budget(execution_env)
-        capacity_log = self.paths.diagnostics_root / task.task_id / "execution-capacity.json"
-        capacity_log.parent.mkdir(parents=True, exist_ok=True)
-        capacity_log.write_text(json.dumps({**capacity, "threads_per_test": threads,
-                                            "thread_env": {k: v for k, v in execution_env.items()
-                                                           if k.endswith("NUM_THREADS")}}, indent=2), encoding="utf-8")
-        pool = None
-        if parallel:
-            has_npu = any(item["device"] == "accelerator" for item, _, _ in families)
-            pool = self.card_pool or CardPool(self.paths.queue_dir / "npu-leases",
-                                             ids=None if has_npu else [])
-        jobs = []
-        sizes = []
-        for item, nodes, _ in families:
+        diagnostic_root = self.paths.diagnostics_root / task.task_id
+        diagnostic_root.mkdir(parents=True, exist_ok=True)
+        atomic_json(diagnostic_root / "execution-capacity.json", {
+            **capacity, "threads_per_test": threads,
+            "thread_env": {k: v for k, v in execution_env.items() if k.endswith("NUM_THREADS")}})
+        has_npu = any(item["device"] == "accelerator" for item in manifest)
+        pool = self.card_pool or CardPool(self.paths.queue_dir / "npu-leases",
+                                         ids=None if has_npu else [])
+        fd = getattr(self, "_executor_fd", None)
+        readiness = self.npu_readiness
+        if has_npu and readiness is None:
+            readiness = NpuReadiness(cfg.get("test_python_env"), diagnostic_root / "npu-readiness",
+                                     executor_fds=() if fd is None else (fd,),
+                                     timeout=float(cfg.get("npu_init_timeout_seconds", 300)),
+                                     cache_seconds=float(cfg.get("npu_readiness_cache_seconds", 60)))
+        selected = [None] * len(manifest)
+        manifest_lock = threading.Lock()
+
+        def record_selection(index, item, nodes, complete, bounded=None, error=None):
+            with manifest_lock:
+                selected[index] = dict(item=item, nodes=list(nodes), complete=complete,
+                                       bounded=bounded, error=error)
+                records = [entry for entry in selected if entry is not None]
+                atomic_json(diagnostic_root / "execution-manifest.json", {
+                    "task_id": task.task_id, "pytorch_commit": task.pytorch_commit,
+                    "interpreter": getattr(self.runner, 'python_env', None),
+                    "verified_against_execution": hasattr(self.runner, 'discover_runtime_nodes'),
+                    "discovery_complete": all(entry is not None for entry in selected),
+                    "max_instances_per_function_device": MAX_INSTANCES_PER_FUNCTION,
+                    "bounded_families": [entry["bounded"] for entry in records if entry["bounded"]],
+                    "families": [{"test_function": entry["item"]["test_function"],
+                                  "device": entry["item"]["device"], "error": entry["error"]}
+                                 for entry in records],
+                    "items": [{"test_function": entry["item"]["test_function"],
+                               "device": entry["item"]["device"],
+                               "execution_name": entry["item"]["device"] + "::" + node,
+                               "runtime_nodeid": node, "family_complete": entry["complete"]}
+                              for entry in records for node in entry["nodes"]]})
+
+        def needed(item, node):
+            if item["device"] == "cpu":
+                return 0
+            explicit = item.get("required_npu_cards")
+            inferred = (self.runner.required_npu_cards(node, "accelerator", len(pool.ids) if explicit is None else 0)
+                        if hasattr(self.runner, "required_npu_cards") else len(pool.ids) if explicit is None else 0)
+            return max(1, explicit or 0, inferred or 0)
+
+        def environment(dev, lease):
+            return {**execution_env, "TORCH_DEVICE_BACKEND_AUTOLOAD": "0",
+                    "ASCEND_RT_VISIBLE_DEVICES": ",".join(map(str, lease.cards)) if dev == "accelerator" else ""}
+
+        def unavailable(item, why):
+            return FunctionRunOutcome.incomplete(item["test_function"], item["device"], why,
+                                                  execution_status="env_init_error")
+
+        def check_device(item, lease, env):
+            if item["device"] == "cpu":
+                return None
+            full_env = {**test_execution_env("accelerator", source_root, item["test_function"]), **env}
+            result = readiness.ensure(lease, full_env)
+            if result.ok:
+                return None
+            # A concrete failing logical device maps back to exactly its leased
+            # physical card. Unlocated backend failures disable this environment
+            # for the task without claiming every device is physically broken.
+            cards = result.failed_cards or pool.ids
+            why = result.reason if result.failed_cards else "NPU environment probe failed; device not localized: " + result.reason
+            pool.quarantine(cards, why)
+            return FunctionRunOutcome.incomplete(item["test_function"], "accelerator",
+                result.log_text or why, execution_status=result.execution_status,
+                artifact_dir=str(getattr(readiness, "root", diagnostic_root / "npu-readiness")))
+
+        def execute(item, node, lease):
             tf, dev = item["test_function"], item["device"]
-            sizes.append(len(nodes))
-            for node in nodes:
-                need = 0
-                if parallel and dev == "accelerator":
-                    need = item.get("required_npu_cards")
-                    if need is None and hasattr(self.runner, "required_npu_cards"):
-                        need = self.runner.required_npu_cards(node, dev, len(pool.ids))
-                    elif need is not None and hasattr(self.runner, "required_npu_cards"):
-                        need = max(need, self.runner.required_npu_cards(node, dev, 0))
-                    if need is None:
-                        need = len(pool.ids)
-                    if need < 1 or need > len(pool.ids):
-                        raise ExecutorError(f"{node}: needs {need} NPU cards; pool has {len(pool.ids)}")
+            env = environment(dev, lease)
+            try:
+                failure = check_device(item, lease, env)
+                if failure is not None:
+                    return failure
+                kwargs = dict(source_root=source_root, extra_env=env)
+                if isinstance(self.runner, PytestRunner):
+                    kwargs.update(source_test_function=tf, lease_fds=lease.fds)
+                return self.runner.run_function(node, dev, **kwargs)
+            except Exception as error:
+                return FunctionRunOutcome.incomplete(tf, dev, f"runner exception for {node}: {error}")
 
-                def execute(lease, node=node, dev=dev, tf=tf):
-                    cards = lease.cards
-                    env = dict(execution_env)
-                    if parallel:
-                        env["ASCEND_RT_VISIBLE_DEVICES"] = ",".join(map(str, cards)) if dev == "accelerator" else ""
-                    kwargs = dict(source_root=source_root, extra_env=env or None)
+        def failed_collection(index, item, why, status="env_init_error", outcome=None):
+            record_selection(index, item, [], None, error=why)
+            outcome = outcome or FunctionRunOutcome.incomplete(item["test_function"], item["device"], why,
+                                                              execution_status=status)
+            return JobExpansion([], dict(item=item, nodes=[], complete=None, failure=outcome))
+
+        def collect(index, item, lease):
+            tf, dev = item["test_function"], item["device"]
+            env = environment(dev, lease)
+            try:
+                failure = check_device(item, lease, env)
+                if failure is not None:
+                    return failed_collection(index, item, failure.log_text, outcome=failure)
+                nodes = list(item.get("runtime_nodeids") or [])
+                if item.get("runtime_nodeid"):
+                    nodes.append(item["runtime_nodeid"])
+                nodes = list(dict.fromkeys(nodes))
+                complete = None
+                if hasattr(self.runner, "discover_runtime_nodes"):
+                    kwargs = dict(source_root=source_root, extra_env=env)
                     if isinstance(self.runner, PytestRunner):
-                        kwargs["source_test_function"] = tf
                         kwargs["lease_fds"] = lease.fds
-                    try:
-                        return self.runner.run_function(node, dev, **kwargs)
-                    except Exception as error:
-                        return FunctionRunOutcome.incomplete(tf, dev, f"runner exception for {node}: {error}")
+                    discovered = list(dict.fromkeys(self.runner.discover_runtime_nodes(tf, dev, **kwargs)))
+                    if not discovered:
+                        raise RuntimeError("runtime discovery returned no nodes")
+                    if nodes and tf not in nodes:
+                        stale = sorted(set(nodes) - set(discovered))
+                        if stale:
+                            raise RuntimeError(f"selected runtime nodes no longer collected: {stale}")
+                    else:
+                        nodes = discovered
+                    complete = set(nodes) == set(discovered)
+                elif not nodes:
+                    nodes = [tf]
+                bounded = None
+                if len(nodes) > MAX_INSTANCES_PER_FUNCTION:
+                    bounded = dict(test_function=tf, device=dev, selected_count=MAX_INSTANCES_PER_FUNCTION,
+                                   requested_count=len(nodes), deferred_count=len(nodes) - MAX_INSTANCES_PER_FUNCTION,
+                                   deferred_nodeids=nodes[MAX_INSTANCES_PER_FUNCTION:])
+                    nodes = nodes[:MAX_INSTANCES_PER_FUNCTION]
+                    complete = False
+                # The manifest is durable before the scheduler can admit children.
+                record_selection(index, item, nodes, complete, bounded)
+                children = [TestJob(dev + ":" + node, needed(item, node),
+                                    lambda lease, node=node: execute(item, node, lease),
+                                    cpu_threads=threads,
+                                    on_unavailable=lambda why: unavailable(item, why)) for node in nodes]
+                return JobExpansion(children, dict(item=item, nodes=nodes, complete=complete))
+            except Exception as error:
+                why = f"runtime discovery failed for {tf} [{dev}]: {error}"
+                self._save_diagnostics(task, why, f"discover-{tf}-{dev}")
+                return failed_collection(index, item, why, "collection_error")
 
-                jobs.append(TestJob(f"{dev}:{node}", need, execute, cpu_threads=threads))
-        if parallel:
-            log = self.paths.diagnostics_root / task.task_id / "scheduler.jsonl"
-            log.parent.mkdir(parents=True, exist_ok=True)
-            def event(**data):
-                data["time"] = datetime.now(timezone.utc).isoformat()
-                with log.open("a", encoding="utf-8") as stream:
-                    stream.write(json.dumps(data, ensure_ascii=False) + "\n")
-                if data["state"] == "resource_wait":
-                    print(f"[resource_wait] {data['key']} needs {data['required_cards']} cards; admission paused", flush=True)
-            ceiling = (capacity["limits"]["online"] if cfg.get("test_max_workers") == "auto"
-                       else capacity["max_workers"])
-            flat = run_ordered(jobs, pool, max_workers=ceiling,
+        jobs = [TestJob("collect:" + item["device"] + ":" + item["test_function"],
+                        needed(item, item["test_function"]),
+                        lambda lease, index=index, item=item: collect(index, item, lease),
+                        cpu_threads=threads, phase="collect",
+                        on_unavailable=lambda why, index=index, item=item: failed_collection(index, item, why))
+                for index, item in enumerate(manifest)]
+        log = diagnostic_root / "scheduler.jsonl"
+        def event(**data):
+            data["time"] = datetime.now(timezone.utc).isoformat()
+            with log.open("a", encoding="utf-8") as stream:
+                stream.write(json.dumps(data, ensure_ascii=False) + "\n")
+            if data["state"] == "resource_wait":
+                print(f"[resource_wait] {data['key']} needs {data['required_cards']} cards; CPU work may continue", flush=True)
+        ceiling = capacity["limits"]["online"] if cfg.get("test_max_workers") == "auto" else capacity["max_workers"]
+        expanded = run_ordered(jobs, pool, max_workers=ceiling,
                                cpu_budget=lambda: worker_capacity(cfg.get("test_max_workers", 1))["available_cpus"],
                                interval=max(0.1, float(cfg.get("test_resource_poll_seconds", 1))), event=event)
-        else:
-            flat = [job.run(CardLease(())) for job in jobs]
-        result, offset = [], 0
-        for size in sizes:
-            result.append(flat[offset:offset + size])
-            offset += size
-        return result
+        families, outcomes = [], []
+        for group in expanded:
+            meta = group.metadata
+            families.append((meta["item"], meta["nodes"], meta["complete"]))
+            outcomes.append([meta["failure"]] if meta.get("failure") is not None else group.results)
+        return families, outcomes
 
     def _run(self, task: q.Task, source_root: Path, extra_env: dict | None = None) -> Submission | None:
         """按清单执行测试，构造一份完整提交。中断时自行处理状态并返回 None。"""
@@ -768,78 +761,8 @@ class Executor:
             self.runner.begin_task()
             fd = getattr(self, "_executor_fd", None)
             self.runner.process_lease_fds = () if fd is None else (fd,)
-        families = []
-        expansion_limits = []
-        parallel = self._parallel_enabled()
-        if parallel:
-            from .cpu_capacity import test_thread_env
-            extra_env = test_thread_env(extra_env)
-        for item in task.test_manifest:
-            tf, dev = item["test_function"], item["device"]
-            explicit_nodes = list(item.get("runtime_nodeids") or [])
-            if item.get("runtime_nodeid"):
-                explicit_nodes.append(item["runtime_nodeid"])
-            runtime_nodes = list(dict.fromkeys(explicit_nodes))
-            family_complete = None
-            if hasattr(self.runner, "discover_runtime_nodes"):
-                try:
-                    discovery_env = dict(extra_env or {})
-                    if parallel and dev == "cpu":
-                        discovery_env["ASCEND_RT_VISIBLE_DEVICES"] = ""
-                    discovered = list(dict.fromkeys(self.runner.discover_runtime_nodes(
-                        tf, dev, source_root=source_root, extra_env=discovery_env or None)))
-                    if not discovered:
-                        raise RuntimeError("runtime discovery returned no nodes")
-                    if runtime_nodes and tf not in runtime_nodes:
-                        stale = sorted(set(runtime_nodes) - set(discovered))
-                        if stale:
-                            raise RuntimeError(f"selected runtime nodes no longer collected: {stale}")
-                    else:
-                        runtime_nodes = discovered
-                    family_complete = set(runtime_nodes) == set(discovered)
-                except Exception as error:
-                    log = f"runtime discovery failed for {tf} [{dev}]: {error}"
-                    self._save_diagnostics(task, log, f"discover-{tf}-{dev}")
-                    no_result.append(f"({tf}, {dev})")
-                    results.append(FunctionResult(
-                        test_function=tf, device=dev, counts=None, status="no_result",
-                        reason=log, log_content=log, execution_status="collection_error",
-                        coverage_status="unknown",
-                    ))
-                    # Never execute the static name after collection has rejected it.
-                    continue
-            elif not runtime_nodes:
-                runtime_nodes = [tf]
-            if len(runtime_nodes) > MAX_INSTANCES_PER_FUNCTION:
-                expansion_limits.append({
-                    "test_function": tf, "device": dev,
-                    "selected_count": MAX_INSTANCES_PER_FUNCTION,
-                    "requested_count": len(runtime_nodes),
-                    "deferred_count": len(runtime_nodes) - MAX_INSTANCES_PER_FUNCTION,
-                    "deferred_nodeids": runtime_nodes[MAX_INSTANCES_PER_FUNCTION:],
-                })
-                runtime_nodes = runtime_nodes[:MAX_INSTANCES_PER_FUNCTION]
-                # A bounded sample is not complete source-function coverage.
-                family_complete = False
-            families.append((item, runtime_nodes, family_complete))
-
-        # Keep canonical source identities for baseline compatibility. Actual
-        # execution identities are explicit and separately named per channel.
-        resolved_manifest = [
-            {"test_function": item["test_function"], "device": item["device"],
-             "execution_name": item["device"] + "::" + node,
-             "runtime_nodeid": node, "family_complete": complete}
-            for item, nodes, complete in families for node in nodes
-        ]
-        from .task_staging import atomic_json
-        atomic_json(self.paths.diagnostics_root / task.task_id / 'execution-manifest.json',
-                    {"task_id": task.task_id, "pytorch_commit": task.pytorch_commit,
-                     "interpreter": getattr(self.runner, 'python_env', None),
-                     "verified_against_execution": hasattr(self.runner, 'discover_runtime_nodes'),
-                     "max_instances_per_function_device": MAX_INSTANCES_PER_FUNCTION,
-                     "bounded_families": expansion_limits,
-                     "items": resolved_manifest})
-        family_outcomes = self._execute_families(task, source_root, families, extra_env)
+        families, family_outcomes = self._execute_families(
+            task, source_root, task.test_manifest, extra_env)
         for (item, runtime_nodes, family_complete), outcomes in zip(families, family_outcomes):
             tf, dev = item["test_function"], item["device"]
             complete = all(outcome.completed for outcome in outcomes)

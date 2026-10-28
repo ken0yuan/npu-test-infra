@@ -38,25 +38,7 @@ HEALTH_OK = "\tHealth                         : OK\n"
 HEALTH_BAD = "\tHealth                         : Warning\n"
 
 
-@pytest.fixture
-def fake_pip(monkeypatch):
-    """模拟 pip 卸载/安装与 torch 版本核验（同 test_executor 口径）。"""
-    import subprocess
-
-    def fake_run(cmd, *args, **kwargs):
-        joined = " ".join(str(c) for c in cmd)
-        stdout = ""
-        if "import torch" in joined:
-            stdout = COMMIT_A
-        elif "import sys" in joined:
-            stdout = "310"
-        elif "uninstall" in joined:
-            stdout = "Skipping torch_npu as it is not installed."
-        elif "install" in joined:
-            stdout = "Successfully installed torch torch_npu"
-        return subprocess.CompletedProcess(cmd, 0, stdout=stdout, stderr="")
-
-    monkeypatch.setattr(subprocess, "run", fake_run)
+from test_executor import fake_pip
 
 
 def test_npu_ids_parses_ascend_rows_only(monkeypatch):
@@ -145,74 +127,32 @@ def _verified_task(queue, *, pr=1, manifest=None):
 
 
 class TestExecutorGate:
-    def _executor(self, config, queue, probe, runner, **cfg):
-        return Executor({**config, "executor": {**(config.get("executor") or {}), **cfg}},
-                        queue_store=queue, downloader=FakeDownloader(),
-                        runner=runner, npu_probe=probe)
-
-    def test_gate_waits_then_runs(self, config, queue, paths, fake_pip):
-        """卡不足时门禁在探针内部等待，释放后进入 testing。"""
+    def test_serial_executor_uses_real_per_card_gate(self, config, queue, paths, fake_pip):
+        from run_test.test_scheduler import CardPool
         task = _verified_task(queue)
-        probe = FakeProbe(rounds_busy=1, free_cards=[2, 3, 6, 7])
-        runner = FakeRunner(counts_map={
-            (TF_A, "cpu"): Counts(1, 0, 0, 0),
-            (TF_B, "accelerator"): Counts(1, 0, 0, 0),
-        })
-        outcome = self._executor(config, queue, probe, runner,
-                                 wait_free_npu_cards=2,
-                                 wait_free_npu_interval_seconds=1).run_once()
-        assert outcome.outcome == "done", f"detail={outcome.detail!r}"
-        assert probe.polls == 2  # 第一轮无卡，第二轮放行
-        # 本轮不钉卡：运行环境不带 ASCEND_RT_VISIBLE_DEVICES。
-        assert all(not (e or {}).get("ASCEND_RT_VISIBLE_DEVICES")
-                   for e in runner.extra_envs)
-
-    def test_gate_timeout_blocks(self, config, queue, fake_pip):
-        task = _verified_task(queue)
-        probe = FakeProbe(rounds_busy=None, free_cards=[], timeout_reason="空闲卡一直不足")
-        executor = self._executor(config, queue, probe, FakeRunner(),
-                                  wait_free_npu_cards=1,
-                                  wait_free_npu_timeout_seconds=5)
-        outcome = executor.run_once()
-        assert outcome.outcome == "blocked"
-        t = queue.get_task(task.task_id)
-        assert t.state == q.STATE_BLOCKED
-        assert "空闲卡" in (t.error_reason or "")
-
-    def test_gate_empty_reason_gets_fallback(self, config, queue, fake_pip):
-        """探针返回空原因时不得以空原因 mark_blocked（防御）。"""
-        task = _verified_task(queue)
-        probe = FakeProbe(rounds_busy=None, free_cards=[], timeout_reason="")
-        executor = self._executor(config, queue, probe, FakeRunner(),
-                                  wait_free_npu_cards=1,
-                                  wait_free_npu_timeout_seconds=5)
-        outcome = executor.run_once()
-        assert outcome.outcome == "blocked"
-        assert (queue.get_task(task.task_id).error_reason or "") != ""
-
-    def test_cpu_only_task_skips_gate(self, config, queue, fake_pip):
-        task = _verified_task(queue, pr=2, manifest=[{"test_function": TF_A, "device": "cpu"}])
-
-        def probe(*a):
-            raise AssertionError("纯 cpu 任务不应触发等卡探测")
-
-        executor = self._executor(config, queue, probe, FakeRunner(),
-                                  wait_free_npu_cards=1)
-        assert executor.run_once().outcome == "done"
-
-    def test_gate_disabled_without_config(self, config, queue, fake_pip):
-        """未配置 wait_free_npu_cards 不启用门禁（不猜默认值约定）。"""
-        _verified_task(queue)
-        calls = {"n": 0}
-
-        def probe(*a):
-            calls["n"] += 1
-            return list(range(8)), ""
-
         runner = FakeRunner()
-        outcome = self._executor(config, queue, probe, runner).run_once()
-        assert outcome.outcome == "done", f"detail={outcome.detail!r}"
-        assert calls["n"] == 0
+        executor = Executor(config, queue_store=queue, downloader=FakeDownloader(), runner=runner)
+        executor.card_pool = CardPool(paths.queue_dir / "cards", ids=[4], is_free=lambda _: True)
+        assert executor.run_once().outcome == "done"
+        assert [env["ASCEND_RT_VISIBLE_DEVICES"] for env in runner.extra_envs] == ["", "4"]
+        assert not executor.card_pool.reserved
+
+    def test_no_cards_does_not_discard_cpu_results(self, config, queue, paths, fake_pip):
+        from run_test.test_scheduler import CardPool
+        _verified_task(queue)
+        runner = FakeRunner()
+        executor = Executor(config, queue_store=queue, downloader=FakeDownloader(), runner=runner)
+        executor.card_pool = CardPool(paths.queue_dir / "cards", ids=[], is_free=lambda _: False)
+        assert executor.run_once().outcome == "done"
+        assert len(runner.extra_envs) == 1 and runner.extra_envs[0]["ASCEND_RT_VISIBLE_DEVICES"] == ""
+
+    def test_cpu_only_never_queries_cards(self, config, queue, fake_pip, monkeypatch):
+        from run_test import npu_cards
+        _verified_task(queue, manifest=[{"test_function": TF_A, "device": "cpu"}])
+        def forbidden(*args):
+            pytest.fail("CPU work must not query NPU readiness or occupancy")
+        monkeypatch.setattr(npu_cards, "npu_ids", forbidden)
+        assert Executor(config, queue_store=queue, downloader=FakeDownloader(), runner=FakeRunner()).run_once().outcome == "done"
 
 
 class FakeProbe:

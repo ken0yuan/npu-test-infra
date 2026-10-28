@@ -5,6 +5,7 @@
 """
 
 import itertools
+import json
 import platform
 import subprocess
 
@@ -55,10 +56,17 @@ class FakeRunner:
 def fake_pip(monkeypatch):
     """模拟 pip 卸载/安装与 torch 版本核验。"""
 
+    from run_test import npu_cards
+    monkeypatch.setattr(npu_cards, "npu_ids", lambda: list(range(8)))
+    monkeypatch.setattr(npu_cards, "card_free", lambda card: True)
+
     def fake_run(cmd, *args, **kwargs):
         joined = " ".join(str(c) for c in cmd)
         stdout = ""
-        if "import torch" in joined:
+        if "NPU_READINESS_RESULT:" in joined:
+            stdout = "NPU_READINESS_RESULT:" + json.dumps(dict(ok=True, checked=json.loads(cmd[3]),
+                failed_logical_device=None, error=""))
+        elif "import torch" in joined:
             stdout = COMMIT_A  # 安装后的 git_version 与任务锁定一致
         elif "import sys" in joined:
             stdout = "310"  # 解释器版本探针（qualified/split 包名带 python_tag 时触发）
@@ -396,96 +404,53 @@ class TestNoResult:
         assert (paths.diagnostics_root / task.task_id).is_dir()
 
 class TestPreflight:
-    """环境预检：环境级故障 blocked(env)，不进 testing、不跑清单。"""
+    def test_npu_unavailable_keeps_cpu_results(self, config, queue, paths, fake_pip, monkeypatch):
+        normal = subprocess.run
+        def run(cmd, **kwargs):
+            if "NPU_READINESS_RESULT:" in " ".join(map(str, cmd)):
+                return subprocess.CompletedProcess(cmd, 73, "NPU_READINESS_RESULT:" + json.dumps(
+                    dict(ok=False, checked=[], failed_logical_device=None, error="NPU unavailable")), "NPU unavailable")
+            return normal(cmd, **kwargs)
+        monkeypatch.setattr(subprocess, "run", run)
+        task = verified_task(queue); runner = FakeRunner()
+        outcome = Executor(config, queue_store=queue, downloader=FakeDownloader(), runner=runner).run_once()
+        assert outcome.outcome == "done"
+        with connect(paths.pr_db) as db:
+            record = get_pr_result(db, 123456)
+        assert record.counts == Counts(1, 0, 0, 0)
+        npu = next(item for item in record.tests if item["device"] == "accelerator")
+        assert npu["status"] == "no_result" and npu["execution_status"] == "env_init_error"
+        assert len(runner.source_roots) == 1
+        assert list((paths.diagnostics_root / task.task_id / "npu-readiness").glob("*/result.json"))
 
-    @staticmethod
-    def _dispatch_run(monkeypatch, responses):
-        """按子串分派的 subprocess.run 桩：首个命中 (needle, rc, stdout) 生效。"""
-        def fake(cmd, *args, **kwargs):
-            joined = " ".join(str(c) for c in cmd)
-            for needle, rc, stdout in responses:
-                if needle in joined:
-                    return subprocess.CompletedProcess(cmd, rc, stdout=stdout, stderr="")
-            return subprocess.CompletedProcess(cmd, 0, stdout="ok", stderr="")
-        monkeypatch.setattr(subprocess, "run", fake)
-
-    def test_npu_unavailable_blocks(self, config, queue, paths, monkeypatch):
-        self._dispatch_run(monkeypatch, [
-            ("npu.is_available", 1, ""),
-            ("import torch", 0, COMMIT_A),
-        ])
-        task = verified_task(queue)
-        runner = FakeRunner()
-        executor = Executor(
-            config, queue_store=queue, downloader=FakeDownloader(), runner=runner
-        )
-        outcome = executor.run_once()
-        assert outcome.outcome == "blocked"
-        t = queue.get_task(task.task_id)
-        assert t.state == q.STATE_BLOCKED
-        assert "torch_npu/NPU 不可用" in t.error_reason
-        assert runner.source_roots == []
-        assert any(
-            p.name.startswith("preflight-1-npu")
-            for p in (paths.diagnostics_root / task.task_id).glob("*.log")
-        )
-
-    def test_boot_selfcheck_fail_line_blocks(self, config, queue, paths, tmp_path, monkeypatch):
-        """boot 自检输出含 FAIL 行（即使退出码 0）→ blocked。"""
-        boot = tmp_path / "transfer_boot"
-        boot.mkdir()
-        (boot / "boot_selfcheck.py").write_text("# stub\n")
-        config["executor"]["transfer_boot_dir"] = str(boot)
-        self._dispatch_run(monkeypatch, [
-            ("boot_selfcheck.py", 0, "  PASS  npu available\n  FAIL  v3.1 _cuda_setStream 路由\n"),
-            ("npu.is_available", 0, "npu devices: 4"),
-            ("randn", 0, "matmul sum: 1.0"),
-            ("import torch", 0, COMMIT_A),
-        ])
+    def test_unsupported_channel_still_blocks_before_install(self, config, queue, fake_pip):
         task = verified_task(queue, manifest=[{"test_function": TF_A, "device": "cuda"}])
         runner = FakeRunner()
-        executor = Executor(
-            config, queue_store=queue, downloader=FakeDownloader(), runner=runner
-        )
-        outcome = executor.run_once()
+        outcome = Executor(config, queue_store=queue, downloader=FakeDownloader(), runner=runner).run_once()
         assert outcome.outcome == "blocked"
         assert "只允许 cpu / accelerator" in queue.get_task(task.task_id).error_reason
-        assert runner.source_roots == []
+        assert not runner.source_roots
 
-    def test_collect_smoke_failure_blocks(self, config, queue, paths, monkeypatch):
-        self._dispatch_run(monkeypatch, [
-            ("--collect-only", 2, "ERROR: file or directory not found"),
-            ("npu.is_available", 0, "npu devices: 4"),
-            ("randn", 0, "matmul sum: 1.0"),
-            ("import torch", 0, COMMIT_A),
-        ])
-        task = verified_task(queue)
-        runner = FakeRunner()
-        executor = Executor(
-            config, queue_store=queue, downloader=FakeDownloader(), runner=runner
-        )
-        outcome = executor.run_once()
-        assert outcome.outcome == "done"
+    def test_collection_failure_is_local_to_its_channel(self, config, queue, paths, fake_pip):
+        class Collects(FakeRunner):
+            def discover_runtime_nodes(self, tf, dev, **kwargs):
+                if dev == "accelerator":
+                    raise RuntimeError("ERROR: file or directory not found")
+                return [tf]
+        task = verified_task(queue); runner = Collects()
+        assert Executor(config, queue_store=queue, downloader=FakeDownloader(), runner=runner).run_once().outcome == "done"
+        with connect(paths.pr_db) as db:
+            record = get_pr_result(db, 123456)
+        npu = next(item for item in record.tests if item["device"] == "accelerator")
+        assert npu["execution_status"] == "collection_error" and record.counts.pass_count == 1
+        assert len(runner.source_roots) == 1
+
+    def test_readiness_success_retains_receipt_and_executes(self, config, queue, paths, fake_pip):
+        task = verified_task(queue); runner = FakeRunner()
+        assert Executor(config, queue_store=queue, downloader=FakeDownloader(), runner=runner).run_once().outcome == "done"
+        receipts = list((paths.diagnostics_root / task.task_id / "npu-readiness").glob("*/result.json"))
+        assert receipts and all(json.loads(path.read_text())["completed"] for path in receipts)
         assert runner.source_roots
-        assert any("preflight-4-collect-target" in p.name for p in (paths.diagnostics_root / task.task_id).glob("*.log"))
-
-    def test_preflight_pass_writes_diagnostics_and_runs(self, config, queue, paths, monkeypatch):
-        """四步全过：诊断落盘（可追溯），任务正常进入 testing 并完成。"""
-        self._dispatch_run(monkeypatch, [
-            ("npu.is_available", 0, "npu devices: 4"),
-            ("randn", 0, "matmul sum: 1.0"),
-            ("import torch", 0, COMMIT_A),
-        ])
-        task = verified_task(queue)
-        runner = FakeRunner()
-        executor = Executor(
-            config, queue_store=queue, downloader=FakeDownloader(), runner=runner
-        )
-        outcome = executor.run_once()
-        assert outcome.outcome == "done"
-        names = {p.name.split("-20")[0] for p in (paths.diagnostics_root / task.task_id).glob("preflight-*.log")}
-        assert {"preflight-1-npu", "preflight-2-op", "preflight-4-collect"} <= names
-        assert runner.source_roots  # 清单确实跑了
 
 
 class TestAbortPaths:

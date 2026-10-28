@@ -10,7 +10,7 @@ from run_test.device_detect import make_device_resolver
 from run_test.device_policy import ExecutionDeviceResolver
 from run_test.runner import PytestRunner
 from run_test.executor import Executor
-from test_executor import verified_task
+from test_executor import verified_task, fake_pip
 
 
 def test_nested_helpers_keep_outer_references_but_never_become_candidates():
@@ -100,7 +100,7 @@ def test_copied_template_uses_exact_origin_and_excludes_other_backends(copied_te
     assert result.completed and result.counts.pass_count == 1
 
 
-def test_execution_artifact_has_separate_device_qualified_names(config, queue, paths, tmp_path):
+def test_execution_artifact_has_separate_device_qualified_names(config, queue, paths, tmp_path, fake_pip):
     root = tmp_path / 'source'; path = root / 'test/test_plain.py'; path.parent.mkdir(parents=True)
     path.write_text('def test_plain(): pass\n')
     tf = 'test/test_plain.py::test_plain'

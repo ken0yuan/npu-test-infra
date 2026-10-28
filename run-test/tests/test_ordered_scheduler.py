@@ -6,7 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
-from run_test.test_scheduler import CardPool, TestJob, run_ordered
+from run_test.test_scheduler import CardPool, JobExpansion, TestJob, run_ordered
 from run_test.process_lock import executor_lease, lease_handle
 from run_test.task_queue import validate_manifest, QueueError
 
@@ -161,3 +161,172 @@ def test_resource_manifest_validation():
     assert validate_manifest([row]) == [row]
     for value in [0,-1,True,'2']:
         with pytest.raises(QueueError): validate_manifest([{**row,'required_npu_cards':value}])
+
+
+def test_cpu_collection_expands_and_executes_while_npu_collection_waits(tmp_path):
+    free = threading.Event()
+    cpu_finished = threading.Event()
+    waiting = threading.Event()
+    pool = CardPool(tmp_path, ids=[4], is_free=lambda _: free.is_set())
+    def execute_cpu(_):
+        cpu_finished.set()
+        return 'cpu result'
+    def event(**data):
+        if data['state'] == 'resource_wait' and data['phase'] == 'collect':
+            waiting.set()
+    jobs = [
+        TestJob('npu collect', 1, lambda _: JobExpansion([
+            TestJob('npu instance', 1, lambda lease: lease.cards)]), phase='collect'),
+        TestJob('cpu collect', 0, lambda _: JobExpansion([
+            TestJob('cpu instance', 0, execute_cpu)]), phase='collect'),
+    ]
+    with ThreadPoolExecutor(1) as executor:
+        future = executor.submit(run_ordered, jobs, pool, max_workers=2, interval=.01, event=event)
+        try:
+            assert waiting.wait(5) and cpu_finished.wait(5)
+            assert not future.done()
+        finally:
+            free.set()
+        result = future.result(timeout=5)
+    assert result[0].results == [(4,)]
+    assert result[1].results == ['cpu result']
+
+
+def test_collection_releases_cards_before_expanded_instances_fill_pool(tmp_path):
+    pool = CardPool(tmp_path, ids=[2, 4], is_free=lambda _: True)
+    barrier = threading.Barrier(2)
+    events = []
+    def execute(lease):
+        barrier.wait(timeout=5)
+        return lease.cards
+    def collect(lease):
+        assert lease.cards == (2, 4)
+        return JobExpansion([TestJob('instance-a', 1, execute), TestJob('instance-b', 1, execute)],
+                            metadata={'selected': 2})
+    def event(**data):
+        events.append(data)
+        if data['state'] == 'expanded':
+            assert not pool.reserved
+            # Physical file locks, not just the in-memory set, are released.
+            other = CardPool(tmp_path, ids=[2, 4], is_free=lambda _: True)
+            lease = other.acquire(2)
+            assert lease is not None
+            other.release(lease)
+    result = run_ordered([TestJob('collect', 2, collect, phase='collect')], pool,
+                         max_workers=2, interval=.01, event=event)
+    assert result[0].metadata == {'selected': 2}
+    assert result[0].results == [(2,), (4,)]
+    assert [e['phase'] for e in events if e['state'] == 'started'] == ['collect', 'execute', 'execute']
+    assert not pool.reserved
+
+
+def test_quarantined_card_finishes_unavailable_multicard_job_and_cpu_continues(tmp_path):
+    pool = CardPool(tmp_path, ids=[2, 4], is_free=lambda _: True)
+    ran = []
+    def collect(lease):
+        pool.quarantine([2], 'TSD initialization failed on physical card 2')
+        return JobExpansion([
+            TestJob('needs-two', 2, lambda _: pytest.fail('must not reduce card requirement'),
+                    on_unavailable=lambda reason: {'status': 'no_result', 'reason': reason}),
+            TestJob('healthy-one', 1, lambda child: child.cards),
+            TestJob('cpu', 0, lambda _: ran.append('cpu') or 'cpu result'),
+        ])
+    result = run_ordered([TestJob('collect', 2, collect, phase='collect')], pool,
+                         max_workers=3, interval=.01)
+    rejected, healthy, cpu = result[0].results
+    assert rejected['status'] == 'no_result' and 'needs 2' in rejected['reason']
+    assert 'healthy pool has 1/2' in rejected['reason']
+    assert healthy == (4,) and cpu == 'cpu result' and ran == ['cpu']
+    assert pool.unavailable_reason(1) is None and not pool.reserved
+    assert pool.acquire(2) is None
+
+
+def test_quarantine_without_handler_is_not_an_infinite_resource_wait(tmp_path):
+    pool = CardPool(tmp_path, ids=[4], is_free=lambda _: True)
+    pool.quarantine([4], 'device init failed')
+    with pytest.raises(ValueError, match='healthy pool has 0/1'):
+        run_ordered([TestJob('npu', 1, lambda _: pytest.fail('unavailable'))], pool, interval=.01)
+    with pytest.raises(ValueError, match='outside the visible pool'):
+        pool.quarantine([8], 'wrong mapping')
+
+
+def test_expansion_preserves_parent_and_child_order_and_one_cpu_budget(tmp_path):
+    pool = CardPool(tmp_path, ids=[])
+    lock = threading.Lock()
+    barrier = threading.Barrier(2)
+    active = peak = 0
+    def execute(value):
+        def run(_):
+            nonlocal active, peak
+            with lock:
+                active += 1
+                peak = max(peak, active)
+            try:
+                barrier.wait(timeout=5)
+                return value
+            finally:
+                with lock:
+                    active -= 1
+        return run
+    first = JobExpansion([TestJob('a1', 0, execute('a1')), TestJob('a2', 0, execute('a2'))], metadata='first')
+    second = JobExpansion([TestJob('b1', 0, execute('b1')), TestJob('b2', 0, execute('b2'))], metadata='second')
+    result = run_ordered([
+        TestJob('first collect', 0, lambda _: first, phase='collect'),
+        TestJob('second collect', 0, lambda _: second, phase='collect'),
+    ], pool, max_workers=8, cpu_budget=lambda: 2, interval=.01)
+    assert [item.metadata for item in result] == ['first', 'second']
+    assert [item.results for item in result] == [['a1', 'a2'], ['b1', 'b2']]
+    assert peak == 2
+
+
+def test_expanded_failure_drains_other_children_before_releasing_card_leases(tmp_path):
+    pool = CardPool(tmp_path, ids=[2, 4], is_free=lambda _: True)
+    barrier = threading.Barrier(2)
+    finished = threading.Event()
+    failed_released = threading.Event()
+    allow_finish = threading.Event()
+    original_release = pool.release
+    def release(lease):
+        original_release(lease)
+        if lease.cards == (2,):
+            failed_released.set()
+    pool.release = release
+    def fail(_):
+        barrier.wait(timeout=5)
+        raise RuntimeError('expanded failure')
+    def finish(_):
+        barrier.wait(timeout=5)
+        assert allow_finish.wait(10)
+        finished.set()
+        return True
+    collector = TestJob('collect', 2, lambda _: JobExpansion([
+        TestJob('fail', 1, fail), TestJob('finish', 1, finish)]), phase='collect')
+    with ThreadPoolExecutor(1) as executor:
+        future = executor.submit(run_ordered, [collector], pool, max_workers=2, interval=.01)
+        try:
+            assert failed_released.wait(5)
+            assert not future.done() and not finished.is_set()
+            assert pool.reserved == {4}
+            other = CardPool(tmp_path, ids=[2, 4], is_free=lambda _: True)
+            assert other.acquire(2) is None
+        finally:
+            allow_finish.set()
+        with pytest.raises(RuntimeError, match='expanded failure'):
+            future.result(timeout=5)
+    assert finished.is_set() and not pool.reserved
+    lease = pool.acquire(2)
+    assert lease is not None
+    pool.release(lease)
+
+
+def test_event_failure_releases_newly_acquired_lease(tmp_path):
+    pool = CardPool(tmp_path, ids=[2], is_free=lambda _: True)
+    def event(**data):
+        if data['state'] == 'started':
+            raise RuntimeError('event output failed')
+    with pytest.raises(RuntimeError, match='event output failed'):
+        run_ordered([TestJob('npu', 1, lambda _: True)], pool, event=event)
+    assert not pool.reserved
+    lease = pool.acquire(1)
+    assert lease is not None
+    pool.release(lease)
