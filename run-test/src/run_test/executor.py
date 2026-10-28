@@ -496,6 +496,15 @@ class Executor:
                 ))
             except ExecutorError as e:
                 return "failed", f"测试依赖安装失败: {e}"
+        # PyTorch main can require C++20 while Triton-Ascend 3.6.0's runtime
+        # launcher still requests C++17. Reapply the guarded compatibility step
+        # after pip so a fresh installation cannot silently restore that flag.
+        try:
+            logs.append(self._run_cmd(
+                [python_env, str(Path(__file__).with_name('triton_compat.py'))], check=True,
+            ))
+        except ExecutorError as e:
+            return "failed", f"Triton 编译环境兼容检查失败: {e}"
         self._save_diagnostics(task, "\n".join(logs), "install")
 
         # 安装后核验：torch 的 git commit 必须与任务锁定版本一致，

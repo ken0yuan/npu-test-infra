@@ -51,22 +51,23 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "allowed_devices": ["cpu", "accelerator"],
         # 指定测试 Python 环境（解释器绝对路径）。文档第 6 节：
         # 具体路径需实施配置明确，不得默认使用系统 Python。
-        # 注意：OBS 包内 wheel 全部为 cp310（构建镜像 py3.10），必须 3.10。
+        # 解释器须匹配 OBS wheel 的 Python tag；当前部署为 py311。
         "test_python_env": None,
         # 测试框架依赖（wheel 安装后额外 pip install 的包清单）。
         # 官方测试容器镜像预装这些；本机串行执行环境需显式给出。
         # torch 已在本地装好，pip 不会从软件源替换它。
         "test_requirements": [
-            "pytest",
+            "pytest==8.4.2",
             "hypothesis",
             "parameterized",
             "zstandard",
             "pandas",
             "pydot",
             "z3-solver",
+            "triton-ascend==3.6.0",
         ],
-        # triton-ascend 不在此列：与 torch 版本强配套，需按被测版本确定
-        # 配套版本后单独安装（见 docs/archive/PIPELINE.md 待确认事项；venv310 已预装 3.2.0）。
+        # 用户指定 Triton-Ascend 3.6.0；测试 venv 配置官方 Ascend 软件源。
+        # 其 wheel 要求 pytest>=8.3.2,<9；详见 docs/requirements-test.txt。
         # device → 传给测试执行接口的附加参数（“已有测试执行接口”的对接点）。
         "device_runner_args": {},
         # 单函数执行超时（秒），None 表示不限制。

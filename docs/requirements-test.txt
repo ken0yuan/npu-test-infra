@@ -1,19 +1,21 @@
 # Shared test dependencies only. torch / torch_npu / torchvision come from OBS.
+# Official Ascend wheels; see run_test/environment-setup.md for install order.
+--extra-index-url https://mirrors.huaweicloud.com/ascend/repos/pypi
 # ARM64 Ubuntu 22.04: newer z3 wheels may require a newer glibc.
 numpy==1.26.4
 z3-solver==4.15.4.0
-pytest==9.0.3
+pytest==8.4.2
 hypothesis
 parameterized
 expecttest
-pytest-xdist
+pytest-xdist==3.6.1
 pytest-timeout
 zstandard
 pandas
 pydot
-scipy
+scipy==1.13.1
 sympy
-psutil
+psutil==6.0.0
 PyYAML
 pillow
 requests
@@ -28,3 +30,9 @@ six
 setuptools>=68
 wheel
 ninja
+attrs==24.2.0
+decorator==5.1.1
+pyelftools>=0.29
+pybind11
+triton==3.6.0
+triton-ascend==3.6.0
