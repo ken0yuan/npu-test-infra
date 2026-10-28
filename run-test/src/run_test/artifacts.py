@@ -1,5 +1,6 @@
 """OBS bundle names observed in the live 7day-cache listing, without guessing identity."""
 import re
+from datetime import datetime
 
 
 def wheel_identity(url):
@@ -37,7 +38,7 @@ def _token_filter(config):
     return required
 
 
-def _match(listing, bucket, sha10, required, formats):
+def _matches(listing, bucket, sha10, required, formats):
     candidates = []
     for url in listing:
         identity = wheel_identity(url)
@@ -45,23 +46,65 @@ def _match(listing, bucket, sha10, required, formats):
                 and identity['format'] in formats and identity['pytorch_short'] == sha10
                 and all(token in url.rsplit('/', 1)[-1] for token in required)):
             candidates.append(url)
-    if len(candidates) > 1:
-        raise ValueError(f'{sha10}: 多个 wheel 构建匹配；请设置 obs.wheel_name_contains: {sorted(candidates)}')
-    return candidates[0] if candidates else None
+    return candidates
+
+
+def _pair_key(url):
+    identity = wheel_identity(url)
+    version = re.search(r'-v(\d+)\.tar\.gz$', url)
+    return (identity['python_tag'], identity['architecture'],
+            identity['build_environment'], version[1] if version else None)
+
+
+def _latest(listing, sha10, bundles):
+    if len(bundles) <= 1:
+        return bundles[0] if bundles else (None, None)
+    ranked = []
+    for bundle in bundles:
+        times = []
+        for url in filter(None, bundle):
+            value = listing[url].get('last_modified')
+            try:
+                stamp = datetime.fromisoformat(value.replace('Z', '+00:00'))
+                if stamp.tzinfo is None:
+                    raise ValueError('timezone missing')
+            except (AttributeError, TypeError, ValueError):
+                raise ValueError(
+                    f'{sha10}: 多个 wheel 构建缺少有效的 OBS last_modified；'
+                    f'无法选择最新完整套包，请设置 obs.wheel_name_contains: {url}'
+                ) from None
+            times.append(stamp.timestamp())
+        # A split bundle becomes complete when its last member is uploaded.
+        # Equal timestamps use member times and URLs for stable listing order.
+        ranked.append(((max(times), tuple(times), tuple(u or '' for u in bundle)), bundle))
+    return max(ranked, key=lambda item: item[0])[1]
 
 
 def select_bundle(listing, bucket, sha10, config):
-    """按对象名配对一个 sha 的 wheels 主体与独立 torch_npu 包。
+    """选择同一 sha、配置过滤范围内最新上传的完整 wheels 套包。
 
     返回 {'wheels': 主体包 URL 或 None, 'wheels_npu': 拆分包的 torch_npu
     包 URL 或 None}；legacy/qualified 格式 torch_npu 在主体包内，
-    wheels_npu 恒为 None。两类候选各自歧义都算构建歧义。
+    wheels_npu 恒为 None。拆分包必须匹配 Python、架构、构建环境和包格式
+    版本。按套包最后一个成员的 OBS last_modified 排序，未上传完整的新
+    构建不挤掉已有完整套包；多个候选缺少可信时间戳时保留显式歧义。
     """
     required = _token_filter(config)
-    wheels = _match(listing, bucket, sha10, required,
-                    ('legacy', 'qualified', 'split-pytorch'))
-    wheels_npu = _match(listing, bucket, sha10, required, ('split-torchnpu',))
-    return {'wheels': wheels, 'wheels_npu': wheels_npu}
+    wheels = _matches(listing, bucket, sha10, required,
+                      ('legacy', 'qualified', 'split-pytorch'))
+    npu = _matches(listing, bucket, sha10, required, ('split-torchnpu',))
+    complete, incomplete = [], []
+    for wheel in wheels:
+        if wheel_identity(wheel)['format'] != 'split-pytorch':
+            complete.append((wheel, None))
+            continue
+        paired = [url for url in npu if _pair_key(url) == _pair_key(wheel)]
+        if paired:
+            complete.extend((wheel, url) for url in paired)
+        else:
+            incomplete.append((wheel, None))
+    wheel, torch_npu = _latest(listing, sha10, complete or incomplete)
+    return {'wheels': wheel, 'wheels_npu': torch_npu}
 
 
 def select_wheel(listing, bucket, sha10, config):

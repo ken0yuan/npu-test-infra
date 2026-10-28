@@ -128,6 +128,37 @@ class TestMirror:
 
 
 class TestCycle:
+    def test_latest_complete_split_build_unblocks_pending_commit(self, setup):
+        config, queue, mirror, shas = setup
+        sha10 = shas['pr2'][:10]
+        bucket = 'obs://pytorch-ci-cache/7day-cache'
+        config['obs']['wheel_name_contains'] = ['-py311-', '-torch-npu-builder-', 'aarch64']
+        def urls(image):
+            suffix = f'py311-torch-npu-builder-aarch64-{image}-aarch64-v3.tar.gz'
+            return (f'{bucket}/wheels-pytorch-{sha10}-{suffix}',
+                    f'{bucket}/wheels-torchnpu-abcdef0123-{sha10}-{suffix}')
+        old_pt, old_npu = urls('202610200103')
+        new_pt, new_npu = urls('202610160225')
+        objects = {
+            old_pt: {'etag':'p1'}, old_npu: {'etag':'n1'},
+            new_pt: {'etag':'p2'}, new_npu: {'etag':'n2'},
+            f'{bucket}/pytorch-source-{sha10}.tar.gz': {'etag':'source'},
+        }
+        # A missing timestamp remains a visible pending commit, then a later
+        # complete listing can admit it without manually rewriting its state.
+        assert _cycle(config, queue, mirror, objects).errors
+        for url in (old_pt, old_npu):
+            objects[url]['last_modified'] = '2026-10-27T01:00:00Z'
+        for url in (new_pt, new_npu):
+            objects[url]['last_modified'] = '2026-10-27T02:00:00Z'
+        report = _cycle(config, queue, mirror, objects)
+        assert len(report.enqueued) == 1 and not report.errors
+        task = queue.get_task(report.enqueued[0]['task_id'])
+        assert (task.obs_wheels_url, task.obs_wheels_npu_url) == (new_pt, new_npu)
+        assert (task.obs_wheels_version, task.obs_wheels_npu_version) == ('p2', 'n2')
+        assert task.pytorch_commit == shas['pr2']
+        assert not _cycle(config, queue, mirror, objects).enqueued
+
     def test_qualified_bundle_and_ambiguous_build(self, setup):
         config, queue, mirror, shas = setup
         sha10 = shas["pr2"][:10]

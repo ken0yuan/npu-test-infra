@@ -107,8 +107,66 @@ def test_torchnpu_without_v_suffix_is_still_a_different_product():
     assert inventory(listing, BUCKET, {})['unique_pairs'] == []
 
 
-def test_multiple_npu_builds_require_explicit_filter():
+def test_npu_from_another_build_environment_is_not_paired():
     other = NPU_NAME.replace('e0dcc43e', '8a315d17')
     listing = {PT_NAME:{}, NPU_NAME:{}, other:{}, f'{BUCKET}/pytorch-source-{SHA}.tar.gz':{}}
-    with pytest.raises(ValueError, match='多个 wheel'):
+    assert select_bundle(listing, BUCKET, SHA, {}) == {'wheels':PT_NAME, 'wheels_npu':NPU_NAME}
+
+
+def test_latest_complete_bundle_uses_upload_time_not_image_date():
+    older_pt = PT_NAME.replace('202610200103', '202610160225')
+    older_npu = NPU_NAME.replace('202610200103', '202610160225')
+    listing = {
+        PT_NAME: {'last_modified': '2026-10-27T03:03:55Z'},
+        NPU_NAME: {'last_modified': '2026-10-27T03:08:31Z'},
+        older_pt: {'last_modified': '2026-10-27T03:21:25Z'},
+        older_npu: {'last_modified': '2026-10-27T03:24:24Z'},
+    }
+    expected = {'wheels':older_pt, 'wheels_npu':older_npu}
+    assert select_bundle(listing, BUCKET, SHA, {}) == expected
+    assert select_bundle(dict(reversed(list(listing.items()))), BUCKET, SHA, {}) == expected
+
+
+def test_incomplete_newer_build_does_not_displace_complete_pair():
+    newer_pt = PT_NAME.replace('e0dcc43e', '12345678')
+    listing = {PT_NAME: {}, NPU_NAME: {}, newer_pt: {'last_modified':'2026-10-28T00:00:00Z'}}
+    assert select_bundle(listing, BUCKET, SHA, {}) == {'wheels':PT_NAME, 'wheels_npu':NPU_NAME}
+
+
+@pytest.mark.parametrize('change', [
+    ('py311-', 'py312-'), ('-aarch64-v2', '-x86_64-v2'),
+    ('e0dcc43e', '12345678'), ('-v2.tar.gz', '-v3.tar.gz'),
+])
+def test_split_pair_rejects_incompatible_members(change):
+    listing = {PT_NAME: {}, NPU_NAME.replace(*change): {}}
+    assert select_bundle(listing, BUCKET, SHA, {}) == {'wheels':PT_NAME, 'wheels_npu':None}
+
+
+def test_latest_npu_within_same_environment_is_selected():
+    other = NPU_NAME.replace('abcdef0123', '1234567890')
+    listing = {PT_NAME: {'last_modified':'2026-10-27T04:00:00Z'},
+               NPU_NAME: {'last_modified':'2026-10-27T03:00:00Z'},
+               other: {'last_modified':'2026-10-27T03:30:00Z'}}
+    assert select_bundle(listing, BUCKET, SHA, {})['wheels_npu'] == other
+
+
+def test_config_filter_excludes_newer_other_environment():
+    other_pt = PT_NAME.replace('torch-npu-builder', 'torch-npu-test-cann-a3')
+    other_npu = NPU_NAME.replace('torch-npu-builder', 'torch-npu-test-cann-a3')
+    listing = {PT_NAME: {}, NPU_NAME: {},
+               other_pt: {'last_modified':'2026-10-28T00:00:00Z'},
+               other_npu: {'last_modified':'2026-10-28T00:01:00Z'}}
+    config = {'obs':{'wheel_name_contains':['-py311-', '-torch-npu-builder-', 'aarch64']}}
+    assert select_bundle(listing, BUCKET, SHA, config) == {'wheels':PT_NAME, 'wheels_npu':NPU_NAME}
+
+
+@pytest.mark.parametrize('modified', [None, 'invalid', '2026-10-28T00:00:00'])
+def test_multiple_complete_builds_need_trustworthy_upload_times(modified):
+    other_pt = PT_NAME.replace('e0dcc43e', '12345678')
+    other_npu = NPU_NAME.replace('e0dcc43e', '12345678')
+    listing = {PT_NAME: {'last_modified':'2026-10-27T00:00:00Z'},
+               NPU_NAME: {'last_modified':'2026-10-27T00:01:00Z'},
+               other_pt: {'last_modified':modified},
+               other_npu: {'last_modified':'2026-10-28T00:01:00Z'}}
+    with pytest.raises(ValueError, match='last_modified'):
         select_bundle(listing, BUCKET, SHA, {})
