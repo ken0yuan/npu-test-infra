@@ -29,6 +29,8 @@ ANSI = re.compile(r'\x1b\][^\x07]*(?:\x07|\x1b\\)|\x1b\[[0-?]*[ -/]*[@-~]')
 COUNT_NOTE = ('上表按测试项（函数 × 设备）计数，每项只归一类：Error > Failed > '
               'No Result > Skipped > Passed。部分实例跳过的测试项归入 Skipped，'
               '只有全部实例通过才归入 Passed；实例计数另列。')
+DEVICE_NOTE = ('设备目标根据用例声明展示；执行通道只表示进程环境，不能据此认定实际使用了 NPU。'
+               'CPU、Meta 用例保留，目标证据不足时标为未核实。')
 
 
 class ReportError(ValueError):
@@ -101,6 +103,36 @@ def comparison_text(test):
             result += '（计数无变化；不据此判定失败根因相同）'
         return result
     return '基线动作未确认，未推断改善或回归'
+
+
+def device_display(test):
+    """Display declared test targets separately from the stored execution key.
+
+    Names identify declared targets, not physical kernel execution. In
+    particular an accelerator process or its backend fingerprint alone never
+    proves that a generic test used NPU hardware.
+    """
+    channel = test['device']
+    reason = (test.get('reason') or '').lower()
+    if test.get('status') == 'no_result' and 'nccl not available' in reason:
+        return f'NCCL 专用，不适用（未执行；通道 {channel}）'
+    targets = set()
+    for node in test.get('instance_ids') or [test['test_function']]:
+        parts = node.split('::')
+        cls = parts[-2] if len(parts) == 3 else ''
+        method = parts[-1].split('[', 1)[0]
+        # Prefer generated runtime variants over words in a source method such
+        # as test_compare_cpu, which can itself be an NPU comparison test.
+        if re.search(r'(?:PRIVATEUSE1|NPU)$', cls) or re.search(r'_npu(?:_|$)', method):
+            targets.add('NPU')
+        elif re.search(r'CPU(?=[A-Z]|$)', cls) or re.search(r'_cpu(?:_|$)', method):
+            targets.add('CPU')
+        if re.search(r'Meta(?=[A-Z]|$)', cls) or parts[0] == 'test/test_meta.py':
+            targets.add('Meta')
+    if not targets:
+        return f'设备目标未核实（通道 {channel}）'
+    label = ' / '.join(d for d in ('CPU', 'Meta', 'NPU') if d in targets)
+    return f'目标 {label}（用例声明；通道 {channel}）'
 
 
 def build_report(row, archive=None, logs=None):
@@ -180,7 +212,7 @@ def build_report(row, archive=None, logs=None):
             'pr_number': row['pr_number'], 'pr_url': f"https://github.com/pytorch/pytorch/pull/{row['pr_number']}",
             'pytorch_commit': row['pytorch_commit'], 'torch_npu_environment': env,
             'merged_at': row.get('merged_at'), 'metrics': metrics,
-            'metric_note': COUNT_NOTE, 'instance_counts': totals,
+            'metric_note': COUNT_NOTE + DEVICE_NOTE, 'instance_counts': totals,
             'declared_no_result_count': declared_no_result,
             'warnings': warnings, 'tests': details}
 
@@ -239,11 +271,13 @@ def environment_line(model):
 def detail_title(test):
     path, _, name = test['test_function'].partition('::')
     return (f"{ICONS[test['outcome']]} {name or path} — {path} · "
-            f"{test['device']} · {test['outcome']}")
+            f"{device_display(test)} · {test['outcome']}")
 
 
 def detail_notes(test):
     notes = ['实例计数：' + count_text(test['counts'])]
+    if test.get('status') == 'no_result' and 'nccl not available' in (test.get('reason') or '').lower():
+        notes.append('后端不适用：本例需要 NCCL，未执行 HCCL 测试；原始 no_result 记录保留，不代表 NPU 算子失败。')
     if test.get('reason'):
         notes.append('原因：' + test['reason'])
     if test.get('observed_counts') is not None:
@@ -281,7 +315,7 @@ def render_html(model):
         parts.append('<div class="warning">证据提示<ul>' + ''.join('<li>' + esc(w) + '</li>' for w in model['warnings']) + '</ul></div>')
     parts.append('<h3>前后对比（基线 → 本次）</h3><ul>')
     for test in model['tests']:
-        parts.append('<li>' + esc(test['test_function'] + ' [' + test['device'] + ']：' + test['comparison_text']) + '</li>')
+        parts.append('<li>' + esc(test['test_function'] + ' [' + device_display(test) + ']：' + test['comparison_text']) + '</li>')
     parts.append('</ul>')
     for test in model['tests']:
         parts += ['<details><summary>' + esc(detail_title(test)) + '</summary>',
@@ -374,7 +408,7 @@ def feishu_plan(model, budget=None):
         add(text_block('text', '证据提示：' + warning))
     add(text_block('heading4', '前后对比（基线 → 本次）', bold=True))
     for test in model['tests']:
-        add(text_block('text', f"{ICONS[test['outcome']]} {test['test_function']} [{test['device']}]：{test['comparison_text']}"))
+        add(text_block('text', f"{ICONS[test['outcome']]} {test['test_function']} [{device_display(test)}]：{test['comparison_text']}"))
     for test in model['tests']:
         label = detail_title(test)
         add(text_block('heading4', label, bold=True, folded=True), label)

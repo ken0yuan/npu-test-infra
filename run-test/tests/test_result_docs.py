@@ -93,6 +93,42 @@ def test_all_no_result_does_not_become_success_or_refresh_baseline():
     assert '基线不动' in m['tests'][0]['comparison_text']
 
 
+@pytest.mark.parametrize('node,target', [
+    ('test/test_reductions.py::TestReductionsOnCPU::test_cumsum_integer_upcast', 'CPU'),
+    ('test/test_meta.py::TestMetaCore::test_empty_quantized', 'Meta'),
+    ('test/test_set_default_mobile_cpu_allocator.py::TestSetDefaultMobileCPUAllocator::test_exception', 'CPU'),
+    ('test/test_ops.py::TestCommonPRIVATEUSE1::test_compare_cpu_npu_float32', 'NPU'),
+])
+def test_report_separates_declared_targets_from_accelerator_environment(node, target):
+    t = item(device='accelerator', test_function=node)
+    before = deepcopy(t)
+    model = docs.build_report(row_for([t]))
+    label = docs.device_display(model['tests'][0])
+    assert '目标 ' + target in label and '通道 accelerator' in label
+    assert model['tests'][0]['device'] == 'accelerator' and t == before
+    assert label in docs.detail_title(model['tests'][0])
+    assert label in docs.render_html(model)
+    assert label in ' '.join(text_of(b) for b in appended(docs.feishu_plan(model)))
+    assert model['metrics']['Passed'] == 1
+
+
+def test_accelerator_environment_alone_does_not_prove_npu_execution():
+    t = item(device='accelerator', environment_fingerprint={'actual_backend':'npu'})
+    model = docs.build_report(row_for([t]))
+    assert docs.device_display(model['tests'][0]) == '设备目标未核实（通道 accelerator）'
+    assert '不能据此认定实际使用了 NPU' in model['metric_note']
+
+
+def test_nccl_unavailable_is_not_reported_as_hccl_coverage():
+    t = item(device='accelerator', counts=None, status='no_result',
+             reason='runtime discovery exited 3: c10d NCCL not available, skipping tests')
+    model = docs.build_report(row_for([t]))
+    test = model['tests'][0]
+    assert 'NCCL 专用，不适用（未执行' in docs.device_display(test)
+    assert '未执行 HCCL 测试' in ' '.join(docs.detail_notes(test))
+    assert model['metrics']['No Result'] == 1 and model['metrics']['Passed'] == 0
+
+
 @pytest.mark.parametrize('mutation', ['duplicate', 'wrong_sum', 'negative', 'boolean', 'missing_counts', 'no_result_counts'])
 def test_corrupt_results_are_refused(mutation):
     row = row_for([item()])
