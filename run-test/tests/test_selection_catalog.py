@@ -121,6 +121,15 @@ def test_added_method_spacing_does_not_become_shared_class_evidence():
     assert value.changed_test_evidence({3})['test_value']['relevance']==0
 
 
+def test_explicit_regressions_prevent_broad_cpp_path_budget_padding(tmp_path, monkeypatch):
+    monkeypatch.setattr(selection,'cpp_test_catalog',lambda root:({},[]))
+    report={'p0':[{'path':'test/distributed/test_pybackend.py','test_nodes':['TestOptions.test_none'],'relevance':0}],
+            'p1':[],'analysis_gaps':[],'ci_recommendations':[]}
+    unrelated=selection.TestInfo(path='test/distributed/test_other_backend.py',test_nodes={'TestOther.test_big':(1,20)})
+    selection.add_cpp_candidates(tmp_path,report,['torch/csrc/distributed/c10d/init.cpp'],[unrelated],'',1)
+    assert not report['p1'] and report['ci_recommendations']
+
+
 def test_shared_helper_reference_cache_keeps_each_callers_identity():
     catalog=Catalog('from torch.foo import target\ndef helper(): return target()\n'
         'class TestX:\n    def test_a(self): assert helper()==2\n'

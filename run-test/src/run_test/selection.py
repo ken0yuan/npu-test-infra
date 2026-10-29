@@ -710,6 +710,10 @@ def add_cpp_candidates(tree_root: Path, report: dict, changed_paths: list[str], 
                 evidence.append({"type": "mentioned_in_pr", "match": node if case_mention else name})
             report["p1"].append({"path": name, "binary": binary, "kind": "gtest", "test_nodes": [node], "score": score, "evidence": evidence})
 
+    if any(entry.get('relevance', 3) <= 1 for entry in report['p0'] + report['p1']):
+        report['ci_recommendations'].append({'path': ', '.join(changed_paths),
+            'reason': 'Explicit changed tests/callers are already selected. Broad native-path Python hints remain upstream recommendations; they do not add unrelated tests to the local execution budget. Native behavior coverage is still unverified.'})
+        return
     for test in tests:
         path_score = len(source_keywords & path_keywords(test.path))
         file_mention = mentioned(pr_text, test.path) or mentioned(pr_text, Path(test.path).name)
