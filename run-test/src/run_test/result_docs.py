@@ -25,6 +25,7 @@ COUNT_KEYS = ('pass', 'fail', 'error', 'skip')
 HEADERS = ('Total', 'Passed', 'Skipped', 'No Result', 'Failed', 'Error')
 STATES = ('pass', 'skip', 'no_result', 'fail', 'error')
 ICONS = dict(zip(STATES, ('✅', '⏭️', '❔', '❌', '⛔')))
+ICONS['resolved'] = '🗄️'
 ANSI = re.compile(r'\x1b\][^\x07]*(?:\x07|\x1b\\)|\x1b\[[0-?]*[ -/]*[@-~]')
 COUNT_NOTE = ('上表按测试项（函数 × 设备）计数，每项只归一类：Error > Failed > '
               'No Result > Skipped > Passed。部分实例跳过的测试项归入 Skipped，'
@@ -254,6 +255,11 @@ def load_report(config, pr):
                 logs[key] = {'text': clean_log(raw.decode('utf-8', errors='replace')),
                              'source': str(path), 'sha256': digest(raw), 'missing': False}
     model = build_report(row, archive, logs)
+    from .issue_resolution import load_index, matching_task, annotate_report
+    from .monitoring import read_rows
+    queue_path=store_paths(config).queue_db
+    task=matching_task(read_rows(queue_path,'tasks') if queue_path.is_file() else [],row)
+    model=annotate_report(model,task,load_index(config))
     if _read_row(config, pr) != row:
         raise ReportError('读取期间 PR 结果已更新，请重试')
     if raw_archive is not None and archive_path.read_bytes() != raw_archive:
@@ -271,11 +277,14 @@ def environment_line(model):
 def detail_title(test):
     path, _, name = test['test_function'].partition('::')
     return (f"{ICONS[test['outcome']]} {name or path} — {path} · "
-            f"{device_display(test)} · {test['outcome']}")
+            f"{device_display(test)} · {'已解决（resolved）' if test['outcome']=='resolved' else test['outcome']}")
 
 
 def detail_notes(test):
     notes = ['实例计数：' + count_text(test['counts'])]
+    if test.get('resolution'):
+        notes.append('已解决归档（未重跑历史用例）：' + '；'.join(test['resolution']['notes']))
+        notes[0]='历史原始实例计数：' + count_text(test['counts'])
     if test.get('status') == 'no_result' and 'nccl not available' in (test.get('reason') or '').lower():
         notes.append('后端不适用：本例需要 NCCL，未执行 HCCL 测试；原始 no_result 记录保留，不代表 NPU 算子失败。')
     if test.get('reason'):
@@ -313,6 +322,8 @@ def render_html(model):
               '<p>执行实例：' + esc(count_text(model['instance_counts'])) + '</p>']
     if model['warnings']:
         parts.append('<div class="warning">证据提示<ul>' + ''.join('<li>' + esc(w) + '</li>' for w in model['warnings']) + '</ul></div>')
+    if 'historical_instance_counts' in model:
+        parts.append('<p>已解决归档测试项：'+str(model['resolved_test_count'])+'；历史原始实例：'+esc(count_text(model['historical_instance_counts']))+'（未重跑，不计入当前未解决错误）</p>')
     parts.append('<h3>前后对比（基线 → 本次）</h3><ul>')
     for test in model['tests']:
         parts.append('<li>' + esc(test['test_function'] + ' [' + device_display(test) + ']：' + test['comparison_text']) + '</li>')
@@ -404,6 +415,8 @@ def feishu_plan(model, budget=None):
         'cell_order': 'row-major'}, None))
     add(text_block('text', model['metric_note']))
     add(text_block('text', '执行实例：' + count_text(model['instance_counts'])))
+    if 'historical_instance_counts' in model:
+        add(text_block('text','已解决归档测试项：'+str(model['resolved_test_count'])+'；历史原始实例：'+count_text(model['historical_instance_counts'])+'（未重跑，不计入当前未解决错误）'))
     for warning in model['warnings']:
         add(text_block('text', '证据提示：' + warning))
     add(text_block('heading4', '前后对比（基线 → 本次）', bold=True))

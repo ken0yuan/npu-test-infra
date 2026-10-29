@@ -32,7 +32,7 @@ def snapshot(config):
             'upstream_states':dict(Counter(r['enqueue_state'] for r in upstream))}
 
 
-def issues_for(snap):
+def issues_for(snap, resolutions=None):
     results = {r['pr_number']:r for r in snap['results']}
     issues = []
     for task in snap['tasks']:
@@ -41,21 +41,26 @@ def issues_for(snap):
         reasons = []
         record = results.get(task['pr_number'])
         if task['state'] in ('failed','blocked'):
-            reasons.append({'kind':task['state'], 'detail':task.get('error_reason')})
+            if resolutions is None or not resolutions.task(task):
+                reasons.append({'kind':task['state'], 'detail':task.get('error_reason')})
         elif record is None:
             reasons.append({'kind':'done_without_result'})
         elif record['pytorch_commit'] == task['pytorch_commit']:
+            historical_record=record
+            if resolutions is not None:
+                from .issue_resolution import active_counts
+                record = {**record,**active_counts(task,record,resolutions)}
             # PR results overwrite older versions; a different commit is not evidence of corruption.
             if record.get('no_result_count',0):
                 reasons.append({'kind':'no_result', 'count':record['no_result_count']})
             if record['fail_count'] or record['error_count']:
                 reasons.append({'kind':'test_failure','fail':record['fail_count'],'error':record['error_count']})
-            tests = json.loads(record['tests'])
+            tests = json.loads(record['tests']) if isinstance(record['tests'],str) else record['tests']
             for test in tests:
                 counts = test.get('counts') or {}
                 if counts.get('skip',0) and not any(counts.get(k,0) for k in ('pass','fail','error')):
                     reasons.append({'kind':'function_all_skipped','test_function':test.get('test_function'),'device':test.get('device')})
-            if not tests or not any(record.get(k,0) for k in ('pass_count','fail_count','error_count','skip_count','no_result_count')):
+            if not tests or not any(historical_record.get(k,0) for k in ('pass_count','fail_count','error_count','skip_count','no_result_count')):
                 reasons.append({'kind':'empty_result'})
         if reasons:
             issues.append({'task_id':task['task_id'],'pr_number':task['pr_number'],
@@ -67,7 +72,8 @@ def issues_for(snap):
 def monitor_once(config, output):
     snap = snapshot(config)
     output.mkdir(parents=True, exist_ok=True)
-    issues = issues_for(snap)
+    from .issue_resolution import load_index
+    issues = issues_for(snap, load_index(config))
     for issue in issues:
         body = json.dumps(issue,ensure_ascii=False,sort_keys=True)
         name = hashlib.sha256(body.encode()).hexdigest()+'.json'
@@ -96,8 +102,22 @@ def monitor_once(config, output):
 def brief_once(config):
     snap = snapshot(config)
     totals = {k:sum(r.get(k,0) for r in snap['results']) for k in ('pass_count','fail_count','error_count','skip_count','no_result_count')}
-    message = {'time':snap['time'],'tasks':snap['task_states'],'upstream':snap['upstream_states'],
-               'prs':len(snap['results']),'counts':totals,'note':'done 仅表示落库完成；skip/no_result 不算通过'}
+    from .issue_resolution import load_index, active_counts, matching_task
+    index=load_index(config)
+    current=dict.fromkeys(totals,0)
+    for record in snap['results']:
+        effective=active_counts(matching_task(snap['tasks'],record),record,index)
+        for key in current:current[key]+=effective[key]
+    task_states=dict(snap['task_states']);archived_tasks=0
+    for task in snap['tasks']:
+        if task['state'] in ('failed','blocked') and index.task(task):
+            task_states[task['state']]-=1;archived_tasks+=1
+    if archived_tasks:task_states['resolved_archived']=archived_tasks
+    message = {'time':snap['time'],'tasks':task_states,'upstream':snap['upstream_states'],
+               'prs':len(snap['results']),'counts':current,'note':'当前计数排除已解决归档错误；归档不是通过，原始结果保留；done 仅表示落库完成'}
+    if current!=totals or archived_tasks:
+        message.update(historical_counts=totals, historical_tasks=snap['task_states'],
+                       resolved_counts={key:totals[key]-current[key] for key in totals})
     if snap['tasks']:
         last = max(t['enqueued_at'] for t in snap['tasks'])
         when = datetime.fromisoformat(last)

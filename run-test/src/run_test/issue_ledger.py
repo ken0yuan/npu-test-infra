@@ -41,6 +41,12 @@ CREATE TABLE IF NOT EXISTS occurrences (
 CREATE TABLE IF NOT EXISTS resolutions (
  id INTEGER PRIMARY KEY, family_id INTEGER NOT NULL REFERENCES families(id),
  verified_at TEXT NOT NULL, note TEXT NOT NULL, evidence TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS occurrence_resolutions (
+ event_key TEXT PRIMARY KEY REFERENCES occurrences(event_key), resolved_at TEXT NOT NULL,
+ note TEXT NOT NULL, evidence TEXT NOT NULL, fix_commit TEXT NOT NULL,
+ basis TEXT NOT NULL DEFAULT 'repair_verified_no_historical_rerun');
+CREATE TABLE IF NOT EXISTS resolution_state (id INTEGER PRIMARY KEY CHECK(id=1), revision INTEGER NOT NULL);
+INSERT OR IGNORE INTO resolution_state(id,revision) VALUES(1,0);
 """
 
 
@@ -173,6 +179,8 @@ class Ledger:
                 '(event_key,family_id,first_seen,last_seen,payload) VALUES(?,?,?,?,?)',
                 (event_key, row['id'], timestamp, timestamp, json.dumps(payload, ensure_ascii=False))).rowcount
             self.conn.execute('UPDATE occurrences SET last_seen=? WHERE event_key=?', (timestamp, event_key))
+            if created:
+                self.conn.execute('UPDATE resolution_state SET revision=revision+1 WHERE id=1')
             self.conn.commit()
             self.new_events += created
         except Exception:
@@ -319,13 +327,34 @@ class Ledger:
             self.conn.execute('INSERT INTO resolutions(family_id,verified_at,note,evidence) VALUES(?,?,?,?)',
                               (row['id'], now(), note, json.dumps(evidence, ensure_ascii=False)))
             self.conn.execute("UPDATE occurrences SET state='resolved' WHERE family_id=?", (row['id'],))
+            self.conn.execute('UPDATE resolution_state SET revision=revision+1 WHERE id=1')
 
     def summary(self):
         counts = dict(self.conn.execute('SELECT namespace,COUNT(*) FROM occurrences o JOIN families f '
                                        'ON f.id=o.family_id GROUP BY namespace').fetchall())
         return {'db': str(self.db), 'docs_root': str(self.docs), 'new_events': self.new_events,
                 'occurrences': sum(counts.values()), 'by_namespace': counts,
-                'open': self.conn.execute("SELECT COUNT(*) FROM occurrences WHERE state='open'").fetchone()[0]}
+                'open': self.conn.execute("SELECT COUNT(*) FROM occurrences WHERE state='open'").fetchone()[0],
+                'resolved': self.conn.execute("SELECT COUNT(*) FROM occurrences WHERE state='resolved'").fetchone()[0]}
+
+    def resolve_events(self, event_keys, note, evidence_path, fix_commit):
+        """Archive reviewed exact occurrences; never close a whole broad family."""
+        keys = sorted(set(event_keys))
+        if not keys or not note.strip() or not re.fullmatch(r'[0-9a-f]{40}', fix_commit):
+            raise ValueError('Exact events, repair note and full fix commit are required')
+        evidence, _ = self.evidence_file(evidence_path)
+        with self.conn:
+            self.conn.execute('BEGIN IMMEDIATE')
+            existing = {row[0] for row in self.conn.execute('SELECT event_key FROM occurrences')}
+            if set(keys)-existing:
+                raise ValueError('Unknown occurrence; no archive changes applied')
+            for key in keys:
+                self.conn.execute('INSERT OR IGNORE INTO occurrence_resolutions '
+                    '(event_key,resolved_at,note,evidence,fix_commit) VALUES(?,?,?,?,?)',
+                    (key,now(),note,json.dumps(evidence,ensure_ascii=False),fix_commit))
+                self.conn.execute("UPDATE occurrences SET state='resolved' WHERE event_key=?",(key,))
+            self.conn.execute('UPDATE resolution_state SET revision=revision+1 WHERE id=1')
+        return len(keys)
 
     def render(self):
         """Four reproducible views; historical legacy IDs are never fabricated."""
@@ -349,7 +378,7 @@ class Ledger:
         for row in rows:
             if row['namespace'] in ('C', 'X'):
                 continue
-            fam = families.setdefault(row['identifier'], {
+            fam = families.setdefault((row['identifier'], row['state']), {
                 'namespace': row['namespace'], 'kind': row['kind'],
                 'state': row['state'], 'count': 0, 'first': row['first_seen'],
                 'last': row['first_seen'], 'prs': [], 'tests': [], 'latest': row,
@@ -364,7 +393,7 @@ class Ledger:
             if tf and tf not in fam['tests']:
                 fam['tests'].append(tf)
             fam['latest'] = row  # 行序按 first_seen，最后一条即最近
-        for identifier, fam in sorted(families.items()):
+        for (identifier, state), fam in sorted(families.items()):
             latest = fam['latest']
             body = json.loads(latest['payload'])
             head = (f"### {identifier} · {fam['kind']}"
@@ -377,7 +406,8 @@ class Ledger:
                 f"- 涉及 PR：{len(fam['prs'])} 个；测试函数：{len(fam['tests'])} 个"
                 + (f"；最近：{fam['tests'][-1][:80]}" if fam['tests'] else ''),
                 f"- 最近任务：`{body.get('task_id')}`；设备：`{body.get('device')}`；阶段：`{body.get('phase')}`",
-                '- 结论：待核对因果，不自动判 PR 回归。']
+                '- 结论：已解决归档；基于修复证据，未要求重跑历史用例。' if state == 'resolved'
+                else '- 结论：待核对因果，不自动判 PR 回归。']
             if body.get('missing_modules'):
                 lines.append('- 缺失模块：' + ', '.join(body['missing_modules']))
             ev = body['evidence'][0] if body.get('evidence') else None
@@ -395,6 +425,12 @@ class Ledger:
                 f"### {row['identifier']} · {row['kind']} · 已核验修复",
                 f"- 核验时间：{row['verified_at']}；说明：{row['note']}",
                 f"- 验证证据：`{ev['source']}`；快照：`{ev['snapshot']}`；SHA256：`{ev['sha256']}`"]))
+        for row in self.conn.execute('SELECT r.fix_commit,r.note,r.evidence,COUNT(*) n FROM occurrence_resolutions r GROUP BY r.fix_commit,r.note,r.evidence'):
+            ev=json.loads(row['evidence'])
+            resolved_lines.append('\n'.join([f"### 已解决归档 · {row['n']} 条历史事件",
+                f"- 修复提交：`{row['fix_commit']}`；说明：{row['note']}",
+                '- 依据：修复已验收，用户要求无需重跑历史用例；保留原始结果和日志。',
+                f"- 修复证据：`{ev['source']}`；SHA256：`{ev['sha256']}`"]))
         sections = []
         if open_lines:
             sections.append('## 待处理（open）\n\n' + '\n\n'.join(open_lines))
