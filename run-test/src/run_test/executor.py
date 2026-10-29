@@ -563,7 +563,8 @@ class Executor:
     def _execute_families(self, task, source_root, manifest, extra_env):
         """Collect under leases, then release and expand into per-instance jobs."""
         import threading
-        from .runner import PytestRunner, FunctionRunOutcome
+        from .runner import PytestRunner, FunctionRunOutcome, NoRuntimeNodes
+        from .test_catalog import sample_instances
         from .test_scheduler import CardPool, TestJob, JobExpansion, run_ordered
         from .cpu_capacity import worker_capacity, test_thread_env, thread_budget
         from .device_policy import test_execution_env
@@ -591,6 +592,43 @@ class Executor:
                                      cache_seconds=float(cfg.get("npu_readiness_cache_seconds", 60)))
         selected = [None] * len(manifest)
         manifest_lock = threading.Lock()
+        candidate_mode = bool(manifest) and all(isinstance(item.get('selection'), dict) for item in manifest)
+        group_indices = {}
+        for index, item in enumerate(manifest):
+            group_indices.setdefault(item['test_function'], []).append(index)
+        groups = list(group_indices)
+        budget = min(item['selection']['budget'] for item in manifest) if candidate_mode else len(groups)
+        initial_groups = groups[:budget]
+        reserve = list(groups[budget:])
+        active = {i for group in initial_groups for i in group_indices[group]}
+        candidate_lock = threading.Lock()
+        finishes = {group: {} for group in groups}
+
+        def finish_candidate(index, expansion, absent=False):
+            if not candidate_mode:
+                return expansion
+            group = manifest[index]['test_function']
+            with candidate_lock:
+                finishes[group][index] = absent
+                if (len(finishes[group]) == len(group_indices[group])
+                        and all(finishes[group].values())):
+                    original = manifest[index]['selection']
+                    preferred = [g for g in reserve if
+                        set(manifest[group_indices[g][0]]['selection'].get('groups', ())) & set(original.get('groups', ()))
+                        and manifest[group_indices[g][0]]['selection']['relevance'] <= original['relevance']]
+                    replacement = min(preferred or reserve, key=lambda g: (
+                        manifest[group_indices[g][0]]['selection']['relevance'],
+                        manifest[group_indices[g][0]]['selection']['rank'])) if reserve else None
+                    if replacement is not None:
+                        reserve.remove(replacement)
+                        indices = group_indices[replacement]
+                        with manifest_lock:
+                            active.update(indices)
+                        expansion.metadata['replacement_collectors'] = True
+                        expansion.metadata['replacement_for'] = group
+                        expansion.jobs = [make_collector(i) for i in indices]
+                        expansion.results = [None] * len(expansion.jobs)
+            return expansion
 
         def record_selection(index, item, nodes, complete, bounded=None, error=None):
             with manifest_lock:
@@ -601,7 +639,11 @@ class Executor:
                     "task_id": task.task_id, "pytorch_commit": task.pytorch_commit,
                     "interpreter": getattr(self.runner, 'python_env', None),
                     "verified_against_execution": hasattr(self.runner, 'discover_runtime_nodes'),
-                    "discovery_complete": all(entry is not None for entry in selected),
+                    "discovery_complete": all(selected[i] is not None for i in active),
+                    "selection_budget": budget, "available_source_families": len(groups),
+                    "activated_source_families": sorted({manifest[i]['test_function'] for i in active}),
+                    "selection_candidates": [dict(test_function=entry['item']['test_function'],
+                        device=entry['item']['device'], selection=entry['item'].get('selection')) for entry in records],
                     "max_instances_per_function_device": MAX_INSTANCES_PER_FUNCTION,
                     "bounded_families": [entry["bounded"] for entry in records if entry["bounded"]],
                     "families": [{"test_function": entry["item"]["test_function"],
@@ -672,7 +714,7 @@ class Executor:
             try:
                 failure = check_device(item, lease, env)
                 if failure is not None:
-                    return failed_collection(index, item, failure.log_text, outcome=failure)
+                    return finish_candidate(index, failed_collection(index, item, failure.log_text, outcome=failure))
                 nodes = list(item.get("runtime_nodeids") or [])
                 if item.get("runtime_nodeid"):
                     nodes.append(item["runtime_nodeid"])
@@ -696,10 +738,13 @@ class Executor:
                     nodes = [tf]
                 bounded = None
                 if len(nodes) > MAX_INSTANCES_PER_FUNCTION:
+                    requested_nodes = list(nodes)
                     bounded = dict(test_function=tf, device=dev, selected_count=MAX_INSTANCES_PER_FUNCTION,
                                    requested_count=len(nodes), deferred_count=len(nodes) - MAX_INSTANCES_PER_FUNCTION,
                                    deferred_nodeids=nodes[MAX_INSTANCES_PER_FUNCTION:])
-                    nodes = nodes[:MAX_INSTANCES_PER_FUNCTION]
+                    nodes = sample_instances(nodes, MAX_INSTANCES_PER_FUNCTION,
+                                             item.get('selection', {}).get('focus', []))
+                    bounded['deferred_nodeids'] = [n for n in requested_nodes if n not in set(nodes)]
                     complete = False
                 # The manifest is durable before the scheduler can admit children.
                 record_selection(index, item, nodes, complete, bounded)
@@ -707,18 +752,22 @@ class Executor:
                                     lambda lease, node=node: execute(item, node, lease),
                                     cpu_threads=threads,
                                     on_unavailable=lambda why: unavailable(item, why)) for node in nodes]
-                return JobExpansion(children, dict(item=item, nodes=nodes, complete=complete))
+                return finish_candidate(index, JobExpansion(children, dict(item=item, nodes=nodes, complete=complete)))
             except Exception as error:
                 why = f"runtime discovery failed for {tf} [{dev}]: {error}"
                 self._save_diagnostics(task, why, f"discover-{tf}-{dev}")
-                return failed_collection(index, item, why, "collection_error")
+                expansion = failed_collection(index, item, why, "collection_error")
+                return finish_candidate(index, expansion, absent=isinstance(error, NoRuntimeNodes))
 
-        jobs = [TestJob("collect:" + item["device"] + ":" + item["test_function"],
-                        needed(item, item["test_function"]),
-                        lambda lease, index=index, item=item: collect(index, item, lease),
-                        cpu_threads=threads, phase="collect",
-                        on_unavailable=lambda why, index=index, item=item: failed_collection(index, item, why))
-                for index, item in enumerate(manifest)]
+        def make_collector(index):
+            item = manifest[index]
+            return TestJob("collect:" + item["device"] + ":" + item["test_function"],
+                           needed(item, item["test_function"]),
+                           lambda lease: collect(index, item, lease),
+                           cpu_threads=threads, phase="collect",
+                           on_unavailable=lambda why: finish_candidate(index, failed_collection(index, item, why)))
+        indices = [i for group in initial_groups for i in group_indices[group]] if candidate_mode else range(len(manifest))
+        jobs = [make_collector(i) for i in indices]
         log = diagnostic_root / "scheduler.jsonl"
         def event(**data):
             data["time"] = datetime.now(timezone.utc).isoformat()
@@ -731,10 +780,14 @@ class Executor:
                                cpu_budget=lambda: worker_capacity(cfg.get("test_max_workers", 1))["available_cpus"],
                                interval=max(0.1, float(cfg.get("test_resource_poll_seconds", 1))), event=event)
         families, outcomes = [], []
-        for group in expanded:
+        pending_groups = list(reversed(expanded))
+        while pending_groups:
+            group = pending_groups.pop()
             meta = group.metadata
             families.append((meta["item"], meta["nodes"], meta["complete"]))
             outcomes.append([meta["failure"]] if meta.get("failure") is not None else group.results)
+            if meta.get('replacement_collectors'):
+                pending_groups.extend(reversed(group.results))
         return families, outcomes
 
     def _run(self, task: q.Task, source_root: Path, extra_env: dict | None = None) -> Submission | None:
@@ -821,7 +874,7 @@ class Executor:
                 )
             )
 
-        if len(no_result) == len(task.test_manifest):
+        if results and len(no_result) == len(results):
             # 全部 no_result 仍然持久化：PR 记录和原始 artifacts 是排障证据，
             # 提交不刷新任何基线，也不能用 blocked 丢弃真实错误。
             self._save_diagnostics(

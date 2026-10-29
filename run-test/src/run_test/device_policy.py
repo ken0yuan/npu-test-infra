@@ -22,6 +22,7 @@ def execution_env(device=None):
     if device is not None:
         require_execution_device(device)
     env = dict(os.environ)
+    env.pop('RUN_TEST_TOOLS_ROOT', None)
     for key in ("PYTEST_PLUGINS", "PYTEST_ADDOPTS", "PYTORCH_TESTING_DEVICE_FOR_CUSTOM",
                 "PYTORCH_TESTING_DEVICE_EXCEPT_FOR", "PYTORCH_TESTING_DEVICE_ONLY_FOR"):
         env.pop(key, None)
@@ -42,24 +43,27 @@ def test_execution_env(device, source_root, test_function):
     """
     env = execution_env(device)
     if source_root is not None:
+        from .test_suites import layout, suite_for
         relative = test_function.split("::", 1)[0]
-        if relative.startswith("test/"):
-            relative = relative[5:]
-        test_root = (Path(source_root) / "test").resolve()
-        parent = (test_root / relative).resolve().parent
-        if parent != test_root and test_root not in parent.parents:
-            raise ValueError("test path escapes source test directory")
+        test_root, local = layout(source_root, relative)
+        parent = (test_root / local).resolve().parent
+        if suite_for(relative) == 'tools':
+            env['RUN_TEST_TOOLS_ROOT'] = str((Path(source_root) / 'tools').resolve())
         entries = [str(parent), *env.get("PYTHONPATH", "").split(os.pathsep)]
         env["PYTHONPATH"] = os.pathsep.join(dict.fromkeys(x for x in entries if x))
     return env
 
 
-def pytest_command(python, device):
+def pytest_command(python, device, test_function=""):
     require_execution_device(device)
+    from .test_suites import suite_for, TOOLS_BOOTSTRAP
+    bootstrap = TOOLS_BOOTSTRAP if suite_for(test_function.split('::', 1)[0]) == 'tools' else ''
     if device == "cpu":
+        if bootstrap:
+            return [python, '-c', bootstrap + "\nimport pytest; sys.exit(pytest.main(sys.argv[1:]))"]
         return [python, "-m", "pytest"]
     # Explicit native NPU registration, with no CUDA transfer or pytest extension.
-    return [python, "-c", "import torch, torch_npu, pytest, sys; "
+    return [python, "-c", bootstrap + "\nimport torch, torch_npu, pytest, sys; "
             "assert torch_npu.npu.is_available(), 'NPU unavailable'; "
             "sys.exit(pytest.main(sys.argv[1:]))"]
 
@@ -77,7 +81,8 @@ class ExecutionDeviceResolver:
         # Legacy generic tests defaulted to CUDA solely for baseline comparability.
         # Generic device parametrization now generates CPU and native NPU variants.
         if evidence.get("basis") == "default" or evidence.get("level") == "default":
-            found = ["cpu", "accelerator"]
+            from .test_suites import suite_for
+            found = ['cpu'] if suite_for(path) == 'tools' else ["cpu", "accelerator"]
         selected = [d for d in found if d in self.allowed]
         if self.fixed:
             selected = [self.fixed] if self.fixed in selected else []

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 from .device_policy import require_execution_device, test_execution_env, pytest_command
+from .test_suites import layout, suite_args, TOOLS_BOOTSTRAP
 
 import ast
 import os
@@ -245,8 +246,8 @@ _COLLECTION_METADATA_PREFIX = "RUN_TEST_ORIGINS="
 # No pytest plugin/hook and no test execution. functools.wraps/__wrapped__ retain
 # the original identity of PyTorch's parametrize/device-generated methods. This
 # also handles inherited methods from imported bases, which local AST cannot.
-_COLLECT_WITH_ORIGINS = r"""
-import inspect, json, pathlib, sys
+_COLLECT_WITH_ORIGINS = TOOLS_BOOTSTRAP + r"""
+import inspect, json, pathlib, sys, unittest
 import pytest
 if sys.argv.pop(1) == "accelerator":
     import torch, torch_npu
@@ -280,12 +281,21 @@ def remember(key, value, owner=None):
                 pass
         if type(required) is not int or required < 1:
             required = None
+        required_arguments = []
+        if inspect.isclass(owner) and issubclass(owner, unittest.TestCase):
+            try:
+                required_arguments = [p.name for p in inspect.signature(value, follow_wrapped=False).parameters.values()
+                                      if p.name not in {'self', 'cls'} and p.default is inspect.Parameter.empty
+                                      and p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD, p.KEYWORD_ONLY)]
+            except (TypeError, ValueError):
+                pass
         origins[key] = {"name": getattr(original, "__name__", ""),
                         "qualname": getattr(original, "__qualname__", ""),
                         "source_file": getattr(getattr(original, "__code__", None), "co_filename", None),
                         "declared_device": getattr(owner, "device_type", getattr(owner, "device", None))
                             if isinstance(getattr(owner, "device_type", getattr(owner, "device", None)), str) else None,
-                        "required_npu_cards": required}
+                        "required_npu_cards": required,
+                        "unbound_unittest_parameters": required_arguments}
     except (AttributeError, TypeError, ValueError, OSError):
         origins[key] = {"name": "", "qualname": ""}
 for module in tuple(sys.modules.values()):
@@ -302,6 +312,10 @@ for module in tuple(sys.modules.values()):
 print("\nRUN_TEST_ORIGINS=" + json.dumps(origins, sort_keys=True))
 sys.exit(rc)
 """
+
+
+class NoRuntimeNodes(RuntimeError):
+    """The file was collected successfully, but this source family was absent."""
 
 
 class PytestRunner:
@@ -361,10 +375,11 @@ class PytestRunner:
     def _collect_file(self, tf, dev, root, rel_file, extra_env, lease_fds=()):
         env = test_execution_env(dev, root, tf)
         env.update(extra_env or {})
+        directory, _ = layout(root, tf.split('::', 1)[0])
         cmd = [self.python_env, "-c", _COLLECT_WITH_ORIGINS, dev, rel_file, "--collect-only",
                "-q", "-o", "addopts=", "-p", "no:cacheprovider",
-               *self.device_args.get(dev, []), *self.extra_args]
-        source = root / "test" / rel_file
+               *suite_args(tf.split('::', 1)[0]), *self.device_args.get(dev, []), *self.extra_args]
+        source = root / tf.split('::', 1)[0]
         digest = hashlib.sha256(source.read_bytes()).hexdigest() if source.is_file() else "missing"
         key = (str(root.resolve()), rel_file, digest, tuple(cmd), tuple(sorted(env.items())))
         # Single-flight per file/mask. Different leased devices can collect
@@ -375,21 +390,22 @@ class PytestRunner:
             if self._task_collection_enabled and key in self._collection_cache:
                 return self._collection_cache[key]
             try:
-                proc = subprocess.run(cmd, cwd=str(root / "test"), env=env,
+                proc = subprocess.run(cmd, cwd=str(directory), env=env,
                                       capture_output=True, text=True,
                                       timeout=self.timeout_seconds, check=False,
                                       **self._lease_options(lease_fds))
             except subprocess.TimeoutExpired as error:
                 raise RuntimeError(f"runtime discovery timeout ({self.timeout_seconds}s): {rel_file}") from error
-            if proc.returncode in (0, 5) and self._task_collection_enabled:
+            if self._task_collection_enabled:
                 if self.artifact_root:
                     receipt = self.artifact_root / "collections" / (hashlib.sha256(repr(key).encode()).hexdigest() + ".json")
                     receipt.parent.mkdir(parents=True, exist_ok=True)
-                    receipt.write_text(json.dumps({"argv":cmd,"cwd":str(root/'test'),
+                    receipt.write_text(json.dumps({"argv":cmd,"cwd":str(directory),
                         "source_sha256":digest,"device":dev,"visible_devices":env.get("ASCEND_RT_VISIBLE_DEVICES"),
                         "returncode":proc.returncode,"stdout":proc.stdout,"stderr":proc.stderr},ensure_ascii=False,indent=2),encoding="utf-8")
                     proc.receipt_path = str(receipt)
-                self._collection_cache[key] = proc
+                if proc.returncode in (0, 5):
+                    self._collection_cache[key] = proc
             return proc
 
     def _source_function_key(self, runtime_nodeid: str) -> str:
@@ -409,10 +425,7 @@ class PytestRunner:
         dev = require_execution_device(validate_device(device))
         root = Path(source_root)
         orig_file = tf.split("::", 1)[0]
-        rel_file = orig_file
-        # discovery runs from the ``test`` directory; strip repository prefix.
-        if rel_file.startswith("test/"):
-            rel_file = rel_file[5:]
+        _, rel_file = layout(root, orig_file)
         source_class = tf.split("::")[1] if len(tf.split("::")) == 3 else ""
         source_method = tf.rsplit("::", 1)[-1]
 
@@ -453,7 +466,8 @@ class PytestRunner:
                 f"{(proc.stderr or proc.stdout or '')[-1000:]}"
             )
         nodes = []
-        declared = declared_class_methods(root / "test" / rel_file)
+        unbound_templates = []
+        declared = declared_class_methods(root / orig_file)
         for node in collected:
             parts = node.split("::")
             cls = parts[-2] if len(parts) == 3 else ""
@@ -462,6 +476,12 @@ class PytestRunner:
                 continue
             key = "::".join([cls, method]) if cls else method
             origin = (origins or {}).get(key, {})
+            # A disabled instantiate_device_type_tests guard may leave a base
+            # unittest template visible to pytest. It is not callable without
+            # its device/dtype parameters, despite appearing in --collect-only.
+            if origin.get('unbound_unittest_parameters'):
+                unbound_templates.append(node)
+                continue
             # Copied template methods can have entirely different runtime class
             # names. Trust exact unwrapped ownership in this source file, not a
             # shared method name or an unrelated class prefix.
@@ -470,7 +490,7 @@ class PytestRunner:
             template_origin = (bool(source_class) and source_method in declared.get(source_class, set())
                                and origin.get("qualname") == source_qualname
                                and bool(origin_file)
-                               and Path(origin_file).resolve() == (root / 'test' / rel_file).resolve())
+                               and Path(origin_file).resolve() == (root / orig_file).resolve())
             backend = origin.get('declared_device')
             if template_origin and backend in {'cpu', 'cuda', 'mps', 'npu', 'privateuse1', 'xpu'}:
                 if backend not in ({'cpu'} if dev == 'cpu' else {'npu', 'privateuse1'}):
@@ -490,9 +510,10 @@ class PytestRunner:
                 origin_key = "::".join([cls, method]) if cls else method
                 self._runtime_requirements[(dev, full_node)] = (origins or {}).get(origin_key, {}).get("required_npu_cards")
         if not nodes:
-            raise RuntimeError(
+            raise NoRuntimeNodes(
                 f"runtime discovery found no node for {tf} [{dev}]: "
                 f"rc={proc.returncode}, collected={len(collected)}; "
+                f"uninstantiated_unittest_templates={len(unbound_templates)}; "
                 f"tail={(proc.stderr or proc.stdout or '')[-400:]!r}"
             )
         return sorted(set(nodes))
@@ -512,8 +533,12 @@ class PytestRunner:
         tf = self._source_function_key(source_test_function or runtime_nodeid)
         dev = require_execution_device(validate_device(device))
         fingerprint = _environment_fingerprint(dev, self.transfer_boot_dir if dev == "cuda" else None)
-        cwd = str(Path(source_root) / "test") if source_root else None
-        nodeid = runtime_nodeid[5:] if source_root and runtime_nodeid.startswith("test/") else runtime_nodeid
+        if source_root:
+            directory, local_file = layout(source_root, runtime_nodeid.split('::', 1)[0])
+            cwd = str(directory)
+            nodeid = local_file + '::' + runtime_nodeid.split('::', 1)[1]
+        else:
+            cwd, nodeid = None, runtime_nodeid
         env = test_execution_env(dev, source_root, tf)
         if extra_env:
             env = {**env, **extra_env}
@@ -531,13 +556,13 @@ class PytestRunner:
         observed = None
         with tempfile.TemporaryDirectory(prefix="run-test-") as temp:
             xml = Path(temp) / "junit.xml"
-            cmd = pytest_command(self.python_env, dev) + [nodeid, f"--junitxml={xml}",
+            cmd = pytest_command(self.python_env, dev, tf) + [nodeid, f"--junitxml={xml}",
                    "-q", "--no-header", "-o", "addopts=", "-p", "no:cacheprovider",
-                   *self.device_args.get(dev, []), *self.extra_args]
+                   *suite_args(tf.split('::', 1)[0]), *self.device_args.get(dev, []), *self.extra_args]
             try:
                 if real_subprocess:
-                    collect = pytest_command(self.python_env, dev) + [nodeid, "--collect-only", "-q",
-                               "-o", "addopts=", "-p", "no:cacheprovider", *self.device_args.get(dev, [])]
+                    collect = pytest_command(self.python_env, dev, tf) + [nodeid, "--collect-only", "-q",
+                               "-o", "addopts=", "-p", "no:cacheprovider", *suite_args(tf.split('::', 1)[0]), *self.device_args.get(dev, [])]
                     if source_test_function and source_root and self._task_collection_enabled:
                         try:
                             valid = self.discover_runtime_nodes(tf, dev, source_root=source_root,

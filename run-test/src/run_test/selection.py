@@ -1,40 +1,14 @@
-"""从已合入 main 的 PR commit 选择有作用域身份的测试候选。
+"""Version-bound source candidates with per-test call evidence and priorities.
 
-移植自用户指定的筛选器 ~/pytorch-commit-pre-check/scripts/（2026-09-17）：
-``detect_test_impact.py`` 的 P0/P1 证据分级 + ``cpp_test_selection.py`` 的
-C++ 候选与 ``finalize_plan`` 全局预算（15 上限）。选择语义与原实现一致：
+The control environment indexes registered test suites without importing tests.
+Changed test entries, helper callers and product-symbol relations each own their
+evidence; a sibling never inherits a file-level score. Semantic tiers and affected
+groups determine the bounded plan. PR prose/path similarity are discovery hints.
 
-- P0：被改测试文件的收窄节点 + 直接引用被改 Python 符号的测试方法。
-  P0 条目按证据打分（窄化 300 > 直接符号引用 250 > 新文件 240 > 回退
-  100）参与 finalize 的全局预算排序；共享 setup / 删改回退全节点时按
-  方法行数限流（默认每文件 3 个最小方法），防止大文件雪崩挤掉其余
-  候选——全局 15 预算同时裁 P0/P1，排序即优先级。
-- P1：import 了被改模块但无直接符号引用的金丝雀（p1_score 打分，
-  每源最多 1 个、方法行数上限），以及 C++ 官方套件/PR 提及候选。
-- missing_coverage / ci_recommendations / analysis_gaps 全量记账。
-- ``finalize_plan`` 把 Python 家族展开为具体用例后做全局 ≤max_tests
-  预算：按 (优先级, -score, 路径) 排序 + 每文件轮转，前 limit 条入
-  p0/p1，其余记 deferred_tests。
-
-与原 skill 的差异（本仓环境适配）：
-
-- 原 skill 面向开发者工作树（merge-base + staged + untracked）；本仓的
-  PR 是已合入 main 的 commit，文件集与逐行改动取自本地 blob:none 裸
-  镜像 ``git diff <sha>^ <sha>``（首父差异，merge commit 时即 PR 落地差异）。
-- 变更后源码内容 ``git show <sha>:<path>``（按需懒取 blob）；测试树
-  来自 OBS 源码包解压的 ``pytorch/test/``，不从 GitHub 拉任何测试资源。
-- PR 文本 = commit subject + message 正文（本地镜像 ``git show -s
-  --format=%B`` 可得全文，无需 gh/token），由调用方拼好经 ``pr_text``
-  传入；未传时退回 subject。官方目录 + 路径关键词继续，缺失记入
-  analysis_gaps。
-- 测试服务器不构建 C++（无 build/bin），gtest 候选无法本地枚举，按原
-  降级路径转入 ci_recommendations。
-- 生产控制环境只选源码 family，不导入测试或接触执行器正在换包的环境。
-  当前 PR 安装完成后，Executor 用真实解释器、源码、设备收集运行节点；
-  未收集的 family 不标成具体 case。独立调用仍可显式要求建议性动态发现。
-- ``plan_to_manifest`` 把结论桥接为队列清单（``test/x.py::Class::func``
-  + device）；清单层只允许一级类名与固定 device 字面值，放不下的节点
-  记入 manifest_skipped。
+Production exports an ordered reserve alongside the default 15-family budget.
+After wheel installation, the executor validates actual nodes under the existing
+leases and backfills absent families. Source identity and runtime node IDs remain
+separate; per-function/channel execution is capped at 100 instances.
 """
 
 from __future__ import annotations
@@ -57,7 +31,10 @@ from .identifiers import (
 
 
 EXCLUDED_PREFIXES = ("third_party/", "build/", ".git/", "agent_space/")
-TEST_PREFIXES = ("test/",)
+from .test_suites import SUITES, suite_for
+from .test_catalog import Catalog, order_candidates
+
+TEST_PREFIXES = tuple(SUITES.values())
 HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
 CPP_SUFFIXES = {".cpp", ".cc", ".cxx", ".cu", ".h", ".hpp", ".cuh"}
 
@@ -264,6 +241,8 @@ def changed_python_symbols(text: str, filename: str, changed_lines: set[int]) ->
 @dataclass
 class TestInfo:
     path: str
+    catalog: Any = None
+    parse_error: str | None = None
     imported_modules: set[str] = field(default_factory=set)
     imported_names: dict[str, tuple[str, str]] = field(default_factory=dict)
     module_aliases: dict[str, str] = field(default_factory=dict)
@@ -341,6 +320,7 @@ class TestVisitor(ast.NodeVisitor):
         dotted = ast.unparse(node)
         for module in self.changed_modules:
             if dotted.startswith(module + "."):
+                self.info.imported_modules.add(module)
                 self._add_module_ref(module)
                 symbol = dotted[len(module) + 1 :].split(".")[0]
                 if symbol in self.changed_modules[module]:
@@ -372,33 +352,51 @@ def is_runnable_test_path(path: Path) -> bool:
 
 
 def analyze_tests(tree_root: Path, changed_sources: list[ChangedFile]) -> list[TestInfo]:
-    changed_modules: dict[str, set[str]] = {}
+    changed_modules = {}
+    export_chains = {}
     for item in changed_sources:
+        for module, symbols in ((item.module, item.symbols), (item.old_module, item.old_symbols)):
+            if module:
+                changed_modules.setdefault(module, set()).update(symbols)
         if item.module:
-            changed_modules.setdefault(item.module, set()).update(item.symbols)
-        if item.old_module:
-            changed_modules.setdefault(item.old_module, set()).update(item.old_symbols)
-    tests: list[TestInfo] = []
-    test_root = tree_root / "test"
-    if not test_root.exists():
-        return tests
-
-    for path in sorted(test_root.rglob("*.py")):
-        rel = path.relative_to(tree_root).as_posix()
-        if rel.startswith(EXCLUDED_PREFIXES):
+            text = read_tree_file(tree_root, item.path)
+            if text is not None:
+                try:
+                    exports = Catalog(text, item.path).affected_exports(item.symbols, item.changed_lines)
+                    export_chains[item.module] = exports
+                    changed_modules[item.module].update(exports)
+                except SyntaxError:
+                    pass  # Original symbols remain; no speculative wrapper edge.
+    tests = []
+    for prefix in TEST_PREFIXES:
+        directory = tree_root / prefix
+        if not directory.exists():
             continue
-        if not is_runnable_test_path(path):
-            continue
-        try:
-            text = path.read_text(encoding="utf-8")
-            tree = _parse_python(text, rel)
-        except (OSError, UnicodeDecodeError, SyntaxError):
-            continue
-        visitor = TestVisitor(changed_modules)
-        visitor.info.path = rel
-        visitor.info.line_count = len(text.splitlines())
-        visitor.visit(tree)
-        tests.append(visitor.info)
+        for path in sorted(directory.rglob("*.py")):
+            if not is_runnable_test_path(path):
+                continue
+            rel = path.relative_to(tree_root).as_posix()
+            try:
+                text = path.read_text(encoding="utf-8")
+                catalog = Catalog(text, rel)
+            except (OSError, UnicodeDecodeError, SyntaxError) as error:
+                tests.append(TestInfo(path=rel, parse_error=str(error)))
+                continue
+            visitor = TestVisitor(changed_modules)
+            visitor.visit(catalog.tree)
+            info = visitor.info
+            info.path, info.catalog, info.line_count = rel, catalog, len(text.splitlines())
+            info.test_nodes = catalog.tests
+            info.direct_refs = ([ref for node in catalog.tests for ref in catalog.references(node, changed_modules)]
+                                if info.imported_modules else [])
+            for ref in info.direct_refs:
+                chain = export_chains.get(ref['module'], {}).get(ref['symbol'])
+                if chain:
+                    ref['product_chain'] = chain
+            info.module_refs = {m: names.intersection(catalog.tests) for m, names in info.module_refs.items()}
+            for ref in info.direct_refs:
+                info.module_refs.setdefault(ref['module'], set()).add(ref['test_node'])
+            tests.append(info)
     return tests
 
 
@@ -487,209 +485,125 @@ _P0_REASON_SCORES = {
 }
 
 
-def build_report(
-    sha: str,
-    merge_base: str,
-    changed: list[ChangedFile],
-    tests: list[TestInfo],
-    tree_root: Path,
-    max_p1_per_source: int,
-    max_p1_lines: int,
-    min_p1_score: int,
-    max_fallback_nodes: int = 3,
-) -> dict[str, Any]:
-    changed_tests = {
-        item.path
-        for item in changed
-        if item.path.startswith(TEST_PREFIXES)
-        and item.path.endswith(".py")
-        and is_runnable_test_path(Path(item.path))
-    }
-    changed_sources = [item for item in changed if item.module and not item.path.startswith(TEST_PREFIXES)]
-
-    p0_by_path: dict[str, dict[str, Any]] = {}
-    analysis_gaps: list[dict[str, str]] = []
-    for path in sorted(changed_tests):
-        item = next(item for item in changed if item.path == path)
-        nodes, reason, total = changed_test_nodes(
-            tree_root, item, max_fallback_nodes=max_fallback_nodes
-        )
-        if not nodes:
-            analysis_gaps.append({"path": path, "reason": reason + "; no runnable test method resolved"})
-            continue
-        entry = {
-            "path": path,
-            "test_nodes": nodes,
-            "evidence": [{"type": "changed_test_file", "reason": reason}],
-            "score": _P0_REASON_SCORES.get(reason, P0_SCORE_FALLBACK),
-        }
-        if total:
-            entry["fallback"] = True
-            analysis_gaps.append(
-                {
-                    "path": path,
-                    "reason": (
-                        f"fallback nodes throttled: kept the {len(nodes)} smallest "
-                        f"methods of {total}; the rest are not in the plan"
-                    ),
-                }
-            )
-        p0_by_path[path] = entry
-
-    direct_coverage: dict[tuple[str, str], list[dict[str, str]]] = {}
-    for test in tests:
-        for ref in test.direct_refs:
-            key = (ref["module"], ref["symbol"])
-            direct_coverage.setdefault(key, []).append({"path": test.path, **ref})
-            entry = p0_by_path.setdefault(
-                test.path,
-                {"path": test.path, "test_nodes": [], "evidence": [], "score": 0},
-            )
-            if ref["test_node"] not in entry["test_nodes"]:
-                entry["test_nodes"].append(ref["test_node"])
-            # 直接引用证据取 max：与被改测试文件证据叠加时保留更高分。
-            entry["score"] = max(entry.get("score", 0), P0_SCORE_DIRECT_REF)
-            evidence = {
-                "type": "direct_changed_symbol_reference",
-                "source_module": ref["module"],
-                "symbol": ref["symbol"],
-                "line": int(ref["line"]),
-            }
-            if evidence not in entry["evidence"]:
-                entry["evidence"].append(evidence)
-
-    p1_by_path: dict[str, dict[str, Any]] = {}
-    ci_recommendations: list[dict[str, Any]] = []
-    for source in changed_sources:
-        imported_candidates = [
-            test
-            for test in tests
-            if source.module in test.imported_modules
-            and test.module_refs.get(source.module, set()) - set(p0_by_path.get(test.path, {}).get("test_nodes", []))
-        ]
-        all_candidates = [
-            test for test in imported_candidates if -p1_score(source, test)[0] >= min_p1_score
-        ]
-
-        def method_size(test: TestInfo) -> int:
-            nodes = test.module_refs[source.module] - set(p0_by_path.get(test.path, {}).get("test_nodes", []))
-            return min(test.test_nodes[n][1] - test.test_nodes[n][0] + 1 for n in nodes)
-
-        oversized = [test for test in all_candidates if method_size(test) > max_p1_lines]
-        candidates = [test for test in all_candidates if method_size(test) <= max_p1_lines]
-        candidates.sort(key=lambda test: p1_score(source, test))
-        for test in candidates[:max_p1_per_source]:
-            entry = p1_by_path.setdefault(
-                test.path,
-                {"path": test.path, "test_nodes": [], "evidence": []},
-            )
-            nodes = test.module_refs[source.module] - set(p0_by_path.get(test.path, {}).get("test_nodes", []))
-            node = min(nodes, key=lambda n: (test.test_nodes[n][1] - test.test_nodes[n][0], n))
-            if node not in entry["test_nodes"]:
-                entry["test_nodes"].append(node)
-            evidence = {
-                "type": "direct_import_canary",
-                "source_module": source.module,
-                "score": -p1_score(source, test)[0],
-                "reason": "selected as a minimal import/initialization compatibility canary",
-            }
-            if evidence not in entry["evidence"]:
-                entry["evidence"].append(evidence)
-        if not candidates and oversized:
-            oversized.sort(key=lambda test: p1_score(source, test))
-            canary = oversized[0]
-            ci_recommendations.append(
-                {
-                    "path": canary.path,
-                    "source_module": source.module,
-                    "reason": f"smallest referenced test method exceeds local P1 limit ({method_size(canary)} lines)",
-                }
-            )
-
-    missing: list[dict[str, Any]] = []
-    for source in changed_sources:
-        if not source.symbols:
-            missing.append(
-                {
-                    "source": source.path,
-                    "symbol": "<module-level-change>",
-                    "reason": "no changed Python symbol could be resolved to a direct test reference",
-                }
-            )
-            continue
-        for symbol in sorted(source.symbols):
-            if not direct_coverage.get((source.module, symbol)):
-                missing.append(
-                    {
-                        "source": source.path,
-                        "symbol": symbol,
-                        "reason": "no existing test directly references this changed symbol",
-                    }
-                )
-
+def build_report(sha, merge_base, changed, tests, tree_root, max_p1_per_source,
+                 max_p1_lines, min_p1_score, max_fallback_nodes=3):
+    """Evidence belongs to one test, never to its file's other methods."""
+    tests = list(tests)
+    known = {t.path for t in tests}
     for item in changed:
-        if Path(item.path).suffix in CPP_SUFFIXES:
-            missing.append({"source": item.path, "symbol": "<native-change>", "reason": "official suite/path/PR selection does not prove coverage of changed native lines"})
-        elif item.path.startswith(TEST_PREFIXES):
-            if item.status == "D":
-                analysis_gaps.append({"path": item.path, "reason": "deleted test file has no surviving runtime node; inspect parent commit callers"})
-            elif item.old_path:
-                analysis_gaps.append({"path": item.old_path, "reason": f"test path renamed to {item.path}; parent path is not executed directly"})
+        if suite_for(item.path) and item.path.endswith('.py') and item.path not in known and item.status != 'D':
+            text = read_tree_file(tree_root, item.path)
+            if text is not None:
+                try:
+                    catalog = Catalog(text, item.path)
+                    tests.append(TestInfo(path=item.path, catalog=catalog, test_nodes=catalog.tests))
+                except SyntaxError as error:
+                    tests.append(TestInfo(path=item.path, parse_error=str(error)))
+    entries = {}
+    gaps = []
+    missing = []
+    ci = []
+    changed_by_path = {item.path: item for item in changed}
+    sources = [item for item in changed if item.module and not suite_for(item.path)]
+    coverage = set()
+    focus_by_module = {}
+    for item in sources:
+        text = read_tree_file(tree_root, item.path)
+        if text is not None:
+            try:
+                focus_by_module[item.module] = Catalog(text, item.path).focus(item.changed_lines)
+            except SyntaxError:
+                pass
+    def add(path, node, relevance, evidence, groups, score):
+        key = (path, node)
+        entry = entries.setdefault(key, dict(path=path, test_nodes=[node], relevance=relevance,
+                                            score=score, evidence=[], groups=[]))
+        entry['relevance'] = min(entry['relevance'], relevance)
+        entry['score'] = max(entry['score'], score)
+        for ev in evidence:
+            if ev not in entry['evidence']:
+                entry['evidence'].append(ev)
+        entry['groups'] = sorted(set(entry['groups']) | set(groups))
+    for info in tests:
+        if info.parse_error:
+            gaps.append(dict(path=info.path, reason='test catalog parse failed: '+info.parse_error))
             continue
-        elif not item.path.endswith(".py"):
-            analysis_gaps.append(
-                {
-                    "path": item.path,
-                    "reason": "automatic source-to-test mapping is not implemented for this file type",
-                }
-            )
-        elif item.module and not item.symbols:
-            analysis_gaps.append(
-                {
-                    "path": item.path,
-                    "reason": "the diff could not be resolved to changed Python symbols",
-                }
-            )
-
-    for item in changed_sources:
-        if item.status == "D":
-            analysis_gaps.append({"path": item.path, "reason": "deleted source analyzed from parent commit; direct behavior coverage is not proven"})
-        elif item.old_path:
-            analysis_gaps.append({"path": item.old_path, "reason": f"renamed source tracked as {item.path}; parent symbols retained for reference analysis"})
-
-    return {
-        "pr_commit": sha,
-        "base_ref": "first-parent",
-        "merge_base": merge_base,
-        "changed_files": [
-            {
-                "path": item.path,
-                "status": item.status,
-                "module": item.module,
-                "changed_symbols": sorted(item.symbols),
-                "old_path": item.old_path,
-                "old_module": item.old_module,
-                "old_symbols": sorted(item.old_symbols),
-            }
-            for item in changed
-        ],
-        "p0": sorted(p0_by_path.values(), key=lambda item: item["path"]),
-        "p1": sorted(p1_by_path.values(), key=lambda item: item["path"]),
-        "missing_coverage": missing,
-        "ci_recommendations": ci_recommendations,
-        "analysis_gaps": analysis_gaps,
-        "notes": [
-            "P2 is intentionally omitted from the local plan.",
-            "P1 is capped per changed source and is a canary set, not every importer.",
-            "Static references do not prove behavioral assertions; review missing_coverage manually.",
-            "Diff and symbols come from the local main mirror; the test tree comes from the OBS source package of the same commit.",
-        ],
-    }
-
-
-# ---------------------------------------------------------------------------
-# C++ 官方套件（目录来源不变；本机无 build/bin → 全部降级为 CI 建议）
-# ---------------------------------------------------------------------------
+        item = changed_by_path.get(info.path)
+        if item and info.catalog:
+            reasons = info.catalog.changed_test_evidence(item.changed_lines, item.status == 'A')
+            for node, reason in reasons.items():
+                level = reason['relevance']
+                score = (P0_SCORE_NEW_FILE if item.status == 'A' else P0_SCORE_NARROWED) if level == 0 else P0_SCORE_DIRECT_REF if level == 1 else P0_SCORE_FALLBACK
+                evidence = dict(reason, source=info.path, test_node=node)
+                scope = reason['chain'][-1] if reason['type']=='changed_binding_reference' else reason['chain'][0]
+                groups = [info.path+'::'+scope] if level < 2 else [info.path+'::<shared:'+scope+'>']
+                add(info.path, node, level, [evidence], groups, score)
+                entries[(info.path, node)]['instance_focus'] = info.catalog.focus(item.changed_lines)
+            if not reasons:
+                gaps.append(dict(path=info.path, reason='no test entry or caller resolved for changed source objects'))
+        for ref in info.direct_refs:
+            affected = ref.get('product_chain', [ref['symbol']])[-1].rsplit('.', 1)[-1]
+            group = ref['module']+'::'+affected
+            coverage.add((ref['module'], affected))
+            ev = dict(type='direct_changed_symbol_reference', **ref)
+            level = 1 if ref.get('reference_kind', 'call') == 'call' else 2
+            add(info.path, ref['test_node'], level, [ev], [group], P0_SCORE_DIRECT_REF if level == 1 else P0_SCORE_FALLBACK)
+            entry = entries[(info.path, ref['test_node'])]
+            entry['instance_focus'] = sorted(set(entry.get('instance_focus', [])) | set(focus_by_module.get(ref['module'], [])))
+        # Import canaries are explicitly weak. Keep them as a reserve, without
+        # discarding behavioral tests because a file/method happens to be long.
+        for source in sources:
+            if source.module not in info.imported_modules:
+                continue
+            for node in sorted(info.module_refs.get(source.module, ())):
+                if (info.path, node) in entries:
+                    continue
+                add(info.path, node, 3,
+                    [dict(type='direct_import_canary', source_module=source.module, test_node=node)],
+                    [], 0)
+    for item in changed:
+        if suite_for(item.path):
+            if item.status == 'D':
+                gaps.append(dict(path=item.path, reason='deleted test source; no surviving entry is assumed'))
+            if not any(t.path == item.path for t in tests) and item.status != 'D':
+                gaps.append(dict(path=item.path, reason='changed suite support file; dependent tests require explicit association'))
+        elif item.module:
+            symbols = item.symbols or {'<module-level-change>'}
+            for symbol in sorted(symbols):
+                if (item.module, symbol) not in coverage:
+                    missing.append(dict(source=item.path, symbol=symbol,
+                                        reason='no resolved test call/reference to changed symbol'))
+        elif Path(item.path).suffix in CPP_SUFFIXES:
+            missing.append(dict(source=item.path, symbol='<native-change>', reason='native behavior coverage is not proven by suite/path names'))
+        else:
+            gaps.append(dict(path=item.path, reason='no registered executable source mapping for this file type'))
+    redundant = []
+    for source in sources:
+        weak = sorted((key for key, entry in entries.items() if entry['relevance'] == 3
+                       and any(ev.get('source_module') == source.module for ev in entry['evidence'])),
+                      key=lambda key: (key[0], key[1]))
+        for key in weak[max(0, max_p1_per_source):]:
+            redundant.append(dict(entries.pop(key), reason='redundant import canary; behavioral tests keep precedence'))
+    ordered = order_candidates(entries.values())
+    return dict(pr_commit=sha, base_ref='first-parent', merge_base=merge_base,
+                changed_files=[dict(path=i.path,status=i.status,module=i.module,
+                                    changed_symbols=sorted(i.symbols),old_path=i.old_path,
+                                    old_module=i.old_module,old_symbols=sorted(i.old_symbols)) for i in changed],
+                p0=[e for e in ordered if e['relevance'] <= 1],
+                p1=[e for e in ordered if e['relevance'] > 1],
+                missing_coverage=missing, ci_recommendations=ci, analysis_gaps=gaps,
+                redundant_canaries=redundant,
+                catalog=dict(schema='source-test-catalog/1', suites=list(SUITES),
+                             files=len(tests), parsed=sum(t.parse_error is None for t in tests),
+                             complete=not any(t.parse_error for t in tests),
+                             files_index=[dict(path=t.path, suite=suite_for(t.path),
+                                normalized_source_sha256=t.catalog.normalized_source_sha256 if t.catalog else None,
+                                test_candidates=len(t.test_nodes), parse_error=t.parse_error) for t in tests],
+                             objects=[dict(path=t.path,name=o.name,kind=o.kind,start=o.start,end=o.end)
+                                      for t in tests if t.catalog and t.path in changed_by_path
+                                      for o in t.catalog.objects.values()]),
+                notes=['Static references/call chains are evidence, not proof of behavioral assertions.',
+                       'Only runtime-collected identities can execute; per-case evidence is never inherited from a sibling.'])
 
 
 def cpp_test_catalog(tree_root: Path) -> tuple[dict[str, dict], list[dict]]:
@@ -808,7 +722,7 @@ def add_cpp_candidates(tree_root: Path, report: dict, changed_paths: list[str], 
                 evidence.append({"type": "similar_path", "keywords": sorted(source_keywords & path_keywords(test.path))})
             if file_mention or node_mention:
                 evidence.append({"type": "mentioned_in_pr", "match": node if node_mention else test.path})
-            report["p1"].append({"path": test.path, "test_nodes": [node], "score": (200 if node_mention else 100 if file_mention else 0) + 10 * path_score, "evidence": evidence})
+            report["p1"].append({"path": test.path, "test_nodes": [node], "relevance": 3, "groups": [], "score": (200 if node_mention else 100 if file_mention else 0) + 10 * path_score, "evidence": evidence})
 
 
 # ---------------------------------------------------------------------------
@@ -884,7 +798,8 @@ def finalize_plan(tree_root: Path, report: dict, limit: int, timeout: int, pr_te
                     item["evidence"].append({"type": "source_family_pending_runtime_collection" if defer_runtime_discovery
                                              else "static_fallback_after_discovery_failure"})
                 if mentioned(pr_text, node) or mentioned(pr_text, node.replace(".", "::")):
-                    item["score"] = max(item.get("score", 0), 200)
+                    if "relevance" not in item:
+                        item["score"] = max(item.get("score", 0), 200)
                     item["evidence"].append({"type": "mentioned_in_pr", "match": node})
                 if key not in ranked:
                     ranked[key] = (priority, item)
@@ -904,9 +819,14 @@ def finalize_plan(tree_root: Path, report: dict, limit: int, timeout: int, pr_te
         rounds[key] = round_number + 1
         with_rounds.append((priority, -item.get("score", 0), round_number, item["path"], item["test_nodes"][0], item))
     with_rounds.sort(key=lambda row: row[:5])
+    if any("relevance" in row[-1] for row in with_rounds):
+        tier = {id(row[-1]): row[0] for row in with_rounds}
+        by_case = order_candidates([row[-1] for row in with_rounds])
+        with_rounds = [(tier[id(item)], 0, 0, item['path'], item['test_nodes'][0], item) for item in by_case]
     report["p0"], report["p1"] = [], []
     report["deferred_tests"] = []
     for index, (priority, _, _, _, _, item) in enumerate(with_rounds):
+        item['selection_rank'] = index
         if index < limit:
             report[priority].append(item)
         else:
@@ -963,7 +883,8 @@ def select_for_commit(
     merge_base = git(git_dir, "rev-parse", f"{sha}^").strip()
     changed = collect_changed_files(git_dir, sha, tree_root)
     sources = [item for item in changed if not item.path.startswith(TEST_PREFIXES)]
-    tests = analyze_tests(tree_root, sources)
+    has_test_work = any(item.module or Path(item.path).suffix in CPP_SUFFIXES for item in changed)
+    tests = analyze_tests(tree_root, sources) if has_test_work else []
     report = build_report(
         sha,
         merge_base,
@@ -989,6 +910,7 @@ def plan_to_manifest(
     report: dict,
     device: str = "cpu",
     device_of: Callable[[str, str], "str | list[str]"] | None = None,
+    *, include_reserve: bool = False,
 ) -> list[dict]:
     """finalize 后的 p0/p1 Python 用例 → 队列清单；放不下的节点记 manifest_skipped。
 
@@ -999,58 +921,66 @@ def plan_to_manifest(
     entries: list[dict] = []
     skipped: list[dict] = []
     seen: set[tuple[str, str]] = set()
-    for priority in ("p0", "p1"):
-        for item in report[priority]:
-            record = {"path": item["path"], "node": item["test_nodes"][0], "priority": priority.upper()}
-            if item.get("kind", "python") == "gtest":
-                # 测试服务器不构建 C++，gtest 用例只留在 ci_recommendations。
-                skipped.append({**record, "reason": "gtest cases are not runnable on the test server; see ci_recommendations"})
-                continue
-            parts = item["test_nodes"][0].split(".")
-            method, classes = parts[-1], parts[:-1]
-            if len(classes) > 1:
-                skipped.append({**record, "reason": "nested-class node exceeds the one-class manifest schema"})
-                continue
-            runtime_tf = "::".join([item["path"], *classes, method])
-            tf = runtime_tf
-            try:
-                if device_of is not None:
-                    got = device_of(item["path"], item["test_nodes"][0])
-                    devices = [got] if isinstance(got, str) else list(got)
-                    resolver_identity = getattr(device_of, "source_test_function", None)
-                    if resolver_identity is not None:
-                        mapped = resolver_identity(item["path"], item["test_nodes"][0])
-                        if mapped:
-                            tf = mapped
-                else:
-                    devices = [device]
-                tf = validate_test_function(tf)
-                devices = [validate_device(d) for d in devices]
-            except IdentifierError as error:
-                skipped.append({**record, "reason": str(error)})
-                continue
-            for dev in devices:
-                key = (tf, dev)
-                existing = next((entry for entry in entries if (entry["test_function"], entry["device"]) == key), None)
-                if existing is None:
-                    seen.add(key)
-                    entry = {"test_function": tf, "device": dev}
-                    if item.get("execution_mode"):
-                        entry["execution_mode"] = item["execution_mode"]
-                    if runtime_tf != tf:
-                        entry.update({"source_test_function": tf, "runtime_nodeid": runtime_tf,
-                                      "device_basis": "ast_or_collected_variant"})
-                    entries.append(entry)
-                else:
-                    # Preserve every concrete collected instance instead of
-                    # de-duplicating it by source function/device.
-                    node = runtime_tf
-                    nodes = existing.setdefault("runtime_nodeids", [])
-                    first = existing.get("runtime_nodeid") or existing["test_function"]
-                    if first not in nodes:
-                        nodes.append(first)
-                    if node not in nodes:
-                        nodes.append(node)
+    plans = [(p, item) for p in ("p0", "p1") for item in report[p]]
+    if include_reserve:
+        plans += [(item.get('priority', 'P1').lower(), item) for item in report.get('deferred_tests', [])]
+    plans.sort(key=lambda pair: pair[1].get('selection_rank', 0))
+    for priority, item in plans:
+        record = {"path": item["path"], "node": item["test_nodes"][0], "priority": priority.upper()}
+        if item.get("kind", "python") == "gtest":
+            # 测试服务器不构建 C++，gtest 用例只留在 ci_recommendations。
+            skipped.append({**record, "reason": "gtest cases are not runnable on the test server; see ci_recommendations"})
+            continue
+        parts = item["test_nodes"][0].split(".")
+        method, classes = parts[-1], parts[:-1]
+        if len(classes) > 1:
+            skipped.append({**record, "reason": "nested-class node exceeds the one-class manifest schema"})
+            continue
+        runtime_tf = "::".join([item["path"], *classes, method])
+        tf = runtime_tf
+        try:
+            if device_of is not None:
+                got = device_of(item["path"], item["test_nodes"][0])
+                devices = [got] if isinstance(got, str) else list(got)
+                resolver_identity = getattr(device_of, "source_test_function", None)
+                if resolver_identity is not None:
+                    mapped = resolver_identity(item["path"], item["test_nodes"][0])
+                    if mapped:
+                        tf = mapped
+            else:
+                devices = [device]
+            tf = validate_test_function(tf)
+            devices = [validate_device(d) for d in devices]
+        except IdentifierError as error:
+            skipped.append({**record, "reason": str(error)})
+            continue
+        for dev in devices:
+            key = (tf, dev)
+            existing = next((entry for entry in entries if (entry["test_function"], entry["device"]) == key), None)
+            if existing is None:
+                seen.add(key)
+                entry = {"test_function": tf, "device": dev}
+                if include_reserve:
+                    entry['selection'] = dict(rank=item.get('selection_rank', 0),
+                        budget=report.get('max_tests', 15), relevance=item.get('relevance', 3),
+                        groups=item.get('groups', []), evidence=item.get('evidence', []),
+                        focus=item.get('instance_focus', []))
+                if item.get("execution_mode"):
+                    entry["execution_mode"] = item["execution_mode"]
+                if runtime_tf != tf:
+                    entry.update({"source_test_function": tf, "runtime_nodeid": runtime_tf,
+                                  "device_basis": "ast_or_collected_variant"})
+                entries.append(entry)
+            else:
+                # Preserve every concrete collected instance instead of
+                # de-duplicating it by source function/device.
+                node = runtime_tf
+                nodes = existing.setdefault("runtime_nodeids", [])
+                first = existing.get("runtime_nodeid") or existing["test_function"]
+                if first not in nodes:
+                    nodes.append(first)
+                if node not in nodes:
+                    nodes.append(node)
     report["manifest"] = entries
     report["manifest_skipped"] = skipped
     return entries

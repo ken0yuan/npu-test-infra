@@ -233,7 +233,7 @@ def test_discovery_success_family_missing_stays_unresolved(env, fake_discover):
     )
 
 
-def test_fallback_nodes_throttled_to_smallest(tmp_path):
+def test_shared_change_candidates_remain_individual_and_do_not_inherit_p0(tmp_path):
     """共享改动回退全节点：按方法行数限流取最小 3 个，其余记 gap。"""
     (tmp_path / "test").mkdir(parents=True)
     src = "class TestBig:\n"
@@ -254,11 +254,11 @@ def test_fallback_nodes_throttled_to_smallest(tmp_path):
     report = selection.build_report(
         "sha", "base", [item], [], tmp_path, 1, 5000, 6,
     )
-    entry = next(i for i in report["p0"] if i["path"] == "test/test_big.py")
-    assert entry["fallback"] is True
-    assert entry["score"] == selection.P0_SCORE_FALLBACK
-    assert len(entry["test_nodes"]) == 3
-    assert any("throttled" in g["reason"] for g in report["analysis_gaps"])
+    entries = [i for i in report["p1"] if i["path"] == "test/test_big.py"]
+    assert len(entries) == 6
+    assert all(e['relevance'] == 2 and len(e['test_nodes']) == 1 for e in entries)
+    assert all(e['evidence'][0]['type'] == 'shared_test_context' for e in entries)
+    assert not any("throttled" in g["reason"] for g in report["analysis_gaps"])
 
 
 def test_p0_evidence_grading_drives_budget_order(tmp_path, monkeypatch):

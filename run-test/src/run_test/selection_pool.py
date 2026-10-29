@@ -66,7 +66,9 @@ class SelectionPool:
             atomic_json(path, {'failures': failures, 'last_exit': rc,
                                'retry_at': time.time() + self.retry_seconds,
                                'finished_at': time.time()})
-            if failures >= self.max_failures:
+            if rc == 4:
+                message = f'{task.task_id}: selection needs review (no eligible test/caller); see test-plan.json'
+            if rc == 4 or failures >= self.max_failures:
                 current = self.store.get_task(task.task_id)
                 if current and current.state == STATE_PENDING_ANALYSIS:
                     self.store.mark_blocked(task.task_id, message)

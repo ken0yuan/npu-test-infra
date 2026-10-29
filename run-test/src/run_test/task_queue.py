@@ -342,6 +342,15 @@ def validate_manifest(manifest: Any) -> list[dict]:
             if type(count) is not int or count < 1 or item["device"] != "accelerator":
                 raise QueueError("required_npu_cards 必须是 accelerator 测试的正整数卡数")
             row["required_npu_cards"] = count
+        if 'selection' in item:
+            meta = item['selection']
+            if not isinstance(meta, dict) or type(meta.get('budget')) is not int or meta['budget'] < 1:
+                raise QueueError('selection requires a positive family budget')
+            if type(meta.get('rank')) is not int or meta['rank'] < 0 or type(meta.get('relevance')) is not int:
+                raise QueueError('selection rank/relevance must be integers')
+            if not all(isinstance(meta.get(k, []), list) for k in ('groups', 'evidence', 'focus')):
+                raise QueueError('selection groups/evidence/focus must be lists')
+            row['selection'] = json.loads(json.dumps(meta, ensure_ascii=False))
         for key in ("source_test_function", "runtime_nodeid", "runtime_nodeids", "execution_mode", "device_basis"):
             if key in item:
                 if key == "runtime_nodeids":

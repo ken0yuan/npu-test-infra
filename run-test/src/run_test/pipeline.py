@@ -167,7 +167,7 @@ def _run_selection_body(
         with tarfile.open(pkg, 'r:gz') as tf:
             members = [m for m in tf.getmembers() if (
                 m.name.removeprefix('./') == 'pytorch/test'
-                or m.name.removeprefix('./').startswith('pytorch/test/')
+                or m.name.removeprefix('./').startswith(('pytorch/test/', 'pytorch/tools/'))
                 or m.name.removeprefix('./') in {'pytorch/aten/tools/run_tests.sh', 'pytorch/.ci/pytorch/test.sh'}
                 or m.name.removeprefix('./') in source_members)]
             tf.extractall(cache, members=members, filter='data')
@@ -205,7 +205,7 @@ def _run_selection_body(
     from .device_policy import ExecutionDeviceResolver, configured_devices
     resolver = ExecutionDeviceResolver(make_device_resolver(tree), None if device == "auto" else device,
                                        configured_devices(config))
-    manifest = plan_to_manifest(report, device_of=resolver)
+    manifest = plan_to_manifest(report, device_of=resolver, include_reserve=True)
     report["device_diagnostics"] = list(resolver.diagnostics)
 
     if manifest:
@@ -227,7 +227,11 @@ def _run_selection_body(
     if not manifest:
         # 没有候选 = selector 不确定，不得当作“不需要测试”，也不提交空清单。
         print("无可用清单条目（候选未能展开或全部被跳过）；不提交，请人工查看计划文件", file=sys.stderr)
-        return 2
+        report['selection_outcome'] = 'needs_review'
+        report['selection_reason'] = 'No eligible source test or helper caller was resolved; inspect catalog and coverage gaps.'
+        from .task_staging import atomic_json
+        atomic_json(plan_path, report)
+        return 4
     if no_submit:
         print("（--no-submit：清单未提交）")
         return 0
