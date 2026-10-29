@@ -317,14 +317,19 @@ def order_candidates(entries):
         turn = rounds.get(key, 0); rounds[key] = turn + 1
         decorated.append((key[0], turn, -len(e.get('groups', ())), e['path'], e['test_nodes'][0], e))
     ordered = [row[-1] for row in sorted(decorated, key=lambda row: row[:-1])]
-    representatives, remainder, covered = [], [], set()
-    for e in ordered:
-        groups = set(e.get('groups', ()))
-        if e.get('relevance', 3) <= 2 and groups - covered:
-            representatives.append(e); covered.update(groups)
-        else:
-            remainder.append(e)
-    return representatives + remainder
+    result, covered = [], set()
+    for level in sorted({e.get('relevance', 3) for e in ordered}):
+        representatives, remainder = [], []
+        for e in ordered:
+            if e.get('relevance', 3) != level:
+                continue
+            groups = set(e.get('groups', ()))
+            if level <= 2 and groups - covered:
+                representatives.append(e); covered.update(groups)
+            else:
+                remainder.append(e)
+        result.extend(representatives + remainder)
+    return result
 
 
 def sample_instances(nodes, limit, focus=()):

@@ -388,7 +388,7 @@ def analyze_tests(tree_root: Path, changed_sources: list[ChangedFile]) -> list[T
             info.path, info.catalog, info.line_count = rel, catalog, len(text.splitlines())
             info.test_nodes = catalog.tests
             info.direct_refs = ([ref for node in catalog.tests for ref in catalog.references(node, changed_modules)]
-                                if info.imported_modules else [])
+                                if changed_modules and info.imported_modules else [])
             for ref in info.direct_refs:
                 chain = export_chains.get(ref['module'], {}).get(ref['symbol'])
                 if chain:
@@ -878,7 +878,7 @@ def select_for_commit(
 
     pr_text：完整 PR 文本信号（subject + commit message 正文，镜像 ``git
     show -s --format=%B`` 可得，无需 gh/token）；缺省退回 subject。
-    mentioned_in_pr 的 200 分加权依赖它——只给 subject 时几乎不触发。
+    PR 提及仅作候选发现线索，不提高已有逐用例证据的语义等级。
     """
     merge_base = git(git_dir, "rev-parse", f"{sha}^").strip()
     changed = collect_changed_files(git_dir, sha, tree_root)

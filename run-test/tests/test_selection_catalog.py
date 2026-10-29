@@ -70,6 +70,21 @@ def test_groups_get_strong_representatives_before_redundant_tests():
     assert [e['test_nodes'][0] for e in result[:3]]==['test_a','test_c','test_b']
 
 
+def test_group_novelty_never_promotes_a_weaker_evidence_tier():
+    def entry(name, group, level):return dict(path='test/test_x.py',test_nodes=[name],groups=[group],relevance=level)
+    result=order_candidates([entry('test_first','A',1),entry('test_second','A',1),entry('test_weak','B',2)])
+    assert [e['test_nodes'][0] for e in result]==['test_first','test_second','test_weak']
+
+
+def test_no_product_python_symbols_means_no_reference_graph_scan(tmp_path, monkeypatch):
+    directory=tmp_path/'test';directory.mkdir()
+    (directory/'test_cpu.py').write_text('import torch\ndef test_one(): assert torch.tensor(1).item()==1\n')
+    def unexpected(*args, **kwargs):raise AssertionError('No changed Python module exists')
+    monkeypatch.setattr(Catalog,'references',unexpected)
+    found=selection.analyze_tests(tmp_path,[])
+    assert found[0].test_nodes=={'test_one':(2,2)} and found[0].direct_refs==[]
+
+
 def test_class_context_does_not_affect_another_class_and_local_alias_shadow_is_not_a_reference():
     catalog=Catalog('from torch.foo import target\n'
         'class TestA:\n    FLAG = 2\n    def test_one(self): pass\n'
