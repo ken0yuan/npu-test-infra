@@ -337,13 +337,14 @@ def _instantiate_table(tree: ast.Module) -> dict[str, tuple[set[str] | None, str
 
 def classify_function(
     file_source: str, class_name: str | None, func_name: str,
+    *, _context=None,
 ) -> Classification:
     """按 (类名, 函数名) 从测试文件 AST 判定设备（规则见模块 docstring）。
 
     文件不可解析 / 类或函数定位不到 → 缺省 cuda + 原因（不排除、不报错）。
     """
     try:
-        tree = ast.parse(file_source)
+        tree = _context['tree'] if _context is not None else ast.parse(file_source)
     except SyntaxError as error:
         return _default(f"文件解析失败（SyntaxError: {error.msg}）")
 
@@ -389,7 +390,7 @@ def classify_function(
 
     # 2) instantiate_device_type_tests 参数化（逐类，不按文件一刀切）。
     if cls_node is not None:
-        table = _instantiate_table(tree)
+        table = _context['instantiations'] if _context is not None else _instantiate_table(tree)
         if cls_node.name in table:
             devices, how = table[cls_node.name]
             if devices:
@@ -409,7 +410,7 @@ def classify_function(
     roots: list[ast.AST] = [func_node]
     if cls_node is not None and cls_node.decorator_list:
         roots.extend(cls_node.decorator_list)
-    signals = _collect_signals(roots, _module_import_aliases(tree))
+    signals = _collect_signals(roots, _context['aliases'] if _context is not None else _module_import_aliases(tree))
     if signals:
         dev = next(d for d in _SIGNAL_PRIORITY if d in signals)
         others = sorted(signals - {dev}, key=_SIGNAL_PRIORITY.index)
@@ -477,6 +478,8 @@ class DeviceResolver:
         self.diagnostics: list[dict] = []
         self._sources: dict[str, str | None] = {}
         self._identities: dict[tuple[str, str], str] = {}
+        self._contexts = {}
+        self._declarations = {}
 
     def _source(self, path: str) -> str | None:
         if path not in self._sources:
@@ -494,6 +497,13 @@ class DeviceResolver:
         if source is None:
             result = _default(f"文件缺失/不可读: {path}")
         else:
+            if path not in self._contexts:
+                try:
+                    tree = ast.parse(source)
+                    self._contexts[path] = dict(tree=tree, instantiations=_instantiate_table(tree),
+                                                aliases=_module_import_aliases(tree))
+                except SyntaxError:
+                    self._contexts[path] = None
             parts = node.split(".")
             method = parts[-1]
             cls = parts[0] if len(parts) == 2 else None
@@ -505,7 +515,9 @@ class DeviceResolver:
             variant_token = None
             if cls:
                 from .runner import declared_class_methods
-                variant = _variant_identity(source, cls, method, declared_class_methods(self.tree_root / path))
+                if path not in self._declarations:
+                    self._declarations[path] = declared_class_methods(self.tree_root / path)
+                variant = _variant_identity(source, cls, method, self._declarations[path])
                 if variant is not None:
                     base_cls, base_method, variant_token = variant
             if variant_token is not None:
@@ -514,7 +526,7 @@ class DeviceResolver:
                                   "NPU": DEVICE_ACCELERATOR,
                                   "XPU": "xpu"}.get(variant_token, variant_token.lower())
             cls, method = base_cls, base_method
-            result = classify_function(source, cls or None, method)
+            result = classify_function(source, cls or None, method, _context=self._contexts[path])
             if variant_device is not None:
                 # A concrete collected variant is one execution channel; never
                 # copy its runtime node to all class-level only_for devices.

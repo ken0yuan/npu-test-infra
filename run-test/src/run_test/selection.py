@@ -919,6 +919,7 @@ def plan_to_manifest(
     否则整个清单用固定 device。
     """
     entries: list[dict] = []
+    entries_by_key = {}
     skipped: list[dict] = []
     seen: set[tuple[str, str]] = set()
     plans = [(p, item) for p in ("p0", "p1") for item in report[p]]
@@ -956,7 +957,7 @@ def plan_to_manifest(
             continue
         for dev in devices:
             key = (tf, dev)
-            existing = next((entry for entry in entries if (entry["test_function"], entry["device"]) == key), None)
+            existing = entries_by_key.get(key)
             if existing is None:
                 seen.add(key)
                 entry = {"test_function": tf, "device": dev}
@@ -971,6 +972,7 @@ def plan_to_manifest(
                     entry.update({"source_test_function": tf, "runtime_nodeid": runtime_tf,
                                   "device_basis": "ast_or_collected_variant"})
                 entries.append(entry)
+                entries_by_key[key] = entry
             else:
                 # Preserve every concrete collected instance instead of
                 # de-duplicating it by source function/device.

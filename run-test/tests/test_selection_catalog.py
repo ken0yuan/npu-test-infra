@@ -85,6 +85,24 @@ def test_no_product_python_symbols_means_no_reference_graph_scan(tmp_path, monke
     assert found[0].test_nodes=={'test_one':(2,2)} and found[0].direct_refs==[]
 
 
+def test_reserve_device_resolution_reuses_source_ast_and_declarations_only_within_one_tree(tmp_path, monkeypatch):
+    import ast
+    from run_test import runner
+    path=tmp_path/'test/test_device.py';path.parent.mkdir()
+    path.write_text('class TestCPU:\n    def test_a(self): return "cpu"\n    def test_b(self): return "cpu"\n')
+    parse=ast.parse;declared=runner.declared_class_methods;calls=[]
+    def tracked_parse(*args,**kwargs):calls.append('parse');return parse(*args,**kwargs)
+    def tracked_declared(*args,**kwargs):calls.append('declared');return declared(*args,**kwargs)
+    monkeypatch.setattr(ast,'parse',tracked_parse);monkeypatch.setattr(runner,'declared_class_methods',tracked_declared)
+    resolver=make_device_resolver(tmp_path)
+    assert resolver('test/test_device.py','TestCPU.test_a')==['cpu']
+    first=len(calls)
+    assert resolver('test/test_device.py','TestCPU.test_b')==['cpu'] and len(calls)==first
+    path.write_text('class TestCPU:\n    def test_a(self): return "npu"\n')
+    fresh=make_device_resolver(tmp_path)
+    assert fresh('test/test_device.py','TestCPU.test_a')==['accelerator'] and len(calls)>first
+
+
 def test_class_context_does_not_affect_another_class_and_local_alias_shadow_is_not_a_reference():
     catalog=Catalog('from torch.foo import target\n'
         'class TestA:\n    FLAG = 2\n    def test_one(self): pass\n'
