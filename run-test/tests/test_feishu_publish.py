@@ -5,6 +5,7 @@ import io
 from pathlib import Path
 from types import SimpleNamespace
 import urllib.parse
+import urllib.error
 
 import pytest
 
@@ -627,3 +628,93 @@ def test_many_parts_do_not_consume_the_date_folders_capacity(tmp_path):
     assert len(api.files(day)) == 1500
     assert len(receipt['parts']) == 3
     assert _doc_names(api, receipt['destination_folder_token']) == ['PR#77', 'PR#77-1', 'PR#77-2']
+
+
+@pytest.mark.parametrize('committed', [False, True])
+def test_uncertain_promotion_recovers_without_reupload_or_duplicate(tmp_path, committed):
+    api = FakeFeishu(); original = api.call; failed = False
+    def flaky(method, url, body=None):
+        nonlocal failed
+        if url.endswith('/move') and len(api.moves) == 22 and not failed:
+            failed = True
+            if committed:
+                original(method, url, body)
+            raise UncertainWrite('HTTP 500')
+        return original(method, url, body)
+    api.call = flaky
+    pointer, plan = {'pr_number': 77, 'fingerprint': 'f1' * 32}, _v2_plan(parts=30)
+    with pytest.raises(UncertainWrite):
+        Publisher(api, 'target', tmp_path).publish(pointer, plan)
+    original_content = deepcopy(api.documents)
+    receipt = Publisher(api, 'target', tmp_path).publish(pointer, plan)
+    assert len(receipt['parts']) == len(api.documents) == len(api.moves) == 30
+    assert api.documents == original_content
+    assert {p['document_id'] for p in receipt['parts']} == {
+        f['token'] for f in api.files(receipt['destination_folder_token'])}
+    state = json.loads((tmp_path / 'target/PR_77' / (pointer['fingerprint'] + '.json')).read_text())
+    assert state['status'] == 'published' and not any(k.endswith('_pending') for k in state)
+    assert state.get('promoted-22_reconciled_retries', 0) == (0 if committed else 1)
+
+
+def test_pending_move_without_positive_source_evidence_stays_pending(tmp_path):
+    api = FakeFeishu(); api.entries['source'] = []
+    worker = Publisher(api, 'target', tmp_path); worker.path = tmp_path / 'state.json'
+    worker.state = {'move_pending': True, 'move_destination': 'target'}
+    with pytest.raises(UncertainWrite, match='源目录未找到'):
+        worker.move('move', 'missing-doc', 'target', source='source')
+    assert not api.mutations and worker.state['move_pending']
+
+
+@pytest.mark.parametrize('status', ['pending', 'processing', 'success', 'unexpected', 'fail'])
+def test_pending_async_move_requires_failed_task_and_source_evidence(tmp_path, status):
+    api = FakeFeishu(); api.entries['source'] = [{'token': 'doc', 'type': 'docx', 'name': 'report'}]
+    original = api.call
+    def call(method, url, body=None):
+        if url.startswith('/drive/v1/files/task_check?'):
+            assert method == 'GET' and urllib.parse.parse_qs(urllib.parse.urlsplit(url).query) == {'task_id': ['task-1']}
+            return {'status': status}
+        return original(method, url, body)
+    api.call = call
+    worker = Publisher(api, 'target', tmp_path); worker.path = tmp_path / 'state.json'
+    worker.state = {'move_pending': True, 'move_destination': 'target', 'move_task_id': 'task-1'}
+    if status == 'fail':
+        worker.move('move', 'doc', 'target', source='source')
+        assert api.moves == [('doc', 'target')] and worker.state['move']
+    else:
+        with pytest.raises(UncertainWrite, match='任务尚未确认失败'):
+            worker.move('move', 'doc', 'target', source='source')
+        assert not api.moves
+
+
+def test_move_task_id_is_saved_before_waiting_and_reconciled_by_membership(tmp_path, monkeypatch):
+    api = FakeFeishu(); api.entries['source'] = [{'token': 'doc', 'type': 'docx', 'name': 'report'}]
+    api.call = lambda *args, **kwargs: {'task_id': 'task-1'}
+    monkeypatch.setattr('run_test.feishu_publish.time.sleep', lambda _: None)
+    worker = Publisher(api, 'target', tmp_path); worker.path = tmp_path / 'state.json'
+    with pytest.raises(UncertainWrite, match='移动请求已提交'):
+        worker.move('move', 'doc', 'target', source='source')
+    saved = json.loads(worker.path.read_text())
+    assert saved['move_task_id'] == 'task-1' and saved['move_pending']
+    api.entries['target'] = api.entries.pop('source')
+    api.call = lambda *args, **kwargs: pytest.fail('membership already confirms success')
+    worker.move('move', 'doc', 'target', source='source')
+    assert worker.state['move'] and 'move_pending' not in worker.state
+
+
+@pytest.mark.parametrize('status,body,expected', [
+    (400, b'{"code":1061045,"msg":"secret-response"}', 'code=1061045'),
+    (500, b'{"code":1061001,"msg":"secret-response"}', 'code=1061001'),
+    (500, b'{"code":"secret-response"}', ''),
+    (500, b'secret-response', ''),
+])
+def test_http_error_keeps_only_numeric_business_code(monkeypatch, status, body, expected):
+    api = Feishu({})
+    def fail(*args, **kwargs):
+        raise urllib.error.HTTPError('https://open.feishu.cn', status, 'secret-header', {}, io.BytesIO(body))
+    api.opener = SimpleNamespace(open=fail)
+    monkeypatch.setattr('run_test.feishu_publish.time.sleep', lambda _: None)
+    error_type = UncertainWrite if status == 500 else PublishError
+    with pytest.raises(error_type) as caught:
+        api.call('POST', '/drive/v1/files/doc/move', auth=False)
+    assert f'HTTP {status}' in str(caught.value) and expected in str(caught.value)
+    assert 'secret' not in str(caught.value)

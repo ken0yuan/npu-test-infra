@@ -106,7 +106,17 @@ class Feishu:
                     time.sleep(2 ** attempt)
                     continue
                 cls = UncertainWrite if method != 'GET' and error.code >= 500 else PublishError
-                raise cls(f'飞书 HTTP {error.code}（响应体及认证头不写日志）') from None
+                # Only an integer business code is safe to retain. Never log the
+                # raw response, which may echo request content or credentials.
+                code = None
+                try:
+                    value = json.loads(error.read(65536)).get('code')
+                    if type(value) is int:
+                        code = value
+                except (ValueError, AttributeError, OSError):
+                    pass
+                detail = '' if code is None else f' code={code}'
+                raise cls(f'飞书 HTTP {error.code}{detail}（响应体及认证头不写日志）') from None
             except (urllib.error.URLError, TimeoutError, OSError, ValueError):
                 if method == 'GET' and attempt < 3:
                     time.sleep(2 ** attempt)
@@ -280,7 +290,7 @@ class Publisher:
                     raise PublishError('远端表格计数与报告不一致')
         return {'blocks': len(blocks), 'root_blocks': len(actual), 'tables': len(tables), 'content_verified': True}
 
-    def move(self, key, doc, destination):
+    def move(self, key, doc, destination, *, source=None):
         # Moving is idempotent after checking membership, including ambiguous HTTP outcomes.
         previous_destination = self.state.get(key + '_destination')
         if self.state.get(key + '_pending') and previous_destination != destination:
@@ -298,7 +308,24 @@ class Publisher:
             self.save()
             return
         if self.state.get(key + '_pending'):
-            raise UncertainWrite('先前移动仍未确认，保留两个目录现场')
+            task = self.state.get(key + '_task_id')
+            if task:
+                result = self.api.call('GET', '/drive/v1/files/task_check?' +
+                                       urllib.parse.urlencode({'task_id': task}))
+                self.state[key + '_task_status'] = result.get('status')
+                self.save()
+                if result.get('status') != 'fail':
+                    raise UncertainWrite('先前移动任务尚未确认失败，等待目标目录对账')
+            # Replaying a move of the SAME document to the SAME destination
+            # cannot create another document. Require positive source evidence;
+            # absence from the destination alone is not evidence of failure.
+            if source is None or source == destination or not any(
+                    f['token'] == doc for f in self.api.files(source)):
+                raise UncertainWrite('先前移动仍未确认且源目录未找到原文档，保留现场')
+            self.state[key + '_reconciled_retries'] = self.state.get(key + '_reconciled_retries', 0) + 1
+            self.state.pop(key + '_task_id', None)
+            self.state.pop(key + '_task_status', None)
+            self.save()
         self.state[key + '_destination'] = destination
         self.state[key + '_pending'] = True
         self.save()
@@ -310,6 +337,9 @@ class Publisher:
             self.state.pop(key + '_pending', None)
             self.save()
             raise
+        if data.get('task_id'):
+            self.state[key + '_task_id'] = data['task_id']
+            self.save()
         # File movement can be asynchronous. Membership, not HTTP 200, confirms completion.
         for _ in range(6):
             if any(f['token'] == doc for f in self.api.files(destination)):
@@ -427,7 +457,7 @@ class Publisher:
         # 完整版本集：全部篇（主篇+续篇）进入目标目录——与历史
         # PR#194758/-1/-2 同层布局一致；逐一晋升后再归档旧版本。
         for pi, doc in enumerate(docs):
-            self.move(f'promoted-{pi}', doc, destination)
+            self.move(f'promoted-{pi}', doc, destination, source=version)
         # 旧版本集 = 主篇名 + 主篇名-数字（历史续篇命名）——篇数变化
         # （多篇变单篇/续篇增减）时旧续篇一并归档。
         def _is_old_version(name):
@@ -443,7 +473,7 @@ class Publisher:
         if old_docs:
             history = self.unique_object('history-' + destination, destination, '历史测试报告', 'folder')
             for old in old_docs:
-                self.move('archived-' + old['token'], old['token'], history)
+                self.move('archived-' + old['token'], old['token'], history, source=destination)
         for suffix in [p['title_suffix'] for p in parts]:
             matches = [f for f in self.api.files(destination)
                        if f['type'] == 'docx' and f['name'] == plan['title'] + suffix]
@@ -494,11 +524,11 @@ class Publisher:
             raise PublishError('本地结果已更新；已验证的旧版本留在暂存，未替换当前文档')
         old_docs = [f for f in self.api.files(destination) if f['type'] == 'docx' and f['name'] == plan['title'] and f['token'] != doc]
         # Keep old content until the complete replacement has been verified and promoted.
-        self.move('promoted', doc, destination)
+        self.move('promoted', doc, destination, source=version)
         if old_docs:
             history = self.unique_object('history-' + destination, destination, '历史测试报告', 'folder')
             for old in old_docs:
-                self.move('archived-' + old['token'], old['token'], history)
+                self.move('archived-' + old['token'], old['token'], history, source=destination)
         matches = [f for f in self.api.files(destination) if f['type'] == 'docx' and f['name'] == plan['title']]
         if len(matches) != 1 or matches[0]['token'] != doc:
             raise PublishError('发布后目录对账未通过，未标记完成')
