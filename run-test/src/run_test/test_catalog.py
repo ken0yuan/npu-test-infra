@@ -47,6 +47,7 @@ class Catalog:
     def __init__(self, text, path):
         import hashlib
         self.path = path
+        self.source = text
         self.normalized_source_sha256 = hashlib.sha256(text.encode('utf-8')).hexdigest()
         self.tree = ast.parse(text, filename=path)
         self.aliases = {}
@@ -160,6 +161,17 @@ class Catalog:
     def changed(self, lines, added=False):
         # Most specific definition wins; enclosing tests are not marked changed
         # just because a nested helper's implementation changed.
+        if not hasattr(self, '_code_lines'):
+            import io, tokenize
+            self._code_lines = set()
+            trivia = {tokenize.NL, tokenize.NEWLINE, tokenize.INDENT, tokenize.DEDENT,
+                      tokenize.COMMENT, tokenize.ENDMARKER}
+            # Keep original coordinates, including every line of a multiline
+            # string token; a line beginning with '#' inside a value is code.
+            for token in tokenize.generate_tokens(io.StringIO(self.source).readline):
+                if token.type not in trivia:
+                    self._code_lines.update(range(token.start[0], token.end[0]+1))
+        lines = set(lines) & self._code_lines
         hits = set()
         shared = set()
         for line in lines:

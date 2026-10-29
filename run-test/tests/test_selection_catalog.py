@@ -113,6 +113,14 @@ def test_class_context_does_not_affect_another_class_and_local_alias_shadow_is_n
     assert not shadow.references('TestA.test_one',{'torch.foo':{'target'}})
 
 
+def test_added_method_spacing_does_not_become_shared_class_evidence():
+    catalog=Catalog('class TestX:\n    def test_old(self): assert True\n\n'
+                    '    # new regression\n    def test_new(self): assert True\n','test/test_x.py')
+    assert set(catalog.changed_test_evidence({3,4,5}))=={'TestX.test_new'}
+    value=Catalog('def test_value():\n    data = """first\n# content\nlast"""\n    assert data\n','test/test_x.py')
+    assert value.changed_test_evidence({3})['test_value']['relevance']==0
+
+
 def test_shared_helper_reference_cache_keeps_each_callers_identity():
     catalog=Catalog('from torch.foo import target\ndef helper(): return target()\n'
         'class TestX:\n    def test_a(self): assert helper()==2\n'
