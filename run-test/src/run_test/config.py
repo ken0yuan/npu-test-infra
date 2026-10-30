@@ -37,6 +37,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "cycle_interval_seconds": 3600.0,
         # 首轮回溯窗口（小时）：一次性 backfill，后续按 tip 增量。
         "first_run_backfill_hours": 2.0,
+        # Retry transient transport failures within a round, without waiting an hour.
+        "fetch_attempts": 3,
+        "fetch_retry_seconds": 5,
+        "fetch_timeout_seconds": 180,
     },
     "queue": {
         # 执行循环空闲时的轮询间隔（秒）。

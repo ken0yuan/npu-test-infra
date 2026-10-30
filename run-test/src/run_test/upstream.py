@@ -26,6 +26,7 @@ from __future__ import annotations
 import re
 import os
 import subprocess
+import time
 from dataclasses import dataclass, field
 import json
 import hashlib
@@ -258,9 +259,40 @@ class PyTorchMirror:
 
     def fetch(self) -> str:
         """拉取最新 main（fetch 并前进本地 main 引用），返回新 tip。"""
-        self.ensure()
-        _git(self.git_dir, ["fetch", "--quiet", "origin", "main:refs/heads/main"])
-        return self.tip()
+        from .upstream_health import read_health, record_health
+        cfg = self.config or {}
+        options = cfg.get("upstream") or {}
+        attempts = max(1, min(5, int(options.get("fetch_attempts", 3))))
+        delay = max(0, min(60, float(options.get("fetch_retry_seconds", 5))))
+        timeout = max(1, float(options.get("fetch_timeout_seconds", 180)))
+        previous = read_health(cfg) if self.config is not None else {}
+        def record(**changes):
+            if self.config is not None:
+                record_health(cfg, **changes)
+        for attempt in range(1, attempts + 1):
+            record(status="fetching", last_attempt_at=datetime.now(timezone.utc).isoformat(),
+                   attempt=attempt, max_attempts=attempts)
+            try:
+                self.ensure()
+                _git(self.git_dir, ["fetch", "--quiet", "origin", "main:refs/heads/main"], timeout=timeout)
+                tip = self.tip()
+            except UpstreamError as error:
+                # Retry transport failures only; bad refs/auth/repository identity
+                # need intervention and must not be hidden by repeated requests.
+                transient = re.search(r"timed? out|timeout|Failed to connect|Could not resolve|"
+                    r"Connection (?:reset|refused|closed)|TLS|SSL|HTTP.*(?:429|500|502|503|504)|"
+                    r"remote end hung up|early EOF", str(error), re.I)
+                retry = bool(transient) and attempt < attempts
+                record(status="retrying" if retry else "failed", error=str(error),
+                       last_failure_at=datetime.now(timezone.utc).isoformat(),
+                       consecutive_failures=int(previous.get("consecutive_failures", 0)) + 1)
+                if not retry:
+                    raise
+                time.sleep(delay * attempt)
+                continue
+            record(status="ok", error="", last_success_at=datetime.now(timezone.utc).isoformat(),
+                   fetched_tip=tip, consecutive_failures=0)
+            return tip
 
     def tip(self) -> str:
         return _git(self.git_dir, ["rev-parse", "main"]).strip()

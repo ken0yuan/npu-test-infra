@@ -27,7 +27,12 @@ def snapshot(config):
     tasks = read_rows(paths.queue_db, 'tasks')
     records = read_rows(paths.pr_db, 'pr_results')
     upstream = read_rows(paths.queue_db, 'upstream_commits')
+    from .upstream_health import read_health, health_warning
+    health = read_health(config)
+    mirror = read_rows(paths.queue_db, 'mirror_state')
+    warning = health_warning(config, health, mirror[0]['last_fetch_at'] if mirror else None)
     return {'time':datetime.now().astimezone().isoformat(), 'tasks':tasks, 'results':records,
+            'upstream_health':health, 'upstream_warning':warning,
             'task_states':dict(Counter(t['state'] for t in tasks)),
             'upstream_states':dict(Counter(r['enqueue_state'] for r in upstream))}
 
@@ -83,6 +88,8 @@ def monitor_once(config, output):
             temp.write_text(json.dumps({'observed_at':snap['time'],**issue},ensure_ascii=False,indent=2),encoding='utf-8')
             temp.replace(path)
     message = {'time':snap['time'],'tasks_checked':len(snap['tasks']),'current_issues':len(issues),'archive':str(output)}
+    message['upstream_health'] = snap.get('upstream_health', {})
+    if snap.get('upstream_warning'): message['upstream_warning'] = snap['upstream_warning']
     if config.get('data_root'):
         from .issue_ledger import scan
         message['ledger'] = scan(config, snap)
@@ -115,6 +122,8 @@ def brief_once(config):
     if archived_tasks:task_states['resolved_archived']=archived_tasks
     message = {'time':snap['time'],'tasks':task_states,'upstream':snap['upstream_states'],
                'prs':len(snap['results']),'counts':current,'note':'当前计数排除已解决归档错误；归档不是通过，原始结果保留；done 仅表示落库完成'}
+    message['upstream_health'] = snap.get('upstream_health', {})
+    if snap.get('upstream_warning'): message['upstream_warning'] = snap['upstream_warning']
     if current!=totals or archived_tasks:
         message.update(historical_counts=totals, historical_tasks=snap['task_states'],
                        resolved_counts={key:totals[key]-current[key] for key in totals})
