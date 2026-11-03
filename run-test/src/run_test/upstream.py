@@ -404,6 +404,7 @@ class CycleReport:
     still_missing: list[str] = field(default_factory=list)
     expired: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
+    obs_listing_status: str = "not_checked"
 
 
 # 上游 commit 记录后等待桶中对象出现的最长时间；超过则不再查找
@@ -482,8 +483,15 @@ def run_cycle(
     try:
         listing = downloader.list(f"{bucket}/")
     except Exception as e:
+        from .upstream_health import record_health
+        report.obs_listing_status = 'failed'
+        record_health(config, obs_listing_status='failed', obs_error=str(e),
+                      obs_pending_before=report.pending_before)
         report.errors.append(f"桶列表获取失败: {e}")
         return report
+    from .upstream_health import record_health
+    report.obs_listing_status = 'ok'
+    record_health(config, obs_listing_status='ok', obs_error='', obs_objects=len(listing))
 
     for row in pending:
         sha10 = row["sha"][:10]

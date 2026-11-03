@@ -68,6 +68,15 @@ def test_quiet_main_is_healthy_but_stale_fetch_is_unknown(config):
     assert '过期' in health_warning(config, {}, (now-timedelta(hours=2)).isoformat(), now=now)
 
 
+def test_obs_failure_warns_even_when_git_fetch_is_healthy(config):
+    now = datetime.now(timezone.utc)
+    health = {'status':'ok','last_success_at':now.isoformat(),
+              'obs_listing_status':'failed','obs_error':'listing timed out'}
+    assert '配套包是否存在未知' in health_warning(config, health, now=now)
+    health.update(obs_listing_status='ok', obs_error='')
+    assert health_warning(config, health, now=now) is None
+
+
 def test_corrupt_health_is_visible(config):
     from run_test.config import store_paths
     path = store_paths(config).data_root / 'upstream-fetch-health.json'

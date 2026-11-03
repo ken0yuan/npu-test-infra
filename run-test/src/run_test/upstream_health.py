@@ -36,6 +36,8 @@ def record_health(config, **changes):
 def health_warning(config, health, last_fetch_at=None, *, now=None):
     if health.get("status") in ("failed", "retrying", "unreadable"):
         return "上游抓取异常，最新提交是否积压未知：" + str(health.get("error", "未知原因"))[-700:]
+    if health.get('obs_listing_status') == 'failed':
+        return '上游 OBS 列表查询失败，配套包是否存在未知：' + str(health.get('obs_error', ''))[-700:]
     last = health.get("last_success_at") or last_fetch_at
     if not last:
         return "尚无上游抓取成功记录，不能判断最新提交是否积压"

@@ -498,10 +498,12 @@ def cmd_cycle(args: argparse.Namespace) -> int:
 
     def _once() -> int:
         report = run_cycle(config, first_run_backfill_hours=backfill)
+        waiting = (str(len(report.still_missing)) if report.obs_listing_status == 'ok'
+                   else f'未知（已登记{report.pending_before}）')
         print(f"[{__import__('datetime').datetime.now().isoformat(timespec='seconds')}] "
               f"tip={report.fetched_tip[:10]} "
               f"新commit={report.new_commits}(记{report.recorded}/无PR{report.skipped_no_pr}) "
-              f"入队={len(report.enqueued)} 等待={len(report.still_missing)} "
+              f"入队={len(report.enqueued)} 等待={waiting} OBS查询={report.obs_listing_status} "
               f"过期={len(report.expired)}", flush=True)
         for e in report.enqueued:
             print(f"  [入队] {e['task_id']} PR#{e['pr_number']} {e['sha10']} "

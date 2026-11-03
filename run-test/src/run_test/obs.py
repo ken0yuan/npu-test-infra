@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import subprocess
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -39,15 +40,24 @@ class DownloadedObject:
 class ObsutilDownloader:
     """通过 obsutil CLI 下载对象（obs://bucket/path → 本地路径）。"""
 
-    def __init__(self, bin_path: str = "obsutil"):
+    def __init__(self, bin_path: str = "obsutil", *, regional_proxy_endpoint=None, bucket=None):
         self.bin_path = bin_path
+        self.regional_proxy_endpoint = regional_proxy_endpoint
+        self.bucket = bucket
 
     def _run(self, args: list[str], timeout: float) -> subprocess.CompletedProcess:
         try:
-            return subprocess.run(
-                [self.bin_path, *args], capture_output=True, text=True,
-                timeout=timeout, check=False,
-            )
+            if self.regional_proxy_endpoint:
+                from .obs_transport import ObsRegionalProxy
+                route = ObsRegionalProxy(self.regional_proxy_endpoint, self.bucket)
+            else:
+                route = nullcontext(None)
+            with route as proxy:
+                options = ['-proxy-url=' + proxy] if proxy else []
+                return subprocess.run(
+                    [self.bin_path, *args, *options], capture_output=True, text=True,
+                    timeout=timeout, check=False,
+                )
         except FileNotFoundError as e:
             raise ObsDownloadError(
                 f"找不到下载工具 {self.bin_path!r}；OBS 下载方式未就绪，不自动安装"
@@ -145,7 +155,9 @@ def make_downloader(obs_cfg: dict | None):
         return None
     kind = cfg.get("type")
     if kind == "obsutil":
-        return ObsutilDownloader(cfg.get("bin", "obsutil"))
+        return ObsutilDownloader(cfg.get("bin", "obsutil"),
+            regional_proxy_endpoint=cfg.get('regional_proxy_endpoint'),
+            bucket=(obs_cfg or {}).get('bucket', 'pytorch-ci-cache'))
     raise ObsDownloadError(
         f"未知 OBS 下载器类型 {kind!r}（当前支持 obsutil）；"
         "下载方式必须由部署配置显式给出"

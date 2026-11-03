@@ -128,6 +128,20 @@ class TestMirror:
 
 
 class TestCycle:
+    def test_obs_listing_failure_preserves_pending_as_unknown(self, setup):
+        from run_test.upstream_health import read_health
+        config, queue, mirror, shas = setup
+        class FailedObs:
+            def list(self, prefix): raise RuntimeError('listing timed out')
+        report = run_cycle(config, queue=queue, mirror=mirror, downloader=FailedObs())
+        assert report.obs_listing_status == 'failed' and report.errors
+        assert queue.pending_upstream_commits()
+        assert report.still_missing == []  # Unqueried objects are not known missing.
+        assert read_health(config)['obs_listing_status'] == 'failed'
+        recovered = _cycle(config, queue, mirror, {})
+        assert recovered.obs_listing_status == 'ok'
+        assert read_health(config)['obs_listing_status'] == 'ok'
+
     def test_latest_complete_split_build_unblocks_pending_commit(self, setup):
         config, queue, mirror, shas = setup
         sha10 = shas['pr2'][:10]
