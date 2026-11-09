@@ -55,6 +55,32 @@ def test_permanent_error_does_not_retry(config, tmp_path, monkeypatch):
     assert read_health(config)['status'] == 'failed'
 
 
+@pytest.mark.parametrize('message', [
+    'error: RPC failed; curl 16 Error in the HTTP2 framing layer',
+    'fatal: HTTP/2 stream 1 was not closed cleanly before end of the underlying stream',
+    'error: RPC failed; curl 92 stream was not closed cleanly: CANCEL',
+    'error: RPC failed; curl 56 Recv failure: unexpected EOF',
+])
+def test_interrupted_git_transport_retries(config, tmp_path, monkeypatch, message):
+    mirror, calls, sleeps = mirror_probe(config, tmp_path, monkeypatch,
+        [UpstreamError(message), ''])
+    assert mirror.fetch() == 'a' * 40
+    assert len(calls) == 2 and sleeps == [5]
+    assert read_health(config)['status'] == 'ok'
+
+
+def test_http2_exhaustion_keeps_last_success_and_retry_limit(config, tmp_path, monkeypatch):
+    record_health(config, last_success_at='2026-11-09T00:20:41+00:00', fetched_tip='b'*40)
+    mirror, calls, sleeps = mirror_probe(config, tmp_path, monkeypatch,
+        [UpstreamError('curl 16 Error in the HTTP2 framing layer')] * 3)
+    with pytest.raises(UpstreamError):
+        mirror.fetch()
+    health = read_health(config)
+    assert len(calls) == 3 and sleeps == [5, 10]
+    assert health['status'] == 'failed' and health['fetched_tip'] == 'b'*40
+    assert health['last_success_at'] == '2026-11-09T00:20:41+00:00'
+
+
 def test_failure_warns_even_with_recent_success_and_unchanged_queue(config):
     now = datetime.now(timezone.utc)
     warning = health_warning(config, {'status':'failed', 'error':'network down',

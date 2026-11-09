@@ -281,7 +281,7 @@ class PyTorchMirror:
                 # need intervention and must not be hidden by repeated requests.
                 transient = re.search(r"timed? out|timeout|Failed to connect|Could not resolve|"
                     r"Connection (?:reset|refused|closed)|TLS|SSL|HTTP.*(?:429|500|502|503|504)|"
-                    r"remote end hung up|early EOF", str(error), re.I)
+                    r"HTTP/?2|curl (?:16|18|56|92)\b|remote end hung up|early EOF", str(error), re.I)
                 retry = bool(transient) and attempt < attempts
                 record(status="retrying" if retry else "failed", error=str(error),
                        last_failure_at=datetime.now(timezone.utc).isoformat(),
