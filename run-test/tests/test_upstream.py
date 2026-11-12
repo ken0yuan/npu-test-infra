@@ -86,6 +86,57 @@ def _cycle(config, queue, mirror, existing_objects):
 
 
 class TestMirror:
+    def test_full_history_and_new_files_readable_with_upstream_offline(self, tmp_path, upstream_repo):
+        work, shas = upstream_repo
+        # file:// exercises upload-pack; plain local clones ignore --filter.
+        _git(work, "config", "uploadpack.allowFilter", "true")
+        (work / "deleted.txt").write_text("historical content\n")
+        _git(work, "add", "-A")
+        _git(work, "commit", "-q", "-m", "historical file (#103)")
+        historical = _git(work, "rev-parse", "HEAD")
+        (work / "deleted.txt").unlink()
+        _git(work, "add", "-A")
+        _git(work, "commit", "-q", "-m", "delete historical file (#104)")
+        mirror = _make_mirror(tmp_path, work.resolve().as_uri())
+        mirror.ensure()
+        # The next ordinary incremental fetch must bring new file objects too.
+        (work / "new.txt").write_text("incremental content\n")
+        _git(work, "add", "-A")
+        _git(work, "commit", "-q", "-m", "new file (#105)")
+        tip = mirror.fetch()
+        work.rename(work.with_name("upstream-offline"))
+        mirror.ensure()  # Reuses the existing complete repository offline.
+        assert _git(mirror.git_dir, "show", shas["pr1"] + ":f.txt") == "1"
+        assert _git(mirror.git_dir, "show", historical + ":deleted.txt") == "historical content"
+        assert _git(mirror.git_dir, "show", tip + ":new.txt") == "incremental content"
+        assert _git(mirror.git_dir, "diff", shas["pr1"], tip, "--", "f.txt").endswith("+3")
+        _git(mirror.git_dir, "fsck", "--full", "--no-dangling")
+
+    @pytest.mark.parametrize("mode", ["partial", "shallow", "promisor_marker"])
+    def test_existing_incomplete_mirror_rejected(self, tmp_path, upstream_repo, mode):
+        work, _ = upstream_repo
+        _git(work, "config", "uploadpack.allowFilter", "true")
+        url = work.resolve().as_uri()
+        mirror = _make_mirror(tmp_path, url)
+        flags = ["--filter=blob:none"] if mode != "shallow" else ["--depth=1"]
+        _git(tmp_path, "clone", "--bare", *flags, "--single-branch", "--branch", "main", url, str(mirror.git_dir))
+        if mode == "promisor_marker":
+            # Removing config alone does not hydrate promised objects.
+            _git(mirror.git_dir, "config", "--remove-section", "remote.origin")
+            _git(mirror.git_dir, "remote", "add", "origin", url)
+        with pytest.raises(UpstreamError, match="partial/shallow"):
+            mirror.ensure()
+
+    def test_failed_clone_does_not_publish_repository(self, tmp_path, upstream_repo):
+        work, _ = upstream_repo
+        mirror = _make_mirror(tmp_path, (tmp_path / "missing").as_uri())
+        with pytest.raises(UpstreamError, match="克隆失败"):
+            mirror.ensure()
+        assert not mirror.git_dir.exists()
+        mirror.repo_url = work.resolve().as_uri()
+        mirror.ensure()
+        assert mirror.exists()
+
     def test_fetch_and_commits_between(self, tmp_path, upstream_repo):
         work, shas = upstream_repo
         mirror = _make_mirror(tmp_path, work)

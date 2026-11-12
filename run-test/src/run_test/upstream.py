@@ -7,7 +7,7 @@
   commit subject 一定含 "(#N)"）；无 PR 号的 commit 按用户确认完全跳过；
 - 对已记录、未入队的 commit，在 OBS 桶中定位配套的
   wheels-<sha10>.tar.gz 与 pytorch-source-<sha10>.tar.gz，存在则入队；
-- 镜像只作为身份与信息来源（blob:none 裸镜像，无工作区文件），
+- 镜像保存 main 的完整历史与文件对象（完整裸镜像，无工作区文件），
   不作为被测资源——被测 wheel 与源码仍只从 OBS 下载。
 
 实证（2026-09-17，wheels-0051b809f7.tar.gz 与三个 workflow 全文）：
@@ -27,6 +27,7 @@ import re
 import os
 import subprocess
 import time
+import tempfile
 from dataclasses import dataclass, field
 import json
 import hashlib
@@ -226,7 +227,7 @@ class PyTorchMirror:
         return (self.git_dir / "HEAD").is_file()
 
     def ensure(self) -> None:
-        """镜像不存在时克隆（blob:none 裸镜像，只含 commit/tree 元数据）。"""
+        """复用完整 main 裸镜像；首次完整克隆，不把选例读文件变成网络请求。"""
         if self.exists():
             origin = _git(self.git_dir, ["remote", "get-url", "origin"]).strip()
             # 本机 git 可能配置 url.<proxy>.insteadOf 把 GitHub URL 透明重写为
@@ -239,23 +240,48 @@ class PyTorchMirror:
                 )
             if origin != self.repo_url:
                 _git(self.git_dir, ["remote", "set-url", "origin", self.repo_url])
+            self._require_full_repository()
             return
         self.git_dir.parent.mkdir(parents=True, exist_ok=True)
         try:
-            cloned = subprocess.run(
-                [
-                    "git", "clone", "--bare", "--filter=blob:none",
-                    "--single-branch", "--branch", "main",
-                    self.repo_url, str(self.git_dir),
-                ],
-                capture_output=True, text=True, timeout=7200, check=False,
-            )
-            if cloned.returncode:
-                raise UpstreamError(f"镜像克隆失败 (exit={cloned.returncode}): {(cloned.stderr or cloned.stdout)[-1500:]}")
+            # A failed or interrupted clone must not leave HEAD at the final
+            # path, where a later ensure() could mistake it for a ready mirror.
+            with tempfile.TemporaryDirectory(
+                prefix=f".{self.git_dir.name}-clone-", dir=self.git_dir.parent,
+            ) as temporary:
+                staged = Path(temporary) / "repository.git"
+                cloned = subprocess.run(
+                    [
+                        "git", "clone", "--bare",
+                        "--single-branch", "--branch", "main",
+                        self.repo_url, str(staged),
+                    ],
+                    capture_output=True, text=True, timeout=7200, check=False,
+                )
+                if cloned.returncode:
+                    raise UpstreamError(f"镜像克隆失败 (exit={cloned.returncode}): {(cloned.stderr or cloned.stdout)[-1500:]}")
+                candidate = PyTorchMirror(repo_url=self.repo_url, mirror_dir=staged)
+                if not candidate.exists():
+                    raise UpstreamError("镜像克隆后仍不存在，请检查网络与磁盘")
+                candidate._require_full_repository()
+                staged.rename(self.git_dir)
         except (OSError, subprocess.TimeoutExpired) as e:
             raise UpstreamError(f"镜像克隆失败: {e}") from e
-        if not self.exists():
-            raise UpstreamError("镜像克隆后仍不存在，请检查网络与磁盘")
+
+    def _require_full_repository(self) -> None:
+        """旧 partial/shallow 镜像必须完整迁移，不能仅删配置冒充完整仓库。"""
+        settings = _git(self.git_dir, ["config", "--local", "--list"])
+        partial = any(
+            re.match(r"(?:extensions\.partialclone|remote\..*\.(?:promisor|partialclonefilter))=", line, re.I)
+            for line in settings.splitlines()
+        ) or any((self.git_dir / "objects" / "pack").glob("*.promisor"))
+        shallow = _git(self.git_dir, ["rev-parse", "--is-shallow-repository"]).strip() == "true"
+        if partial or shallow:
+            raise UpstreamError(
+                "上游镜像是 partial/shallow 仓库，缺少完整历史或文件对象；"
+                "请在独立目录完整克隆并验证后切换，保留旧镜像；"
+                "不要只删除 promisor 配置。"
+            )
 
     def fetch(self) -> str:
         """拉取最新 main（fetch 并前进本地 main 引用），返回新 tip。"""

@@ -11,7 +11,7 @@
   封闭列表的官方实现，权威来源
   https://gitcode.com/ken0yuan/pytorch-pr-analysis scripts/）；
 - 输入从本地 main 镜像构造：`git diff <sha>^! --name-only`
-  （blob:none 裸镜像只读 tree 元数据，不触网、不查 GitHub、不用 token）；
+  （完整裸镜像在本地读取，不触网、不查 GitHub、不用 token）；
 - 无法取得文件清单时不得排除（保守进入分析队列）；
 - 规则版本（store.json skill.ref，已钉 bf9b16e）写入队列库 skill_state，
   保证规则可追溯。
@@ -42,7 +42,7 @@ class PrefilterError(RuntimeError):
 def changed_files_from_mirror(mirror_dir: str | Path, sha: str) -> list[str]:
     """从本地 main 裸镜像取该 commit 相对父提交的改动文件清单。
 
-    blob:none 镜像只有 commit/tree 元数据，`--name-only` 不读 blob。
+    完整镜像同时保存 commit/tree/blob，后续逐用例取证也无需临时取文件。
     根提交（无父）或 diff 失败返回空列表——空清单按"无法判定"处理，
     不排除（交给分析阶段）。
     """
