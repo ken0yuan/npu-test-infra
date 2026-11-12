@@ -35,6 +35,6 @@
       "type": "obsutil",
       "bin": "obsutil"
     },
-    "wheel_name_contains": []
+    "wheel_name_contains": ["-py311-", "aarch64"]
   }
 }
