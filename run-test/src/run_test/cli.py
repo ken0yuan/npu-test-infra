@@ -25,7 +25,7 @@ from .config import (
 from .environment import collect_environment, validate_environment, write_environment_file
 from .executor import Executor
 from .identifiers import Counts, validate_commit
-from .obs import make_downloader
+from .obs import make_downloader, list_artifacts
 from .pr_store import ensure_pr_db
 from .task_queue import QueueStore
 from .record import FunctionResult, Submission, submit_complete_result
@@ -45,8 +45,8 @@ def cmd_obs_scan(args):
     downloader = make_downloader(config.get("obs"))
     if downloader is None:
         raise ValueError("obs.downloader 未配置")
-    bucket = f"obs://{config['obs']['bucket']}/7day-cache"
-    report = inventory(downloader.list(bucket + "/"), bucket, config)
+    listing, wheels, source = list_artifacts(config.get('obs'), downloader)
+    report = inventory(listing, wheels, config, source_bucket=source)
     text = json.dumps(report, ensure_ascii=False, indent=2)
     if args.output:
         target = Path(args.output)

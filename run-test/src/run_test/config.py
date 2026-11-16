@@ -93,8 +93,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "ref": None,
     },
     "obs": {
-        # OBS 桶名（对象位于 <bucket>/7day-cache/ 下）。
+        # Legacy bucket/route also preserves downloads for existing queued tasks.
         "bucket": "pytorch-ci-cache",
+        # Optional explicit {bucket, downloader} routes for wheels and sources.
+        # None preserves the single-bucket behavior for older deployments.
+        "wheels": None,
+        "source": None,
         # OBS 下载方式，如 {"type": "obsutil", "bin": "/usr/local/bin/obsutil"}。
         # 未配置时执行端在该阶段记 blocked，不偷偷启用任何联网认证路径。
         "downloader": None,

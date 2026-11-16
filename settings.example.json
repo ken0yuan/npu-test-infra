@@ -35,6 +35,16 @@
       "type": "obsutil",
       "bin": "obsutil"
     },
+    "source": {
+      "bucket": "pytorch-ci-cache"
+    },
+    "wheels": {
+      "bucket": "pytorch-torchnpu",
+      "downloader": {
+        "type": "public_https",
+        "endpoint": "https://obs.cn-southwest-2.myhuaweicloud.com"
+      }
+    },
     "wheel_name_contains": ["-py311-", "aarch64"]
   }
 }

@@ -111,19 +111,21 @@ def select_wheel(listing, bucket, sha10, config):
     return select_bundle(listing, bucket, sha10, config)['wheels']
 
 
-def inventory(listing, bucket, config):
-    wheels = {u:wheel_identity(u) for u in listing if wheel_identity(u)}
+def inventory(listing, bucket, config, *, source_bucket=None):
+    wheels = {u:wheel_identity(u) for u in listing
+              if u.startswith(bucket + '/') and wheel_identity(u)}
     groups = sorted({i['pytorch_short'] for i in wheels.values()})
     pairs, ambiguous = [], []
     for sha in groups:
-        source = f'{bucket}/pytorch-source-{sha}.tar.gz'
+        source = f'{source_bucket or bucket}/pytorch-source-{sha}.tar.gz'
         if source not in listing:
             continue
         try:
             bundle = select_bundle(listing, bucket, sha, config)
         except ValueError as error:
             ambiguous.append(str(error)); continue
-        if bundle['wheels']:
+        if (bundle['wheels'] and (wheel_identity(bundle['wheels'])['format'] != 'split-pytorch'
+                                 or bundle['wheels_npu'])):
             pairs.append({'source':source, 'wheels':bundle['wheels'],
                           'wheels_npu':bundle['wheels_npu'], **wheels[bundle['wheels']]})
     return {'objects':len(listing), 'full_wheel_bundles':len(wheels), 'unique_pairs':pairs,

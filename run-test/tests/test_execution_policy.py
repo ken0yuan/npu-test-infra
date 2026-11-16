@@ -95,6 +95,19 @@ def test_split_bundle_pairing():
     assert pair['wheels'] == PT_NAME and pair['wheels_npu'] == NPU_NAME
 
 
+def test_inventory_pairs_separate_source_bucket_without_reporting_incomplete_npu():
+    wp='obs://pytorch-torchnpu/7day-cache'
+    sp='obs://pytorch-ci-cache/7day-cache'
+    pt=PT_NAME.replace(BUCKET,wp)
+    npu=NPU_NAME.replace(BUCKET,wp)
+    listing={pt:{},f'{sp}/pytorch-source-{SHA}.tar.gz':{}}
+    assert inventory(listing,wp,{},source_bucket=sp)['unique_pairs']==[]
+    listing[npu]={}
+    pairs=inventory(listing,wp,{},source_bucket=sp)['unique_pairs']
+    assert len(pairs)==1 and pairs[0]['source']==f'{sp}/pytorch-source-{SHA}.tar.gz'
+    assert pairs[0]['wheels']==pt and pairs[0]['wheels_npu']==npu
+
+
 def test_split_bundle_without_npu_object_reports_missing_npu():
     listing = {PT_NAME:{}, f'{BUCKET}/pytorch-source-{SHA}.tar.gz':{}}
     bundle = select_bundle(listing, BUCKET, SHA, {})

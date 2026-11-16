@@ -179,6 +179,49 @@ class TestMirror:
 
 
 class TestCycle:
+    def test_cross_bucket_pairing_requires_same_commit_and_complete_build(self, setup):
+        config, queue, mirror, shas = setup
+        sha = shas['pr2'][:10]
+        other = shas['pr1'][:10]
+        config['obs']['wheels'] = {'bucket':'pytorch-torchnpu'}
+        config['obs']['source'] = {'bucket':'pytorch-ci-cache'}
+        wp = 'obs://pytorch-torchnpu/7day-cache'
+        sp = 'obs://pytorch-ci-cache/7day-cache'
+        pt = f'{wp}/wheels-pytorch-{sha}-py311-builder-aarch64-v3.tar.gz'
+        npu = f'{wp}/wheels-torchnpu-abcdef0123-{sha}-py311-builder-aarch64-v3.tar.gz'
+        wrong = npu.replace(sha, other)
+        source = f'{sp}/pytorch-source-{sha}.tar.gz'
+        # A source in the wheel bucket and another commit's old-bucket source
+        # must not be accepted for this wheel, nor an NPU from another commit.
+        listing = {pt:{'etag':'pt'},wrong:{'etag':'wrong'},
+                   source.replace(sha, other):{'etag':'other-source'},
+                   source.replace(sp, wp):{'etag':'wrong-bucket'}}
+        assert not _cycle(config, queue, mirror, listing).enqueued
+        listing[npu] = {'etag':'npu'}
+        assert not _cycle(config, queue, mirror, listing).enqueued
+        listing[source] = {'etag':'source'}
+        report = _cycle(config, queue, mirror, listing)
+        assert len(report.enqueued) == 1
+        task = queue.get_task(report.enqueued[0]['task_id'])
+        assert (task.obs_wheels_url,task.obs_wheels_npu_url,task.obs_source_url)==(pt,npu,source)
+        assert (task.obs_wheels_version,task.obs_wheels_npu_version,task.obs_source_version)==('pt','npu','source')
+        assert task.pytorch_commit == shas['pr2']
+        assert not _cycle(config, queue, mirror, listing).enqueued
+
+    def test_cross_bucket_listing_failure_keeps_pending_visible(self, setup):
+        from run_test.upstream_health import read_health
+        config,queue,mirror,shas=setup
+        config['obs']['wheels']={'bucket':'pytorch-torchnpu'}
+        class FailedSource:
+            def list(self,prefix):
+                if 'pytorch-ci-cache' in prefix: raise RuntimeError('source query failed')
+                return {}
+        report=run_cycle(config,queue=queue,mirror=mirror,downloader=FailedSource())
+        assert report.obs_listing_status=='failed' and not report.enqueued
+        assert 'pytorch-ci-cache' in report.errors[0]
+        assert report.still_missing==[] and queue.pending_upstream_commits()
+        assert read_health(config)['obs_listing_status']=='failed'
+
     def test_obs_listing_failure_preserves_pending_as_unknown(self, setup):
         from run_test.upstream_health import read_health
         config, queue, mirror, shas = setup

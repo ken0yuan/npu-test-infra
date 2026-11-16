@@ -15,6 +15,7 @@ import time
 from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlsplit
 
 # 超时分级：stat/ls 是控制面查询；下载按最坏包体（779MB 源码包）× 链路
 # 劣化（~500KB/s ≈ 26 分钟）校准。原先全局 3600s 在链路挂死时会让单个
@@ -148,17 +149,91 @@ class ObsutilDownloader:
         raise last_error
 
 
-def make_downloader(obs_cfg: dict | None):
-    """按配置构造下载器；未配置返回 None（由执行端记 blocked）。"""
-    cfg = (obs_cfg or {}).get("downloader")
+def artifact_prefixes(obs_cfg: dict | None) -> tuple[str, str]:
+    """Wheel and source namespaces; legacy single-bucket configurations still work."""
+    obs_cfg = obs_cfg or {}
+    legacy = obs_cfg.get('bucket', 'pytorch-ci-cache')
+    def prefix(role):
+        bucket = (obs_cfg.get(role) or {}).get('bucket', legacy)
+        if not isinstance(bucket, str) or not bucket or any(c in bucket for c in '/?#@:'):
+            raise ObsDownloadError(f'Invalid OBS {role} bucket: {bucket!r}')
+        return f'obs://{bucket}/7day-cache'
+    return prefix('wheels'), prefix('source')
+
+
+def list_artifacts(obs_cfg, downloader):
+    """Only publish a combined snapshot after every required namespace succeeds."""
+    wheels, source = artifact_prefixes(obs_cfg)
+    listing = {}
+    for prefix in dict.fromkeys([wheels, source]):
+        try:
+            entries = downloader.list(prefix + '/')
+            if any(not url.startswith(prefix + '/') for url in entries):
+                raise ObsDownloadError('Listing returned objects outside its requested namespace')
+            listing.update(entries)
+        except Exception as error:
+            raise ObsDownloadError(f'OBS listing failed for {prefix}: {error}') from error
+    return listing, wheels, source
+
+
+class RoutedObsDownloader:
+    """Route exact bucket URLs, including old queued artifacts, without credential fallback."""
+    def __init__(self, routes):
+        self.routes = routes
+
+    def _route(self, url):
+        parsed = urlsplit(url)
+        if (parsed.scheme != 'obs' or parsed.query or parsed.fragment
+                or parsed.netloc not in self.routes or '..' in parsed.path.split('/')):
+            raise ObsDownloadError(f'No configured OBS route for {url!r}')
+        return self.routes[parsed.netloc]
+
+    def list(self, url):
+        return self._route(url).list(url)
+
+    def stat(self, url):
+        return self._route(url).stat(url)
+
+    def download(self, url, dest):
+        return self._route(url).download(url, dest)
+
+
+def _make_downloader(cfg, bucket):
     if not cfg:
         return None
     kind = cfg.get("type")
     if kind == "obsutil":
         return ObsutilDownloader(cfg.get("bin", "obsutil"),
             regional_proxy_endpoint=cfg.get('regional_proxy_endpoint'),
-            bucket=(obs_cfg or {}).get('bucket', 'pytorch-ci-cache'))
+            bucket=bucket)
+    if kind == 'public_https':
+        from .obs_public import PublicObsDownloader
+        return PublicObsDownloader(cfg.get('endpoint', ''), bucket,
+            regional_proxy_endpoint=cfg.get('regional_proxy_endpoint'))
     raise ObsDownloadError(
-        f"未知 OBS 下载器类型 {kind!r}（当前支持 obsutil）；"
+        f"未知 OBS 下载器类型 {kind!r}（当前支持 obsutil/public_https）；"
         "下载方式必须由部署配置显式给出"
     )
+
+
+def make_downloader(obs_cfg: dict | None):
+    """Explicit per-bucket routes; unconfigured legacy deployments still return None."""
+    obs_cfg = obs_cfg or {}
+    bucket = obs_cfg.get('bucket', 'pytorch-ci-cache')
+    legacy = _make_downloader(obs_cfg.get('downloader'), bucket)
+    if not obs_cfg.get('wheels') and not obs_cfg.get('source'):
+        return legacy
+    wheels, source = artifact_prefixes(obs_cfg)
+    routes = {bucket: legacy} if legacy else {}
+    for role, prefix in [('source', source), ('wheels', wheels)]:
+        route = obs_cfg.get(role) or {}
+        name = urlsplit(prefix).netloc
+        if not route.get('downloader') and name in routes:
+            continue
+        selected = _make_downloader(route.get('downloader'), name)
+        if selected is None:
+            raise ObsDownloadError(f'OBS {role} bucket {name!r} requires an explicit downloader')
+        if name in routes and not (role == 'source' and name == bucket):
+            raise ObsDownloadError(f'Conflicting download routes for OBS bucket {name!r}')
+        routes[name] = selected
+    return RoutedObsDownloader(routes)

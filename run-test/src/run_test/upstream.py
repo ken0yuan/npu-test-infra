@@ -453,7 +453,7 @@ def run_cycle(
     - 对象不齐的 commit 保持 pending，下轮再查；发现超过 7 天标记 expired；
     - 入队后停在 prefilter_pending，等待分析端（下一个 agent 串接）。
     """
-    from .obs import make_downloader
+    from .obs import make_downloader, list_artifacts
 
     paths = store_paths(config)
     queue = queue or QueueStore(config)
@@ -505,9 +505,8 @@ def run_cycle(
     pending = queue.pending_upstream_commits()
     report.pending_before = len(pending)
     now = datetime.now(timezone.utc)
-    bucket = f"obs://{config.get('obs', {}).get('bucket', 'pytorch-ci-cache')}/7day-cache"
     try:
-        listing = downloader.list(f"{bucket}/")
+        listing, wheel_bucket, source_bucket = list_artifacts(config.get('obs'), downloader)
     except Exception as e:
         from .upstream_health import record_health
         report.obs_listing_status = 'failed'
@@ -523,14 +522,14 @@ def run_cycle(
         sha10 = row["sha"][:10]
         from .artifacts import select_bundle, wheel_identity
         try:
-            bundle = select_bundle(listing, bucket, sha10, config)
+            bundle = select_bundle(listing, wheel_bucket, sha10, config)
         except ValueError as error:
             report.errors.append(str(error))
             queue.update_upstream_commit(row["sha"], state="pending", note=str(error))
             continue
         wheels_url = bundle["wheels"]
         npu_url = bundle["wheels_npu"]
-        source_url = f"{bucket}/pytorch-source-{sha10}.tar.gz"
+        source_url = f"{source_bucket}/pytorch-source-{sha10}.tar.gz"
         wheels_meta = listing.get(wheels_url) if wheels_url else None
         source_meta = listing.get(source_url)
         npu_meta = listing.get(npu_url) if npu_url else None
