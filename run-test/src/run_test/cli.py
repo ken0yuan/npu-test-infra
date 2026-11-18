@@ -504,7 +504,7 @@ def cmd_cycle(args: argparse.Namespace) -> int:
               f"tip={report.fetched_tip[:10]} "
               f"新commit={report.new_commits}(记{report.recorded}/无PR{report.skipped_no_pr}) "
               f"入队={len(report.enqueued)} 等待={waiting} OBS查询={report.obs_listing_status} "
-              f"过期={len(report.expired)}", flush=True)
+              f"过期={len(report.expired)} 缺资源={json.dumps(report.missing_counts, ensure_ascii=False)}", flush=True)
         for e in report.enqueued:
             print(f"  [入队] {e['task_id']} PR#{e['pr_number']} {e['sha10']} "
                   f"{e['subject'][:70]}", flush=True)

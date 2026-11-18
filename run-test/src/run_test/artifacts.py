@@ -118,7 +118,12 @@ def inventory(listing, bucket, config, *, source_bucket=None):
     pairs, ambiguous = [], []
     for sha in groups:
         source = f'{source_bucket or bucket}/pytorch-source-{sha}.tar.gz'
-        if source not in listing:
+        from .git_source import enabled, source_metadata
+        if enabled(config):
+            try:source = source_metadata(config,sha)['url']
+            except Exception as error:
+                ambiguous.append(f'{sha}: Git source unavailable: {error}');continue
+        elif source not in listing:
             continue
         try:
             bundle = select_bundle(listing, bucket, sha, config)

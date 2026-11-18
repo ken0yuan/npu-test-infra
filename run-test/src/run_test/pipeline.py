@@ -149,29 +149,35 @@ def _run_selection_body(
 
     progress('source_download')
     downloader = make_downloader(config.get('obs'))
-    pkg = stage_package(config, task, 'pytorch-source.tar.gz', downloader)
-    cache = pkg.parent
-    tree = cache / 'pytorch'
-    marker = cache / '.selection-sources-complete'
-    expected = {'identity': identity(task, pkg.name), 'sha256': checksum(pkg)}
-    try:
-        complete = json.loads(marker.read_text(encoding='utf-8')) == expected
-    except (OSError, ValueError):
-        complete = False
-    if not complete or not (tree / 'test').is_dir():
-        progress('source_extract')
-        if tree.exists():
-            shutil.rmtree(tree)
-        changed_paths = sel_git(mirror.git_dir, 'diff', '--name-only', f'{sha}^', sha).splitlines()
-        source_members = {'pytorch/' + path for path in changed_paths if not path.startswith('test/')}
-        with tarfile.open(pkg, 'r:gz') as tf:
-            members = [m for m in tf.getmembers() if (
-                m.name.removeprefix('./') == 'pytorch/test'
-                or m.name.removeprefix('./').startswith(('pytorch/test/', 'pytorch/tools/'))
-                or m.name.removeprefix('./') in {'pytorch/aten/tools/run_tests.sh', 'pytorch/.ci/pytorch/test.sh'}
-                or m.name.removeprefix('./') in source_members)]
-            tf.extractall(cache, members=members, filter='data')
-        atomic_json(marker, expected)
+    from .git_source import is_git_source, checkout_source
+    if is_git_source(task.obs_source_url):
+        progress('source_git_checkout')
+        cache = task_root(config, task) / 'source-staging'
+        tree = checkout_source(config, task, cache / 'pytorch')
+    else:
+        pkg = stage_package(config, task, 'pytorch-source.tar.gz', downloader)
+        cache = pkg.parent
+        tree = cache / 'pytorch'
+        marker = cache / '.selection-sources-complete'
+        expected = {'identity': identity(task, pkg.name), 'sha256': checksum(pkg)}
+        try:
+            complete = json.loads(marker.read_text(encoding='utf-8')) == expected
+        except (OSError, ValueError):
+            complete = False
+        if not complete or not (tree / 'test').is_dir():
+            progress('source_extract')
+            if tree.exists():
+                shutil.rmtree(tree)
+            changed_paths = sel_git(mirror.git_dir, 'diff', '--name-only', f'{sha}^', sha).splitlines()
+            source_members = {'pytorch/' + path for path in changed_paths if not path.startswith('test/')}
+            with tarfile.open(pkg, 'r:gz') as tf:
+                members = [m for m in tf.getmembers() if (
+                    m.name.removeprefix('./') == 'pytorch/test'
+                    or m.name.removeprefix('./').startswith(('pytorch/test/', 'pytorch/tools/'))
+                    or m.name.removeprefix('./') in {'pytorch/aten/tools/run_tests.sh', 'pytorch/.ci/pytorch/test.sh'}
+                    or m.name.removeprefix('./') in source_members)]
+                tf.extractall(cache, members=members, filter='data')
+            atomic_json(marker, expected)
     if not (tree / "test").is_dir():
         print(f"源码包解压后缺少 pytorch/test/: {cache}", file=sys.stderr)
         return 2

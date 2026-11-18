@@ -292,7 +292,11 @@ class Executor:
         source_pkg = packages / "pytorch-source.tar.gz"
         # 拆分包格式（2026-10-22 起）：torch_npu 独立对象，与主体包同下。
         npu_pkg = packages / "wheels-npu.tar.gz"
-        downloads = [(task.obs_wheels_url, wheels_pkg), (task.obs_source_url, source_pkg)]
+        from .git_source import is_git_source, checkout_source, MARKER as SOURCE_MARKER
+        git_source = is_git_source(task.obs_source_url)
+        downloads = [(task.obs_wheels_url, wheels_pkg)]
+        if not git_source:
+            downloads.append((task.obs_source_url, source_pkg))
         if task.obs_wheels_npu_url:
             downloads.append((task.obs_wheels_npu_url, npu_pkg))
         # 下载重试：次数/间隔来自 store.json（queue.download_retries /
@@ -352,11 +356,17 @@ class Executor:
         # 解压并确认两个 wheel 与源码齐全（文档步骤 3）。
         try:
             wheels_dir = self._extract(wheels_pkg, packages / "wheels")
-            self._extract(source_pkg, source)
+            if git_source:
+                checkout = checkout_source(self.config, task, source / 'pytorch')
+                from .task_staging import atomic_json
+                atomic_json(self.paths.diagnostics_root / task.task_id / 'artifacts/source-identity.json',
+                            json.loads((checkout / SOURCE_MARKER).read_text()))
+            else:
+                self._extract(source_pkg, source)
             if task.obs_wheels_npu_url:
                 self._extract(npu_pkg, packages / "wheels")
-        except (tarfile.TarError, OSError) as e:
-            reason = f"压缩包损坏或解压失败: {e}"
+        except (tarfile.TarError, OSError, ObsDownloadError) as e:
+            reason = f"资源解包或源码检出失败: {e}"
             self.queue.mark_blocked(task.task_id, reason)
             return False, reason
 

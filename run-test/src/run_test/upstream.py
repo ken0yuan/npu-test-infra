@@ -5,10 +5,10 @@
 - 每轮找出新出现的 commit，从 subject 的 "(#PR号)" 解析 PR 号并记录
   （构建方 receive-trigger.yml 依赖同一约定：land bot push 到 main 的
   commit subject 一定含 "(#N)"）；无 PR 号的 commit 按用户确认完全跳过；
-- 对已记录、未入队的 commit，在 OBS 桶中定位配套的
-  wheels-<sha10>.tar.gz 与 pytorch-source-<sha10>.tar.gz，存在则入队；
+- 对已记录、未入队的 commit，定位同 commit 的 OBS wheels；源码按配置
+  从完整 Git 镜像检出，或兼容已有 OBS 源码包，身份核实后入队；
 - 镜像保存 main 的完整历史与文件对象（完整裸镜像，无工作区文件），
-  不作为被测资源——被测 wheel 与源码仍只从 OBS 下载。
+  wheel 只从 OBS 下载；Git 源码提供器复用此镜像，不按任务联网重克隆。
 
 实证（2026-09-17，wheels-0051b809f7.tar.gz 与三个 workflow 全文）：
 - 包体含 torch + torch_npu + torchvision + 纯 Python 依赖，同链配套构建；
@@ -431,6 +431,7 @@ class CycleReport:
     expired: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
     obs_listing_status: str = "not_checked"
+    missing_counts: dict[str, int] = field(default_factory=dict)
 
 
 # 上游 commit 记录后等待桶中对象出现的最长时间；超过则不再查找
@@ -518,6 +519,7 @@ def run_cycle(
     report.obs_listing_status = 'ok'
     record_health(config, obs_listing_status='ok', obs_error='', obs_objects=len(listing))
 
+    from .git_source import enabled as git_enabled, source_metadata
     for row in pending:
         sha10 = row["sha"][:10]
         from .artifacts import select_bundle, wheel_identity
@@ -538,8 +540,20 @@ def run_cycle(
         npu_required = bool(wheels_url) and (
             wheel_identity(wheels_url) or {}
         ).get("format") == "split-pytorch"
+        if git_enabled(config) and wheels_meta and (not npu_required or npu_meta):
+            try:
+                source_meta = source_metadata(config, row['sha'])
+                source_url = source_meta['url']
+            except Exception as error:
+                source_meta = None
+                reason = f'{sha10}: Git source unavailable: {error}'
+                report.errors.append(reason)
+                queue.update_upstream_commit(row['sha'],state='pending',note=reason)
         if (wheels_meta is None or source_meta is None
                 or (npu_required and npu_meta is None)):
+            for label, missing in [('wheels',not wheels_meta),('wheels_npu',npu_required and not npu_meta),
+                                   ('git_source' if git_enabled(config) else 'source',not source_meta and bool(wheels_meta) and (not npu_required or bool(npu_meta)))]:
+                if missing:report.missing_counts[label]=report.missing_counts.get(label,0)+1
             discovered = datetime.fromisoformat(row["discovered_at"])
             if discovered.tzinfo is None:
                 discovered = discovered.replace(tzinfo=timezone.utc)
@@ -620,4 +634,6 @@ def run_cycle(
                 "subject": row["subject"],
             }
         )
+    record_health(config,missing_objects=report.missing_counts,
+                  source_provider='git' if git_enabled(config) else 'obs')
     return report

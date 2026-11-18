@@ -36,7 +36,8 @@
       "bin": "obsutil"
     },
     "source": {
-      "bucket": "pytorch-ci-cache"
+      "bucket": "pytorch-ci-cache",
+      "provider": "git"
     },
     "wheels": {
       "bucket": "pytorch-torchnpu",

@@ -1,9 +1,10 @@
 """OBS 下载层。
 
 对应《OBS监测与串行测试队列说明》第 2 节硬性要求：
-- 测试服务器只从 OBS 获取 PyTorch wheel、torch-npu wheel 和源码；
+- 测试服务器只从 OBS 获取 PyTorch wheel、torch-npu wheel；
 - 不访问 GitHub 拉取记录、不使用 GitHub token、不通过 ghfast 或
-  git clone/pull 补源码、不在本地重建 wheel；
+  本模块不从其他位置补 wheel、不在本地重建 wheel；源码由显式配置的
+  git_source 提供器按完整 commit 检出，或兼容历史 OBS 源码对象；
 - 下载方式必须由部署配置显式给出（如 obsutil）。未配置时执行端在该阶段
   记 blocked，不偷偷启用任何联网认证路径，也不自动安装下载工具。
 """
@@ -165,7 +166,8 @@ def list_artifacts(obs_cfg, downloader):
     """Only publish a combined snapshot after every required namespace succeeds."""
     wheels, source = artifact_prefixes(obs_cfg)
     listing = {}
-    for prefix in dict.fromkeys([wheels, source]):
+    git_source = ((obs_cfg or {}).get('source') or {}).get('provider') == 'git'
+    for prefix in dict.fromkeys([wheels] if git_source else [wheels, source]):
         try:
             entries = downloader.list(prefix + '/')
             if any(not url.startswith(prefix + '/') for url in entries):
